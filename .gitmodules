@@ -1,0 +1,3 @@
+[submodule "src_directxtex_decoder/external/DirectXTex"]
+	path = src_directxtex_decoder/external/DirectXTex
+	url = https://github.com/microsoft/DirectXTex.git

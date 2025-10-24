@@ -1,0 +1,377 @@
+// =======================================================================================
+//  decoder.cpp - A High-Performance C++ Python Module for DDS File Decoding
+// =======================================================================================
+// FINAL PRODUCTION-READY VERSION 4.2: This version enhances the fallback mechanism.
+// It now correctly identifies common FourCC codes (DXT1, DXT3, DXT5) and handles
+// the 'DX10' extended header case during manual parsing. This provides maximum
+// compatibility and robustness.
+// =======================================================================================
+
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <sstream>
+#include <iostream>
+#include <memory>
+#include <vector>
+#include <Windows.h>
+#include <objbase.h>
+
+#include "DirectXTex.h"
+
+// Structs for manual header parsing, must match DDS spec
+#pragma pack(push,1)
+struct DDS_PIXELFORMAT {
+    uint32_t dwSize;
+    uint32_t dwFlags;
+    uint32_t dwFourCC;
+    uint32_t dwRGBBitCount;
+    uint32_t dwRBitMask;
+    uint32_t dwGBitMask;
+    uint32_t dwBBitMask;
+    uint32_t dwABitMask;
+};
+
+struct DDS_HEADER_DXT10 {
+    DXGI_FORMAT dxgiFormat;
+    uint32_t resourceDimension;
+    uint32_t miscFlag;
+    uint32_t arraySize;
+    uint32_t miscFlags2;
+};
+
+struct DDS_HEADER {
+    uint32_t dwSize, dwFlags, dwHeight, dwWidth, dwPitchOrLinearSize, dwDepth, dwMipMapCount;
+    uint32_t dwReserved1[11];
+    DDS_PIXELFORMAT ddspf;
+    uint32_t dwCaps, dwCaps2, dwCaps3, dwCaps4, dwReserved2;
+};
+#pragma pack(pop)
+
+namespace py = pybind11;
+
+// Correctly translates FourCC and pixel format flags to a modern DXGI_FORMAT.
+DXGI_FORMAT GetDXGIFormatFromHeader(const DDS_HEADER& header, const uint8_t* file_end) {
+    const DDS_PIXELFORMAT& pf = header.ddspf;
+
+    if (pf.dwFlags & 0x4) { // DDPF_FOURCC
+        switch (pf.dwFourCC) {
+            // Standard DXT formats
+            case '1TXD': return DXGI_FORMAT_BC1_UNORM; // DXT1
+            case '3TXD': return DXGI_FORMAT_BC2_UNORM; // DXT3
+            case '5TXD': return DXGI_FORMAT_BC3_UNORM; // DXT5
+
+            // ATI/AMD formats (common alternatives)
+            case '1ITA': return DXGI_FORMAT_BC4_UNORM; // ATI1
+            case 'U4CB': return DXGI_FORMAT_BC4_UNORM; // BC4U
+            case '2ITA': return DXGI_FORMAT_BC5_UNORM; // ATI2
+            case 'U5CB': return DXGI_FORMAT_BC5_UNORM; // BC5U
+
+            // Handle DX10 extended header
+            case '01XD':
+            {
+                // The DX10 header is immediately after the main header.
+                const DDS_HEADER_DXT10* ext_header = reinterpret_cast<const DDS_HEADER_DXT10*>(reinterpret_cast<const uint8_t*>(&header) + sizeof(DDS_HEADER));
+                // Boundary check to prevent reading past the end of the file buffer
+                if (reinterpret_cast<const uint8_t*>(ext_header) + sizeof(DDS_HEADER_DXT10) > file_end) {
+                    return DXGI_FORMAT_UNKNOWN;
+                }
+                return ext_header->dxgiFormat;
+            }
+
+            default:
+                // For other FourCCs, we can try a direct cast. This is less reliable but covers some cases.
+                // DirectXTex handles a much wider range; this is purely a fallback.
+                return static_cast<DXGI_FORMAT>(pf.dwFourCC);
+        }
+    }
+
+    // Handle uncompressed formats based on bitmasks
+    if (pf.dwFlags & 0x40) { // DDPF_RGB
+        switch (pf.dwRGBBitCount) {
+            case 32:
+                if (pf.dwRBitMask == 0x00FF0000 && pf.dwGBitMask == 0x0000FF00 && pf.dwBBitMask == 0x000000FF && pf.dwABitMask == 0xFF000000)
+                    return DXGI_FORMAT_R8G8B8A8_UNORM;
+                if (pf.dwRBitMask == 0x000000FF && pf.dwGBitMask == 0x0000FF00 && pf.dwBBitMask == 0x00FF0000 && pf.dwABitMask == 0xFF000000)
+                    return DXGI_FORMAT_B8G8R8A8_UNORM;
+                break;
+            // Other uncompressed formats like R5G6B5 could be added here if needed
+        }
+    }
+
+    // Handle single-channel alpha
+    if (pf.dwFlags & 0x1) { // DDPF_ALPHA
+        if (pf.dwRGBBitCount == 8) {
+            return DXGI_FORMAT_A8_UNORM;
+        }
+    }
+
+    return DXGI_FORMAT_UNKNOWN;
+}
+
+
+// RAII wrapper for COM initialization. Ensures CoUninitialize is called.
+struct CoInitializer {
+    HRESULT hr;
+    CoInitializer() : hr(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)) {}
+    ~CoInitializer() { if (SUCCEEDED(hr)) { CoUninitialize(); } }
+};
+
+// Helper to convert HRESULT error codes into readable strings.
+std::string HResultToString(HRESULT hr) {
+    char* msg_buf = nullptr;
+    DWORD msg_len = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, hr, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&msg_buf, 0, NULL);
+    if (msg_len == 0) { std::ostringstream oss; oss << "Unknown HRESULT error: 0x" << std::hex << hr; return oss.str(); }
+    std::string msg(msg_buf, msg_len);
+    LocalFree(msg_buf);
+    return msg;
+}
+
+std::string DXGIFormatToString(DXGI_FORMAT format);
+
+py::dict decode_dds(const py::bytes& dds_bytes, size_t mip_level, size_t array_index) {
+    py::buffer_info info(py::buffer(dds_bytes).request());
+    if (info.size < 4 || memcmp(info.ptr, "DDS ", 4) != 0) { throw py::value_error("Input is not a valid DDS file."); }
+
+    std::vector<char> pixel_buffer;
+    size_t final_width = 0, final_height = 0, final_row_pitch = 0;
+    DXGI_FORMAT final_format = DXGI_FORMAT_UNKNOWN;
+
+    {
+        py::gil_scoped_release release;
+        CoInitializer co_init;
+        if (FAILED(co_init.hr)) { py::gil_scoped_acquire acquire; throw std::runtime_error("COM initialization failed: " + HResultToString(co_init.hr)); }
+
+        const uint8_t* dds_data_ptr = static_cast<const uint8_t*>(info.ptr);
+        const size_t dds_data_size = static_cast<size_t>(info.size);
+        const uint8_t* file_end = dds_data_ptr + dds_data_size;
+        auto image = std::make_unique<DirectX::ScratchImage>();
+        auto temp_image = std::make_unique<DirectX::ScratchImage>();
+        HRESULT hr = DirectX::LoadFromDDSMemory(dds_data_ptr, dds_data_size, DirectX::DDS_FLAGS_NONE, nullptr, *image);
+
+        if (FAILED(hr)) {
+            constexpr HRESULT ERROR_NOT_SUPPORTED_HRESULT = 0x80070032;
+            constexpr HRESULT ERROR_HANDLE_EOF_HRESULT = 0x80070026;
+
+            if ((hr == ERROR_NOT_SUPPORTED_HRESULT || hr == ERROR_HANDLE_EOF_HRESULT) && dds_data_size > sizeof(DDS_HEADER) + 4) {
+                const DDS_HEADER* header = reinterpret_cast<const DDS_HEADER*>(dds_data_ptr + 4);
+                DXGI_FORMAT manual_format = GetDXGIFormatFromHeader(*header, file_end);
+
+                const uint8_t* image_data_start = dds_data_ptr + 4 + sizeof(DDS_HEADER);
+                if (header->ddspf.dwFourCC == '01XD') {
+                    image_data_start += sizeof(DDS_HEADER_DXT10);
+                }
+
+                DirectX::Image manual_image = { header->dwWidth, header->dwHeight, manual_format, 0, 0, const_cast<uint8_t*>(image_data_start) };
+
+                if (manual_image.format == DXGI_FORMAT_UNKNOWN) { py::gil_scoped_acquire acquire; throw std::runtime_error("Manual header parse failed: Could not determine format."); }
+
+                size_t rowPitch, slicePitch;
+                hr = DirectX::ComputePitch(manual_image.format, manual_image.width, manual_image.height, rowPitch, slicePitch);
+                if (FAILED(hr)) { py::gil_scoped_acquire acquire; throw std::runtime_error("Manual pitch computation failed: " + HResultToString(hr)); }
+                manual_image.rowPitch = rowPitch; manual_image.slicePitch = slicePitch;
+
+                if (DirectX::IsCompressed(manual_image.format)) {
+                    hr = DirectX::Decompress(manual_image, DXGI_FORMAT_UNKNOWN, *image);
+                    if (FAILED(hr)) { py::gil_scoped_acquire acquire; throw std::runtime_error("Manual fallback decompression failed: " + HResultToString(hr)); }
+                } else {
+                    hr = image->InitializeFromImage(manual_image);
+                    if (FAILED(hr)) { py::gil_scoped_acquire acquire; throw std::runtime_error("Manual fallback initialization failed: " + HResultToString(hr)); }
+                }
+            } else {
+                py::gil_scoped_acquire acquire; throw std::runtime_error("Failed to load DDS from memory: " + HResultToString(hr));
+            }
+        }
+
+        const DirectX::TexMetadata& metadata = image->GetMetadata();
+        if (mip_level >= metadata.mipLevels || array_index >= metadata.arraySize) { py::gil_scoped_acquire acquire; throw py::value_error("mip_level or array_index is out of bounds."); }
+
+        const DirectX::Image* selected_image = image->GetImage(mip_level, array_index, 0);
+        if (!selected_image) { py::gil_scoped_acquire acquire; throw std::runtime_error("Failed to get image slice."); }
+
+        DirectX::ScratchImage current_slice;
+        hr = current_slice.InitializeFromImage(*selected_image);
+        if(FAILED(hr)) { py::gil_scoped_acquire acquire; throw std::runtime_error("Failed to initialize from slice: " + HResultToString(hr)); }
+
+        DirectX::ScratchImage* pCurrent = &current_slice;
+        DirectX::ScratchImage* pTemp = temp_image.get();
+        DXGI_FORMAT currentFormat = pCurrent->GetMetadata().format;
+
+        if (DirectX::IsCompressed(currentFormat)) {
+            hr = DirectX::Decompress(*pCurrent->GetImage(0, 0, 0), DXGI_FORMAT_UNKNOWN, *pTemp);
+            if (FAILED(hr)) { py::gil_scoped_acquire acquire; throw std::runtime_error("Failed to decompress image: " + HResultToString(hr)); }
+            std::swap(pCurrent, pTemp);
+            currentFormat = pCurrent->GetMetadata().format;
+        }
+
+        if (currentFormat != DXGI_FORMAT_R8G8B8A8_UNORM && currentFormat != DXGI_FORMAT_B8G8R8A8_UNORM) {
+            hr = DirectX::Convert(*pCurrent->GetImage(0, 0, 0), DXGI_FORMAT_R8G8B8A8_UNORM, DirectX::TEX_FILTER_DEFAULT, DirectX::TEX_THRESHOLD_DEFAULT, *pTemp);
+            if (FAILED(hr)) { py::gil_scoped_acquire acquire; std::string error_msg = "Failed to convert format " + DXGIFormatToString(currentFormat) + " to RGBA: " + HResultToString(hr); throw std::runtime_error(error_msg); }
+            std::swap(pCurrent, pTemp);
+        }
+
+        const DirectX::Image* final_image = pCurrent->GetImage(0, 0, 0);
+        if (!final_image) { py::gil_scoped_acquire acquire; throw std::runtime_error("Failed to get final image data."); }
+
+        final_width = final_image->width; final_height = final_image->height; final_row_pitch = final_image->rowPitch; final_format = final_image->format;
+        const char* pixels = reinterpret_cast<const char*>(final_image->pixels);
+        pixel_buffer.assign(pixels, pixels + final_image->slicePitch);
+    }
+
+    py::bytes pixel_data(pixel_buffer.data(), pixel_buffer.size());
+    std::string format_name = (final_format == DXGI_FORMAT_B8G8R8A8_UNORM) ? "BGRA" : "RGBA";
+    return py::dict(py::arg("width")=final_width, py::arg("height")=final_height, py::arg("data")=pixel_data, py::arg("stride")=final_row_pitch, py::arg("format")=format_name);
+}
+
+py::dict get_dds_metadata(const py::bytes& dds_bytes) {
+    py::buffer_info info(py::buffer(dds_bytes).request());
+    if (info.size < 128) { throw py::value_error("Input data too small for DDS header."); }
+    if (memcmp(info.ptr, "DDS ", 4) != 0) { throw py::value_error("Input is not a valid DDS file."); }
+
+    DirectX::TexMetadata metadata;
+    {
+        py::gil_scoped_release release;
+        const uint8_t* dds_data_ptr = static_cast<const uint8_t*>(info.ptr);
+        const size_t dds_data_size = static_cast<size_t>(info.size);
+        const uint8_t* file_end = dds_data_ptr + dds_data_size;
+        HRESULT hr = DirectX::GetMetadataFromDDSMemory(dds_data_ptr, dds_data_size, DirectX::DDS_FLAGS_NONE, metadata);
+
+        constexpr HRESULT ERROR_NOT_SUPPORTED_HRESULT = 0x80070032;
+        if (FAILED(hr)) {
+            if (hr == ERROR_NOT_SUPPORTED_HRESULT && dds_data_size > sizeof(DDS_HEADER) + 4) {
+                 const DDS_HEADER* header = reinterpret_cast<const DDS_HEADER*>(dds_data_ptr + 4);
+                 metadata.width = header->dwWidth;
+                 metadata.height = header->dwHeight;
+                 metadata.format = GetDXGIFormatFromHeader(*header, file_end);
+                 metadata.mipLevels = header->dwMipMapCount > 0 ? header->dwMipMapCount : 1;
+                 metadata.arraySize = (header->dwCaps2 & 0x200) ? header->dwDepth : 1; // Handle cubemaps
+                 metadata.depth = (header->dwFlags & 0x800000) ? header->dwDepth : 1;
+                 metadata.dimension = (header->dwFlags & 0x800000) ? DirectX::TEX_DIMENSION_TEXTURE3D : ((header->dwCaps2 & 0x200) ? DirectX::TEX_DIMENSION_TEXTURE2D : DirectX::TEX_DIMENSION_TEXTURE2D);
+            } else {
+                py::gil_scoped_acquire acquire;
+                throw std::runtime_error("Failed to get metadata from DDS memory: " + HResultToString(hr));
+            }
+        }
+    }
+
+    return py::dict(py::arg("width")=metadata.width, py::arg("height")=metadata.height, py::arg("format_str")=DXGIFormatToString(metadata.format), py::arg("mip_levels")=metadata.mipLevels, py::arg("is_cubemap")=metadata.IsCubemap(), py::arg("array_size")=metadata.arraySize, py::arg("is_3d")=(metadata.dimension == DirectX::TEX_DIMENSION_TEXTURE3D));
+}
+
+PYBIND11_MODULE(directxtex_decoder, m) {
+    m.doc() = "A high-performance C++ module to decode and inspect DDS files using DirectXTex.";
+    m.def("decode_dds", &decode_dds, "Decodes a specific MIP/array slice.", py::arg("dds_bytes"), py::arg("mip_level") = 0, py::arg("array_index") = 0);
+    m.def("get_dds_metadata", &get_dds_metadata, "Quickly reads DDS header metadata.", py::arg("dds_bytes"));
+}
+
+std::string DXGIFormatToString(DXGI_FORMAT format) {
+    #pragma region DXGI_FORMAT_ToString_Switch
+    switch (format) {
+        case DXGI_FORMAT_UNKNOWN: return "UNKNOWN";
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS: return "R32G32B32A32_TYPELESS";
+        case DXGI_FORMAT_R32G32B32A32_FLOAT: return "R32G32B32A32_FLOAT";
+        case DXGI_FORMAT_R32G32B32A32_UINT: return "R32G32B32A32_UINT";
+        case DXGI_FORMAT_R32G32B32A32_SINT: return "R32G32B32A32_SINT";
+        case DXGI_FORMAT_R32G32B32_TYPELESS: return "R32G32B32_TYPELESS";
+        case DXGI_FORMAT_R32G32B32_FLOAT: return "R32G32B32_FLOAT";
+        case DXGI_FORMAT_R32G32B32_UINT: return "R32G32B32_UINT";
+        case DXGI_FORMAT_R32G32B32_SINT: return "R32G32B32_SINT";
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: return "R16G16B16A16_TYPELESS";
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: return "R16G16B16A16_FLOAT";
+        case DXGI_FORMAT_R16G16B16A16_UNORM: return "R16G16B16A16_UNORM";
+        case DXGI_FORMAT_R16G16B16A16_UINT: return "R16G16B16A16_UINT";
+        case DXGI_FORMAT_R16G16B16A16_SNORM: return "R16G16B16A16_SNORM";
+        case DXGI_FORMAT_R16G16B16A16_SINT: return "R16G16B16A16_SINT";
+        case DXGI_FORMAT_R32G32_TYPELESS: return "R32G32_TYPELESS";
+        case DXGI_FORMAT_R32G32_FLOAT: return "R32G32_FLOAT";
+        case DXGI_FORMAT_R32G32_UINT: return "R32G32_UINT";
+        case DXGI_FORMAT_R32G32_SINT: return "R32G32_SINT";
+        case DXGI_FORMAT_R32G8X24_TYPELESS: return "R32G8X24_TYPELESS";
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return "D32_FLOAT_S8X24_UINT";
+        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: return "R32_FLOAT_X8X24_TYPELESS";
+        case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: return "X32_TYPELESS_G8X24_UINT";
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS: return "R10G10B10A2_TYPELESS";
+        case DXGI_FORMAT_R10G10B10A2_UNORM: return "R10G10B10A2_UNORM";
+        case DXGI_FORMAT_R10G10B10A2_UINT: return "R10G10B10A2_UINT";
+        case DXGI_FORMAT_R11G11B10_FLOAT: return "R11G11B10_FLOAT";
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return "R8G8B8A8_TYPELESS";
+        case DXGI_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return "R8G8B8A8_UNORM_SRGB";
+        case DXGI_FORMAT_R8G8B8A8_UINT: return "R8G8B8A8_UINT";
+        case DXGI_FORMAT_R8G8B8A8_SNORM: return "R8G8B8A8_SNORM";
+        case DXGI_FORMAT_R8G8B8A8_SINT: return "R8G8B8A8_SINT";
+        case DXGI_FORMAT_R16G16_TYPELESS: return "R16G16_TYPELESS";
+        case DXGI_FORMAT_R16G16_FLOAT: return "R16G16_FLOAT";
+        case DXGI_FORMAT_R16G16_UNORM: return "R16G16_UNORM";
+        case DXGI_FORMAT_R16G16_UINT: return "R16G16_UINT";
+        case DXGI_FORMAT_R16G16_SNORM: return "R16G16_SNORM";
+        case DXGI_FORMAT_R16G16_SINT: return "R16G16_SINT";
+        case DXGI_FORMAT_R32_TYPELESS: return "R32_TYPELESS";
+        case DXGI_FORMAT_D32_FLOAT: return "D32_FLOAT";
+        case DXGI_FORMAT_R32_FLOAT: return "R32_FLOAT";
+        case DXGI_FORMAT_R32_UINT: return "R32_UINT";
+        case DXGI_FORMAT_R32_SINT: return "R32_SINT";
+        case DXGI_FORMAT_R24G8_TYPELESS: return "R24G8_TYPELESS";
+        case DXGI_FORMAT_D24_UNORM_S8_UINT: return "D24_UNORM_S8_UINT";
+        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: return "R24_UNORM_X8_TYPELESS";
+        case DXGI_FORMAT_X24_TYPELESS_G8_UINT: return "X24_TYPELESS_G8_UINT";
+        case DXGI_FORMAT_R8G8_TYPELESS: return "R8G8_TYPELESS";
+        case DXGI_FORMAT_R8G8_UNORM: return "R8G8_UNORM";
+        case DXGI_FORMAT_R8G8_UINT: return "R8G8_UINT";
+        case DXGI_FORMAT_R8G8_SNORM: return "R8G8_SNORM";
+        case DXGI_FORMAT_R8G8_SINT: return "R8G8_SINT";
+        case DXGI_FORMAT_R16_TYPELESS: return "R16_TYPELESS";
+        case DXGI_FORMAT_R16_FLOAT: return "R16_FLOAT";
+        case DXGI_FORMAT_D16_UNORM: return "D16_UNORM";
+        case DXGI_FORMAT_R16_UNORM: return "R16_UNORM";
+        case DXGI_FORMAT_R16_UINT: return "R16_UINT";
+        case DXGI_FORMAT_R16_SNORM: return "R16_SNORM";
+        case DXGI_FORMAT_R16_SINT: return "R16_SINT";
+        case DXGI_FORMAT_R8_TYPELESS: return "R8_TYPELESS";
+        case DXGI_FORMAT_R8_UNORM: return "R8_UNORM";
+        case DXGI_FORMAT_R8_UINT: return "R8_UINT";
+        case DXGI_FORMAT_R8_SNORM: return "R8_SNORM";
+        case DXGI_FORMAT_R8_SINT: return "R8_SINT";
+        case DXGI_FORMAT_A8_UNORM: return "A8_UNORM";
+        case DXGI_FORMAT_R1_UNORM: return "R1_UNORM";
+        case DXGI_FORMAT_R9G9B9E5_SHAREDEXP: return "R9G9B9E5_SHAREDEXP";
+        case DXGI_FORMAT_R8G8_B8G8_UNORM: return "R8G8_B8G8_UNORM";
+        case DXGI_FORMAT_G8R8_G8B8_UNORM: return "G8R8_G8B8_UNORM";
+        case DXGI_FORMAT_BC1_TYPELESS: return "BC1_TYPELESS";
+        case DXGI_FORMAT_BC1_UNORM: return "BC1 (DXT1)";
+        case DXGI_FORMAT_BC1_UNORM_SRGB: return "BC1_SRGB (DXT1)";
+        case DXGI_FORMAT_BC2_TYPELESS: return "BC2_TYPELESS";
+        case DXGI_FORMAT_BC2_UNORM: return "BC2 (DXT3)";
+        case DXGI_FORMAT_BC2_UNORM_SRGB: return "BC2_SRGB (DXT3)";
+        case DXGI_FORMAT_BC3_TYPELESS: return "BC3_TYPELESS";
+        case DXGI_FORMAT_BC3_UNORM: return "BC3 (DXT5)";
+        case DXGI_FORMAT_BC3_UNORM_SRGB: return "BC3_SRGB (DXT5)";
+        case DXGI_FORMAT_BC4_TYPELESS: return "BC4_TYPELESS";
+        case DXGI_FORMAT_BC4_UNORM: return "BC4_UNORM (ATI1)";
+        case DXGI_FORMAT_BC4_SNORM: return "BC4_SNORM";
+        case DXGI_FORMAT_BC5_TYPELESS: return "BC5_TYPELESS";
+        case DXGI_FORMAT_BC5_UNORM: return "BC5_UNORM (ATI2)";
+        case DXGI_FORMAT_BC5_SNORM: return "BC5_SNORM";
+        case DXGI_FORMAT_B5G6R5_UNORM: return "B5G6R5_UNORM";
+        case DXGI_FORMAT_B5G5R5A1_UNORM: return "B5G5R5A1_UNORM";
+        case DXGI_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
+        case DXGI_FORMAT_B8G8R8X8_UNORM: return "B8G8R8X8_UNORM";
+        case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM: return "R10G10B10_XR_BIAS_A2_UNORM";
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return "B8G8R8A8_TYPELESS";
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return "B8G8R8A8_UNORM_SRGB";
+        case DXGI_FORMAT_B8G8R8X8_TYPELESS: return "B8G8R8X8_TYPELESS";
+        case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return "B8G8R8X8_UNORM_SRGB";
+        case DXGI_FORMAT_BC6H_TYPELESS: return "BC6H_TYPELESS";
+        case DXGI_FORMAT_BC6H_UF16: return "BC6H_UF16";
+        case DXGI_FORMAT_BC6H_SF16: return "BC6H_SF16";
+        case DXGI_FORMAT_BC7_TYPELESS: return "BC7_TYPELESS";
+        case DXGI_FORMAT_BC7_UNORM: return "BC7_UNORM";
+        case DXGI_FORMAT_BC7_UNORM_SRGB: return "BC7_UNORM_SRGB";
+        default:
+            std::ostringstream oss;
+            oss << "UNKNOWN_FORMAT_CODE_" << format;
+            return oss.str();
+    }
+    #pragma endregion
+}

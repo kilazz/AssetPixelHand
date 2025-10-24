@@ -1,0 +1,11 @@
+# This file tells pip which packages are required to build the C++ module.
+# It ensures that build dependencies are installed *before* setup.py is executed.
+
+[build-system]
+# A list of all dependencies needed to run setup.py and compile the C++ code.
+requires = [
+    "setuptools",
+    "cmake",
+    "pybind11"
+]
+build-backend = "setuptools.build_meta"

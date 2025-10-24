@@ -1,0 +1,332 @@
+/*
+ * QSS Theme: Dark
+ */
+
+/*----- Global Settings -----*/
+* {
+    font-family: "Helvetica Neue", "Helvetica", "Arial", sans-serif;
+    font-size: 9pt;
+}
+
+QWidget {
+    background-color: #313338;
+    color: #dcddde;
+    border: 0px;
+    padding: 0px;
+    margin: 0px;
+}
+
+QWidget:disabled {
+    color: #7c808a;
+}
+
+/*----- Main Panels (QGroupBox) -----*/
+QGroupBox {
+    font-weight: bold;
+    background-color: #2b2d31;
+    border: 1px solid #202225;
+    border-radius: 4px;
+    margin-top: 10px;
+    padding: 6px;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    padding: 0 4px 0 4px;
+    color: #949ba4;
+    font-size: 8pt;
+    text-transform: uppercase;
+}
+
+/*----- Input Fields (QLineEdit, QSpinBox, QComboBox) -----*/
+QLineEdit, QSpinBox, QComboBox {
+    background-color: #1e1f22;
+    color: #dcddde;
+    border: 1px solid #1e1f22;
+    border-radius: 3px;
+    padding: 5px;
+    min-height: 18px;
+}
+
+QLineEdit:hover, QSpinBox:hover, QComboBox:hover {
+    border: 1px solid #3c4196;
+}
+
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
+    border: 1px solid #5865f2;
+}
+
+/* === DEPENDENCY-FREE ComboBox Style === */
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 20px;
+    border-left-width: 1px;
+    border-left-color: #4e5058;
+    border-left-style: solid;
+    border-top-right-radius: 3px;
+    border-bottom-right-radius: 3px;
+}
+
+QComboBox::down-arrow {
+    /* Triangle drawn with borders, no external image needed */
+    width: 0;
+    height: 0;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 5px solid #949ba4; /* Arrow color */
+    margin: 0 auto;
+}
+
+QComboBox::down-arrow:on { /* Style when the dropdown is open */
+    border-top: 5px solid #5865f2; /* Active color */
+}
+
+QComboBox QAbstractItemView {
+    background-color: #2b2d31;
+    border: 1px solid #1e1f22;
+    selection-background-color: #40444b;
+    outline: 0;
+}
+/* ===================================== */
+
+/*----- Buttons -----*/
+QPushButton {
+    background-color: #4e5058;
+    color: #f2f3f5;
+    border: 1px solid #4e5058;
+    border-radius: 3px;
+    padding: 5px 10px;
+    font-weight: 500;
+}
+
+QPushButton:hover {
+    background-color: #5d6069;
+}
+
+QPushButton:pressed {
+    background-color: #43454b;
+}
+
+QPushButton:disabled {
+    background-color: #2b2d31;
+    color: #7c808a;
+    border-color: #3a3c41;
+}
+
+/* Primary "Scan" Button */
+QPushButton#scan_button {
+    background-color: #248046;
+    border-color: #248046;
+    font-weight: bold;
+}
+QPushButton#scan_button:hover {
+    background-color: #2a914f;
+}
+
+/* Destructive Buttons */
+QPushButton#delete_button, QPushButton#clear_all_data_button {
+    background-color: #da373c;
+    border-color: #da373c;
+}
+QPushButton#delete_button:hover, QPushButton#clear_all_data_button:hover {
+    background-color: #e8454b;
+}
+
+/* Other colored buttons */
+QPushButton#hardlink_button, QPushButton#reflink_button {
+    background-color: #5865f2;
+    border-color: #5865f2;
+}
+QPushButton#hardlink_button:hover, QPushButton#reflink_button:hover {
+    background-color: #6974f3;
+}
+QPushButton#clear_models_button {
+    background-color: #f0b132;
+    border-color: #f0b132;
+    color: #1e1f22;
+}
+QPushButton#clear_models_button:hover {
+    background-color: #f2bd4e;
+}
+
+
+/*----- Tree & List Views -----*/
+QTreeView, QListView {
+    background-color: #2b2d31;
+    border: 1px solid #202225;
+    border-radius: 4px;
+    outline: 0; /* Removes dotted focus rectangle */
+}
+
+QTreeView::item, QListView::item {
+    padding: 4px;
+    border-radius: 3px;
+}
+
+QTreeView::item:hover, QListView::item:hover {
+    background-color: #393c41;
+}
+
+QTreeView::item:selected, QListView::item:selected {
+    background-color: #5865f2; /* Я изменил цвет на тот, что у кнопок, rgba(...) может быть причиной проблем */
+    color: #f2f3f5;
+}
+
+QHeaderView::section {
+    background-color: #2b2d31;
+    color: #949ba4;
+    padding: 5px;
+    border: none;
+    border-bottom: 1px solid #202225;
+    font-weight: bold;
+    text-transform: uppercase;
+    font-size: 8pt;
+}
+
+/*----- Scroll Bars -----*/
+QScrollBar:vertical {
+    border: none;
+    background: #2b2d31;
+    width: 8px;
+    margin: 0;
+}
+
+QScrollBar::handle:vertical {
+    background: #1e1f22;
+    min-height: 20px;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: #232428;
+}
+
+QScrollBar:horizontal {
+    border: none;
+    background: #2b2d31;
+    height: 8px;
+    margin: 0px;
+}
+
+QScrollBar::handle:horizontal {
+    background: #1e1f22;
+    min-width: 20px;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background: #232428;
+}
+
+QScrollBar::add-line, QScrollBar::sub-line {
+    height: 0px;
+    width: 0px;
+}
+
+
+/*----- Other Widgets -----*/
+QSlider::groove:horizontal {
+    border: 1px solid #1e1f22;
+    height: 4px;
+    background: #1e1f22;
+    margin: 2px 0;
+    border-radius: 2px;
+}
+
+QSlider::handle:horizontal {
+    background: #dcddde;
+    border: 1px solid #dcddde;
+    width: 12px;
+    height: 12px;
+    margin: -5px 0;
+    border-radius: 6px;
+}
+QSlider::handle:horizontal:hover {
+    background: #fff;
+    border-color: #fff;
+}
+
+QCheckBox, QLabel {
+    background-color: transparent;
+}
+
+/* === FINAL CHECKBOX STYLE WITH SELECTION FIX === */
+QTreeView::indicator, QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    background-color: #1e1f22;
+    border: 1px solid #4e5058;
+    border-radius: 4px;
+}
+
+QTreeView::indicator:hover, QCheckBox::indicator:hover {
+    border-color: #5865f2;
+}
+
+QTreeView::indicator:checked, QCheckBox::indicator:checked {
+    background-color: #5865f2;
+    border: 1px solid #5865f2;
+    image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><path fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" d="M20 6L9 17l-5-5"></path></svg>');
+}
+
+QTreeView::indicator:checked:hover, QCheckBox::indicator:checked:hover {
+    background-color: #6974f3;
+    border-color: #6974f3;
+}
+
+/* [NEW] This block fixes the background issue on selected items */
+QTreeView::indicator:selected:unchecked, QTreeView::indicator:selected:!checked {
+    background-color: #1e1f22;
+}
+
+QTreeView::indicator:selected:checked {
+    background-color: #5865f2;
+}
+/* =============================================== */
+
+
+QSplitter::handle {
+    background-color: #202225;
+}
+
+QSplitter::handle:hover {
+    background-color: #5865f2;
+}
+
+QSplitter::handle:horizontal, QSplitter::handle:vertical {
+    width: 2px;
+    height: 2px;
+}
+
+QPlainTextEdit#log_display {
+    background-color: #1e1f22;
+    border: 1px solid #202225;
+    border-radius: 3px;
+    padding: 5px;
+    font-family: "Consolas", "Monaco", monospace;
+}
+
+QMenu {
+    background-color: #1e1f22;
+    border: 1px solid #101113;
+    padding: 4px;
+}
+
+QMenu::item {
+    padding: 5px 20px 5px 20px;
+    border-radius: 3px;
+}
+
+QMenu::item:selected {
+    background-color: #5865f2;
+    color: #f2f3f5;
+}
+
+QMenu::separator {
+    height: 1px;
+    background-color: #313338;
+    margin: 4px 0px;
+}

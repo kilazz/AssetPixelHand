@@ -1,0 +1,96 @@
+/*
+ *  Default
+ */
+
+/* Main Window General Styles */
+QMainWindow {
+    background-color: #282828;
+    color: #cccccc;
+    font-family: "Roboto", "Open Sans", sans-serif;
+    font-size: 13px;
+}
+
+/* PushButton Styles */
+QPushButton {
+    background-color: #3c3c3c;
+    border: 1px solid #444444;
+    padding: 5px 10px;
+    border-radius: 3px;
+    color: #cccccc;
+}
+
+QPushButton:hover {
+    background-color: #4c4c4c;
+    border: 1px solid #555555;
+}
+
+QPushButton:pressed {
+    background-color: #00aaff;
+    border: 1px solid #00557f;
+    color: #ffffff;
+}
+
+/* LineEdit (Input Field) Styles */
+QLineEdit {
+    background-color: #3c3c3c;
+    border: 1px solid #444444;
+    padding: 5px;
+    border-radius: 3px;
+    color: #cccccc;
+}
+
+QLineEdit:focus {
+    border: 1px solid #00aaff;
+}
+
+/* MenuBar and Menu Styles */
+QMenuBar {
+    background-color: #282828;
+    color: #cccccc;
+}
+
+QMenuBar::item {
+    background-color: transparent;
+    padding: 5px 10px;
+}
+
+QMenuBar::item:selected {
+    background-color: #00aaff;
+    color: #ffffff;
+}
+
+QMenu {
+    background-color: #282828;
+    border: 1px solid #444444;
+    color: #cccccc;
+}
+
+QMenu::item:selected {
+    background-color: #00aaff;
+    color: #ffffff;
+}
+
+/* ScrollBar Styles */
+QScrollBar:vertical {
+    border: 1px solid #444444;
+    background: #282828;
+    width: 15px;
+    margin: 15px 0 15px 0;
+}
+
+QScrollBar::handle:vertical {
+    background: #4c4c4c;
+    min-height: 20px;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    border: 1px solid #444444;
+    background: #3c3c3c;
+    height: 14px;
+    subcontrol-position: top;
+    subcontrol-origin: margin;
+}
+
+QScrollBar::add-line:vertical {
+    subcontrol-position: bottom;
+}
