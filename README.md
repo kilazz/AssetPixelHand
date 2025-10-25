@@ -14,7 +14,7 @@
     *   **Wipe & Overlay**: Interactively compare two images using a slider or by blending them.
 
 *   **⚙️ Deep Performance Tuning**: Take full control over every aspect of the scan:
-    *   **Compute Precision (FP16/FP32)**: Nearly double your performance on modern GPUs with a minimal trade-off in accuracy.
+    *   **Compute Precision (FP32/FP16)**: Nearly double your performance on modern GPUs with a minimal trade-off in accuracy.
     *   **Batch Size**: Optimize VRAM usage for maximum throughput.
     *   **Search Precision**: Fine-tune the vector database's trade-off between speed and result completeness.
 
@@ -42,6 +42,7 @@ The project is designed for an effortless launch.
 2.  Run `run.bat`.
 
 The script will automatically set up a virtual environment, install all necessary dependencies, and launch the application.
+
 
 
 
