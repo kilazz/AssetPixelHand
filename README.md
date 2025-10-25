@@ -19,7 +19,7 @@
     *   **Search Precision**: Fine-tune the vector database's trade-off between speed and result completeness.
 
 *   **📁 Universal Format Support**: Extensive, built-in support for dozens of formats thanks to a multi-layered loading system (`DirectXTex`, `OpenCV`, `PyVips`, `Pillow`):
-    *   **Supported Formats**: `PNG`, `JPG`, `WEBP`, `AVIF`, `PSD`, `EXR`, `HDR`, `TIFF`, `DDS`, `TGA` and more.
+    *   **Supported Formats**: `PNG`, `JPG`, `WEBP`, `AVIF`, `HEIF`, `PSD`, `EXR`, `HDR`, `TIFF`, `DDS`, `TGA` and more.
 
 *   **💾 Efficient File Management**:
     *   **Hardlink Replacement**: Save gigabytes of disk space by replacing duplicate files with hardlinks to a single source file, all without breaking your project's folder structure.
@@ -42,4 +42,5 @@ The project is designed for an effortless launch.
 2.  Run `run.bat`.
 
 The script will automatically set up a virtual environment, install all necessary dependencies, and launch the application.
+
 
