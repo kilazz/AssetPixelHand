@@ -4,9 +4,9 @@ A small utility for finding duplicates and similar images.
 
 ## How to Run
 
-### Step 1: Install **Python 3.12** or newer. ~
+### Install **Python 3.12** or newer. ~
 
-### Step 2: Download and Run the Program
+### Download and Run the Program
 
 1. Click and select **`Download ZIP`**.
 2. Unzip the downloaded archive to a convenient location.
