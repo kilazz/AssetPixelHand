@@ -18,7 +18,7 @@
     *   **Batch Size**: Optimize VRAM usage for maximum throughput.
     *   **Search Precision**: Fine-tune the vector database's trade-off between speed and result completeness.
 
-*   **📁 Universal Format Support**: Extensive, built-in support for dozens of formats thanks to a multi-layered loading system (`DirectXTex`, `OpenCV`, `PyVips`, `Pillow`):
+*   **📁 Universal Format Support**: Extensive, built-in support for dozens of formats thanks to a multi-layered loading system (`PyVips`, `OpenCV`, `Pillow`, `DirectXTex Decoder`):
     *   **Supported Formats**: `PNG`, `JPG`, `WEBP`, `AVIF`, `HEIF`, `PSD`, `EXR`, `HDR`, `TIFF`, `DDS`, `TGA` and more.
 
 *   **💾 Efficient File Management**:
@@ -42,5 +42,6 @@ The project is designed for an effortless launch.
 2.  Run `run.bat`.
 
 The script will automatically set up a virtual environment, install all necessary dependencies, and launch the application.
+
 
 
