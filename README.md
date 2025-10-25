@@ -1,5 +1,5 @@
 # AssetPixelHand
-**An advanced AI-powered tool for finding and managing duplicate and visually similar images.**
+**An AI-powered tool for finding and managing duplicate and visually similar images.**
 
 > **Note: This is a  Prototype**
 
@@ -42,6 +42,7 @@ The project is designed for an effortless launch.
 2.  Run `run.bat`.
 
 The script will automatically set up a virtual environment, install all necessary dependencies, and launch the application.
+
 
 
 
