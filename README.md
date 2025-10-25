@@ -42,8 +42,3 @@ The project is designed for an effortless launch.
 2.  Run `run.bat`.
 
 The script will automatically set up a virtual environment, install all necessary dependencies, and launch the application.
-
-
-
-
-

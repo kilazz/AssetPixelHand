@@ -56,7 +56,7 @@ from app.gui_dialogs import FileTypesDialog
 from app.gui_models import ImageItemDelegate, ImagePreviewModel, ResultsTreeModel
 from app.gui_tasks import ImageLoader
 from app.gui_widgets import AlphaBackgroundWidget, ImageCompareWidget, ResizedListView
-from app.utils import OPENCV_AVAILABLE
+from app.utils import OPENCV_AVAILABLE, _load_image_static_cached
 
 app_logger = logging.getLogger("AssetPixelHand.gui.panels")
 
@@ -684,7 +684,18 @@ class ResultsPanel(QGroupBox):
         if not to_link:
             QMessageBox.warning(self, "No Selection", "No duplicate files selected to replace.")
             return
-        msg = f"This will PERMANENTLY DELETE the data of {len(to_link)} files and replace them with hardlinks. This action cannot be undone.\n\nAre you sure?"
+
+        # [FIX] Improved warning message for clarity
+        msg = (
+            f"This will replace {len(to_link)} duplicate files with hardlinks to the best file.\n\n"
+            f"⚠️ IMPORTANT:\n"
+            f"• The original file data will be preserved\n"
+            f"• Duplicate files will become pointers to the same data\n"
+            f"• If you edit any linked file, ALL linked copies will change\n"
+            f"• This operation cannot be undone\n\n"
+            f"Are you sure you want to continue?"
+        )
+
         if QMessageBox.question(self, "Confirm Hardlink Replacement", msg) == QMessageBox.StandardButton.Yes:
             self.set_operation_in_progress(FileOperation.HARDLINKING)
             self.hardlink_requested.emit(to_link)
@@ -695,7 +706,18 @@ class ResultsPanel(QGroupBox):
         if not to_link:
             QMessageBox.warning(self, "No Selection", "No duplicate files selected to replace.")
             return
-        msg = f"This will PERMANENTLY DELETE the data of {len(to_link)} files and replace them with space-saving reflinks (CoW links). This action cannot be undone.\n\nAre you sure?"
+
+        # [FIX] Improved warning message for reflink
+        msg = (
+            f"This will replace {len(to_link)} duplicate files with reflinks (Copy-on-Write).\n\n"
+            f"ℹ️ INFO:\n"
+            f"• Creates space-saving copies that share data blocks\n"
+            f"• When you edit a file, only the changed blocks are duplicated\n"
+            f"• Safer than hardlinks but requires filesystem support (APFS, Btrfs, XFS, ReFS)\n"
+            f"• This operation cannot be undone\n\n"
+            f"Are you sure you want to continue?"
+        )
+
         if QMessageBox.question(self, "Confirm Reflink Replacement", msg) == QMessageBox.StandardButton.Yes:
             self.set_operation_in_progress(FileOperation.REFLINKING)
             self.reflink_requested.emit(to_link)
@@ -1071,7 +1093,21 @@ class ImageViewerPanel(QGroupBox):
         del self.active_loaders[path_str]
         self.active_loader_timestamps.pop(path_str, None)
         self.compare_pixmaps[path_str] = pixmap
-        self.compare_pil_images[path_str] = Image.fromqpixmap(pixmap)
+
+        # [FIX] Load original PIL image separately to avoid QPixmap conversion artifacts
+        try:
+            original_img = _load_image_static_cached(
+                path_str, target_size=None, tonemap_mode=self.tonemap_mode_combo.currentText().lower()
+            )
+            if original_img:
+                self.compare_pil_images[path_str] = original_img
+            else:
+                # Fallback to converting from pixmap
+                self.compare_pil_images[path_str] = Image.fromqpixmap(pixmap)
+        except Exception as e:
+            app_logger.warning(f"Could not load original image for comparison, using pixmap: {e}")
+            self.compare_pil_images[path_str] = Image.fromqpixmap(pixmap)
+
         if len(self.compare_pixmaps) == 2:
             self.load_timeout_timer.stop()
             self._update_channel_controls_based_on_images()

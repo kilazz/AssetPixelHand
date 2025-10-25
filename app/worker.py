@@ -76,8 +76,15 @@ class InferenceEngine:
             return np.array([])
         inputs = self.processor(images=image_list_for_processor, return_tensors="np")
         pixel_values = inputs.pixel_values.astype(np.float16 if self.is_fp16 else np.float32)
-        # [FIX] Restore the [0] to correctly extract the numpy array from the list returned by session.run()
-        embeddings = self.visual_session.run(None, {"pixel_values": pixel_values})[0]
+
+        # [FIX] Added safety check for ONNX output format
+        outputs = self.visual_session.run(None, {"pixel_values": pixel_values})
+        if not outputs or len(outputs) == 0:
+            app_logger.error("ONNX visual model returned empty output")
+            return np.array([])
+
+        app_logger.debug(f"Visual model outputs: {len(outputs)} tensors, shapes: {[o.shape for o in outputs]}")
+        embeddings = outputs[0]
         return normalize_vectors_numpy(embeddings)
 
     def get_text_features(self, text: str) -> np.ndarray:
@@ -94,8 +101,15 @@ class InferenceEngine:
         onnx_inputs = {"input_ids": inputs["input_ids"]}
         if "attention_mask" in self.text_input_names:
             onnx_inputs["attention_mask"] = inputs["attention_mask"]
-        # [FIX] Restore the [0] here as well for the text model.
-        embedding = self.text_session.run(None, onnx_inputs)[0]
+
+        # [FIX] Added safety check for text model output
+        outputs = self.text_session.run(None, onnx_inputs)
+        if not outputs or len(outputs) == 0:
+            app_logger.error("ONNX text model returned empty output")
+            return np.array([])
+
+        app_logger.debug(f"Text model outputs: {len(outputs)} tensors, shapes: {[o.shape for o in outputs]}")
+        embedding = outputs[0]
         return normalize_vectors_numpy(embedding).flatten()
 
 
@@ -193,7 +207,14 @@ def inference_worker_loop(config: dict, tensor_q: "multiprocessing.Queue", resul
                 break
             pixel_values, fps, skipped = item
             if pixel_values is not None and pixel_values.size > 0:
-                embeddings = g_inference_engine.visual_session.run(None, {"pixel_values": pixel_values})[0]
+                # [FIX] Added safety check for inference output
+                outputs = g_inference_engine.visual_session.run(None, {"pixel_values": pixel_values})
+                if not outputs or len(outputs) == 0:
+                    app_logger.error("Inference worker: model returned empty output")
+                    results_q.put(([], skipped))
+                    continue
+
+                embeddings = outputs[0]
                 embeddings = normalize_vectors_numpy(embeddings)
                 for i, data in enumerate(fps):
                     data.hashes = embeddings[i].flatten()

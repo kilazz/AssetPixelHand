@@ -35,6 +35,12 @@ def setup_dll_paths():
         import sysconfig
 
         packages_dir = sysconfig.get_path("purelib")
+
+        # [FIX] Added fallback for frozen/bundled applications
+        if not packages_dir or not Path(packages_dir).exists():
+            packages_dir = os.path.join(sys.prefix, "Lib", "site-packages")
+            print(f"[INFO] Using fallback packages directory: {packages_dir}")
+
         if packages_dir and Path(packages_dir).exists():
             current_path = os.environ.get("PATH", "")
             new_path = f"{packages_dir};{current_path}"
