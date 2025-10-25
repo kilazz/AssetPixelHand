@@ -15,6 +15,7 @@ from pathlib import Path
 from queue import Empty
 
 import numpy as np
+import pandas as pd
 from PySide6.QtCore import QObject
 
 import app.worker as worker
@@ -25,7 +26,6 @@ from app.utils import find_best_in_group
 
 if LANCEDB_AVAILABLE:
     import lancedb
-    import pandas as pd  # [ADDED] This line was missing
 
 app_logger = logging.getLogger("AssetPixelHand.engines")
 

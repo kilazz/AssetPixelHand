@@ -40,14 +40,12 @@ class QtHandler(logging.Handler):
             self.signals_emitter.log.emit(message, log_level)
 
 
-# [MODIFIED] The function now accepts a 'force_debug' flag.
 def setup_logging(ui_signals_emitter: QObject | None = None, force_debug: bool = False):
     """
     Configures the root logger for the application.
     - Directs logs to console, a rotating file, and optionally the GUI.
     - Logging level can be set to DEBUG via the APP_DEBUG environment variable or the force_debug flag.
     """
-    # [MODIFIED] 'force_debug' flag takes priority.
     is_debug = force_debug or os.environ.get("APP_DEBUG", "false").lower() in ("1", "true")
     log_level = logging.DEBUG if is_debug else logging.INFO
 

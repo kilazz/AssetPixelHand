@@ -115,12 +115,8 @@ def check_onnx_backend() -> bool:
         return False
 
 
-# [REMOVED] The entire check_pyvips_loaders function has been deleted as requested.
-
-
 def check_onnx_model_compatibility() -> bool:
     """Generates and tests different ONNX model formats in a temporary directory."""
-    # [CHANGED] Section number updated from 5 to 4.
     print_header("4. ONNX Model Format Compatibility Test")
     try:
         import numpy as np
@@ -179,7 +175,6 @@ def main() -> int:
     """Runs all diagnostic checks and prints a final summary."""
     print_header("AssetPixelHand Environment Diagnostic Tool", "*")
 
-    # [CHANGED] Removed "PyVips Loaders" from the dictionary of checks.
     check_results = {
         "Python Version": check_python_version(),
         "Library Imports": check_library_imports(),

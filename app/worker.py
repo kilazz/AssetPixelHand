@@ -76,6 +76,7 @@ class InferenceEngine:
             return np.array([])
         inputs = self.processor(images=image_list_for_processor, return_tensors="np")
         pixel_values = inputs.pixel_values.astype(np.float16 if self.is_fp16 else np.float32)
+        # [FIX] Restore the [0] to correctly extract the numpy array from the list returned by session.run()
         embeddings = self.visual_session.run(None, {"pixel_values": pixel_values})[0]
         return normalize_vectors_numpy(embeddings)
 
@@ -93,6 +94,7 @@ class InferenceEngine:
         onnx_inputs = {"input_ids": inputs["input_ids"]}
         if "attention_mask" in self.text_input_names:
             onnx_inputs["attention_mask"] = inputs["attention_mask"]
+        # [FIX] Restore the [0] here as well for the text model.
         embedding = self.text_session.run(None, onnx_inputs)[0]
         return normalize_vectors_numpy(embedding).flatten()
 
@@ -108,7 +110,6 @@ def _init_worker_process(config: dict):
             pass
 
 
-# [RESTORED] This function was missing.
 def init_cpu_worker(config: dict):
     _init_worker_process(config)
 
@@ -131,10 +132,7 @@ def _process_batch_from_paths(paths: list[Path], input_size) -> tuple[list, list
                 skipped_paths.append(str(path))
                 continue
 
-            # [CHANGED] Call to the refactored image loader.
-            # For AI inference, we need the raw, linear pixel data from HDR files,
-            # so tonemapping is explicitly disabled.
-            img_obj = _load_image_static_cached(path, target_size=input_size, tonemap_exr=False)
+            img_obj = _load_image_static_cached(path, target_size=input_size, tonemap_mode="none")
 
             if img_obj is not None:
                 images.append(img_obj)

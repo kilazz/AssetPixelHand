@@ -100,8 +100,8 @@ class SizeLimitedLRUCache:
                 key_hash.update(str(path_or_buffer).encode())
 
             target_size = kwargs.get("target_size")
-            tonemap = kwargs.get("tonemap_exr", True)
-            key = f"{key_hash.hexdigest()}_{target_size}_{tonemap}"
+            tonemap_mode = kwargs.get("tonemap_mode", "none")
+            key = f"{key_hash.hexdigest()}_{target_size}_{tonemap_mode}"
 
             with self.lock:
                 if key in self.cache:
@@ -126,15 +126,17 @@ class SizeLimitedLRUCache:
 image_loader_cache = SizeLimitedLRUCache(max_size_mb=1024)
 
 
-@image_loader_cache
-def _load_image_static_cached(
-    path_or_buffer: str | Path | io.BytesIO, target_size: tuple[int, int] | None = None, tonemap_exr: bool = True
+def _load_image_core(
+    path_or_buffer: str | Path | io.BytesIO, target_size: tuple[int, int] | None = None, tonemap_mode: str = "none"
 ) -> Image.Image | None:
-    """Loads an image using an optimized chain of loaders and caches the result."""
+    """
+    Core image loading logic without caching. It uses an optimized chain of loaders.
+    This function is not decorated with a cache.
+    """
     original_max_pixels = Image.MAX_IMAGE_PIXELS
     try:
         Image.MAX_IMAGE_PIXELS = None
-        img = _load_image_with_optimal_chain(path_or_buffer, tonemap_exr)
+        img = _load_image_with_optimal_chain(path_or_buffer, tonemap_mode)
 
         if img is None:
             utils_logger.warning(f"All loading methods failed for {path_or_buffer}")
@@ -153,7 +155,18 @@ def _load_image_static_cached(
         Image.MAX_IMAGE_PIXELS = original_max_pixels
 
 
-def _load_image_with_optimal_chain(path_or_buffer: str | Path | io.BytesIO, tonemap_exr: bool) -> Image.Image | None:
+@image_loader_cache
+def _load_image_static_cached(
+    path_or_buffer: str | Path | io.BytesIO, target_size: tuple[int, int] | None = None, tonemap_mode: str = "none"
+) -> Image.Image | None:
+    """
+    A wrapper around the core loading function that applies caching.
+    Used for thumbnails to ensure UI responsiveness.
+    """
+    return _load_image_core(path_or_buffer, target_size, tonemap_mode)
+
+
+def _load_image_with_optimal_chain(path_or_buffer: str | Path | io.BytesIO, tonemap_mode: str) -> Image.Image | None:
     """Implements the ideal loading chain based on diagnostic test results."""
     if not isinstance(path_or_buffer, (str, Path)):
         try:
@@ -181,14 +194,39 @@ def _load_image_with_optimal_chain(path_or_buffer: str | Path | io.BytesIO, tone
         try:
             with path.open("rb") as f:
                 decoded = directxtex_decoder.decode_dds(f.read())
-            numpy_array = decoded["data"]
-            if decoded.get("format") == "BGRA":
-                numpy_array = numpy_array[:, :, [2, 1, 0, 3]]
-            return Image.fromarray(numpy_array)
+            np_array = decoded["data"]
+
+            format_str = decoded.get("format_str", "").upper()
+            is_hdr_dds = "BC6H" in format_str or "FLOAT" in format_str
+
+            if is_hdr_dds and OPENCV_AVAILABLE:
+                if len(np_array.shape) == 3 and np_array.shape[2] == 4 and "BGRA" in format_str:
+                    np_array = cv2.cvtColor(np_array, cv2.COLOR_BGRA2RGBA)
+
+                np_array = np.nan_to_num(np_array, copy=True)
+                if tonemap_mode != "none":
+                    # Use aggressive parameters for DDS HDR, as its decoded range is typically small (e.g., 0-1).
+                    if tonemap_mode == "reinhard":
+                        tonemap = cv2.createTonemapReinhard(gamma=2.2, intensity=3.0, light_adapt=0.6, color_adapt=0.4)
+                    elif tonemap_mode == "drago":
+                        tonemap = cv2.createTonemapDrago(gamma=2.2, saturation=1.0, bias=0.85)
+                    else:
+                        tonemap = cv2.createTonemapReinhard(gamma=2.2, intensity=3.0, light_adapt=0.6, color_adapt=0.4)
+
+                    ldr = tonemap.process(np_array.astype(np.float32))
+                    ldr = np.nan_to_num(ldr, copy=True)
+                    img_8bit = np.clip(ldr * 255, 0, 255).astype(np.uint8)
+                else:
+                    img_8bit = np.clip(np_array * 255, 0, 255).astype(np.uint8)
+                return Image.fromarray(img_8bit)
+            else:
+                if decoded.get("format") == "BGRA":
+                    np_array = np_array[:, :, [2, 1, 0, 3]]
+                return Image.fromarray(np_array)
         except Exception as e:
             utils_logger.debug(f"DirectXTex failed for {path.name}: {e}. Falling back to Pillow.")
 
-    if ext in [".exr", ".hdr"] and OPENCV_AVAILABLE:
+    if ext in [".exr", ".hdr", ".tif", ".tiff"] and OPENCV_AVAILABLE:
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 np_array = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
@@ -202,20 +240,29 @@ def _load_image_with_optimal_chain(path_or_buffer: str | Path | io.BytesIO, tone
                     np_array = cv2.cvtColor(np_array, cv2.COLOR_BGR2RGB)
 
             if np.issubdtype(np_array.dtype, np.floating):
-                np_array = np.nan_to_num(np_array)
-                if tonemap_exr:
-                    tonemap = cv2.createTonemapReinhard(gamma=2.2, intensity=0.3, light_adapt=0.4, color_adapt=0.0)
+                np_array = np.nan_to_num(np_array, copy=True)
+                if tonemap_mode != "none":
+                    # Use softer parameters for EXR/TIFF, as they often have a very large dynamic range.
+                    if tonemap_mode == "reinhard":
+                        tonemap = cv2.createTonemapReinhard(gamma=2.2, intensity=0.3, light_adapt=0.4, color_adapt=0.0)
+                    elif tonemap_mode == "drago":
+                        tonemap = cv2.createTonemapDrago(gamma=2.2, saturation=1.0, bias=0.85)
+                    else:
+                        tonemap = cv2.createTonemapReinhard(gamma=2.2, intensity=0.3, light_adapt=0.4, color_adapt=0.0)
+
                     ldr = tonemap.process(np_array.astype(np.float32))
-                    ldr = np.nan_to_num(ldr)
+                    ldr = np.nan_to_num(ldr, copy=True)
                     img_8bit = np.clip(ldr * 255, 0, 255).astype(np.uint8)
                 else:
                     img_8bit = np.clip(np_array * 255, 0, 255).astype(np.uint8)
             else:
-                img_8bit = np_array.astype(np.uint8)
+                if np_array.dtype == np.uint16:
+                    img_8bit = (np_array / 256).astype(np.uint8)
+                else:
+                    img_8bit = np_array.astype(np.uint8)
             return Image.fromarray(img_8bit)
         except Exception as e:
-            utils_logger.warning(f"OpenCV (HDR/EXR handler) failed for {path.name}: {e}")
-            return None
+            utils_logger.warning(f"OpenCV failed for {path.name}: {e}. Falling back.")
 
     if PYVIPS_AVAILABLE:
         try:
@@ -251,6 +298,9 @@ def get_image_metadata(path: Path) -> dict[str, Any] | None:
                     dds_meta = directxtex_decoder.get_dds_metadata(f.read())
                 format_str = dds_meta["format_str"].upper()
                 has_alpha = any(s in format_str for s in ["A8", "BC2", "BC3", "BC7", "DXT2", "DXT3", "DXT4", "DXT5"])
+                bit_depth = (
+                    16 if "BC6H" in format_str or "FLOAT16" in format_str else 32 if "FLOAT32" in format_str else 8
+                )
                 return {
                     "resolution": (dds_meta["width"], dds_meta["height"]),
                     "file_size": stat.st_size,
@@ -259,12 +309,12 @@ def get_image_metadata(path: Path) -> dict[str, Any] | None:
                     "format_details": f"DDS ({format_str})",
                     "has_alpha": has_alpha,
                     "capture_date": None,
-                    "bit_depth": 8,
+                    "bit_depth": bit_depth,
                 }
             except Exception:
-                raise
+                pass
 
-        if ext_lower in [".exr", ".hdr"] and OPENCV_AVAILABLE:
+        if ext_lower in [".exr", ".hdr", ".tif", ".tiff"] and OPENCV_AVAILABLE:
             try:
                 img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
                 if img is None:
@@ -286,7 +336,6 @@ def get_image_metadata(path: Path) -> dict[str, Any] | None:
 
         if pyvips is not None:
             try:
-                # [CHANGED] Suppress stderr to hide noisy VIPS warnings
                 with contextlib.redirect_stderr(io.StringIO()):
                     image = pyvips.Image.new_from_file(str(path), access="sequential")
                 bit_depth_map = {"uchar": 8, "ushort": 16, "float": 32, "double": 64}

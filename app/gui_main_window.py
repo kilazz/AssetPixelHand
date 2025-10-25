@@ -27,7 +27,6 @@ from PySide6.QtWidgets import (
 from app.constants import (
     DEEP_LEARNING_AVAILABLE,
     DIRECTXTEX_AVAILABLE,
-    # [REMOVED] DUCKDB_AVAILABLE is no longer directly used in this file.
     PYVIPS_AVAILABLE,
     SCRIPT_DIR,
     VISUALS_DIR,
@@ -38,7 +37,6 @@ from app.constants import (
 from app.data_models import AppSettings, PerformanceConfig, ScanConfig
 from app.gui_dialogs import ModelConversionDialog, ScanStatisticsDialog, SkippedFilesDialog
 from app.gui_panels import (
-    # [CHANGED] Import the new FileOperation enum
     FileOperation,
     ImageViewerPanel,
     LogPanel,
@@ -51,10 +49,6 @@ from app.gui_panels import (
 from app.logging_config import setup_logging
 from app.scanner import ScannerController
 from app.utils import check_link_support, clear_all_app_data, clear_models_cache, clear_scan_cache, is_onnx_model_cached
-
-# [REMOVED] duckdb is no longer needed here. The model handles all DB interactions.
-# if DUCKDB_AVAILABLE:
-#     import duckdb
 
 app_logger = logging.getLogger("AssetPixelHand.gui.main")
 
@@ -246,7 +240,6 @@ class App(QMainWindow):
     def _request_settings_save(self):
         self.settings_save_timer.start()
 
-    # [CHANGED] This entire function is refactored to match the new architecture.
     def _log_system_status(self):
         app_logger.info("Application ready. Checking system capabilities...")
 
@@ -426,8 +419,6 @@ class App(QMainWindow):
             self.log_panel.log_message("Another file operation is in progress.", "warning")
             return
         self.set_ui_scan_state(is_scanning=True)
-        # [REMOVED] The logic to set button text is now managed by ResultsPanel.
-        # self.results_panel.delete_button.setText("Deleting...")
         self.log_panel.log_message(f"Moving {len(paths_to_delete)} files to trash...", "info")
         self.delete_thread = threading.Thread(target=self._delete_worker, args=(paths_to_delete,), daemon=True)
         self.delete_thread.start()
@@ -447,7 +438,6 @@ class App(QMainWindow):
 
     @Slot(list, int, int)
     def _on_delete_complete(self, affected_paths, count, failed):
-        # [CHANGED] Determine operation name based on the explicit state, not button text.
         op_name = "Moved"
         current_op = self.results_panel.current_operation
         if current_op in [FileOperation.HARDLINKING, FileOperation.REFLINKING]:
@@ -458,7 +448,6 @@ class App(QMainWindow):
         self.results_panel.update_after_deletion(affected_paths)
         self.viewer_panel.clear_viewer()
         self.set_ui_scan_state(is_scanning=False)
-        # [CHANGED] Reset the operation state and button texts via the panel's method.
         self.results_panel.clear_operation_in_progress()
 
     @Slot()
@@ -478,23 +467,12 @@ class App(QMainWindow):
         if not paths:
             self.log_panel.log_message("No valid duplicates selected for linking.", "warning")
             return
-        # [REMOVED] db_path is no longer needed as the model is the source of truth.
-        # db_path = self.results_panel.results_model.db_path
-        # if not (db_path and db_path.exists()):
-        #     self.log_panel.log_message("Results database not found. Cannot perform linking.", "error")
-        #     return
         self.set_ui_scan_state(is_scanning=True)
-        # [REMOVED] The logic to set button text is now managed by ResultsPanel.
-        # button = self.results_panel.hardlink_button if method == "hardlink" else self.results_panel.reflink_button
-        # button.setText("Linking...")
         self.log_panel.log_message(f"Replacing {len(paths)} files with {method}s...", "info")
-        # [CHANGED] The worker no longer needs the db_path.
         self.delete_thread = threading.Thread(target=self._link_worker, args=(paths, method), daemon=True)
         self.delete_thread.start()
 
-    # [CHANGED] The worker now gets the link map directly from the model.
     def _link_worker(self, paths_to_replace: list[Path], method: str):
-        # [CHANGED] Get the link map from the model, not by querying the DB.
         link_map = self.results_panel.results_model.get_link_map_for_paths(paths_to_replace)
 
         if not link_map:
@@ -522,10 +500,6 @@ class App(QMainWindow):
         self.controller.signals.deletion_finished.emit(affected, replaced, failed)
         if failed_list:
             self.controller.signals.log.emit(f"Failed to link: {', '.join(failed_list)}", "error")
-
-    # [REMOVED] This method is no longer needed as the logic has been moved to ResultsTreeModel.
-    # def _prepare_link_map_from_db(self, paths_to_replace: list[Path], db_path: Path) -> dict[Path, Path]:
-    #     ...
 
     def _show_results_context_menu(self, pos):
         idx = self.results_panel.results_view.indexAt(pos)

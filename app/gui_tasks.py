@@ -17,7 +17,7 @@ from PySide6.QtGui import QPixmap
 
 from app.constants import DEEP_LEARNING_AVAILABLE, QuantizationMode
 from app.model_adapter import get_model_adapter
-from app.utils import _load_image_static_cached
+from app.utils import _load_image_core, _load_image_static_cached
 
 if TYPE_CHECKING:
     import torch
@@ -42,7 +42,6 @@ class ModelConverter(QRunnable):
         self.adapter = get_model_adapter(self.hf_model_name)
 
     def run(self):
-        # These imports are local to the thread to avoid issues with multiprocessing contexts.
         import torch
         from PIL import Image
 
@@ -61,7 +60,6 @@ class ModelConverter(QRunnable):
 
             target_dir = self._setup_directories(MODELS_DIR)
 
-            # Check if a valid cached model already exists
             vision_exists = (target_dir / "visual.onnx").exists()
             text_exists = (target_dir / "text.onnx").exists()
             if vision_exists and (not self.adapter.has_text_model() or text_exists):
@@ -85,7 +83,6 @@ class ModelConverter(QRunnable):
             app_logger.error(msg, exc_info=True)
             self.signals.finished.emit(False, str(e))
         finally:
-            # Restore original environment setting for progress bars
             if original_progress_bar_setting is None:
                 if "HF_HUB_DISABLE_PROGRESS_BARS" in os.environ:
                     del os.environ["HF_HUB_DISABLE_PROGRESS_BARS"]
@@ -99,7 +96,6 @@ class ModelConverter(QRunnable):
         target_dir = models_dir / target_dir_name
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save the processor config to the target directory so it can be loaded later.
         ProcessorClass = self.adapter.get_processor_class()
         processor = ProcessorClass.from_pretrained(self.hf_model_name)
         processor.save_pretrained(target_dir)
@@ -144,7 +140,6 @@ class ModelConverter(QRunnable):
                 return_attention_mask=True,
             )
 
-            # Determine the required inputs for the text model's forward pass
             sig = inspect.signature(text_wrapper.forward)
             if "attention_mask" in sig.parameters:
                 onnx_inputs = (dummy_text_input["input_ids"], dummy_text_input["attention_mask"])
@@ -178,29 +173,34 @@ class ImageLoader(QRunnable):
         finished = Signal(str, object)
         error = Signal(str, str)
 
-    def __init__(self, path_str: str, target_size: int | None, tonemap_exr: bool = True):
+    # [FIX] Changed 'tonemap_exr' to 'tonemap_mode' to accept the new string-based parameter.
+    def __init__(self, path_str: str, target_size: int | None, tonemap_mode: str = "reinhard", use_cache: bool = True):
         super().__init__()
         self.path_str = path_str
         self.target_size = target_size
-        self.tonemap_exr = tonemap_exr
+        self.tonemap_mode = tonemap_mode
         self.signals = self.Signals()
         self._is_cancelled = False
+        self.use_cache = use_cache
 
     @property
     def is_cancelled(self) -> bool:
         return self._is_cancelled
 
     def run(self):
-        app_logger.debug(f"ImageLoader task started for: {self.path_str}")
+        app_logger.debug(f"ImageLoader task started for: {self.path_str} (use_cache={self.use_cache})")
         try:
             if self.is_cancelled:
                 app_logger.debug(f"Task for {self.path_str} was cancelled before starting.")
                 return
 
-            img = _load_image_static_cached(
+            loader_func = _load_image_static_cached if self.use_cache else _load_image_core
+
+            # [FIX] Pass the correct 'tonemap_mode' parameter to the loading function.
+            img = loader_func(
                 self.path_str,
                 target_size=(self.target_size, self.target_size) if self.target_size else None,
-                tonemap_exr=self.tonemap_exr,
+                tonemap_mode=self.tonemap_mode,
             )
 
             if self.is_cancelled:

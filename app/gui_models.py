@@ -5,8 +5,6 @@ and QListView. This separates the data representation from the UI widgets.
 """
 
 import logging
-
-# [NEW] Import OrderedDict to create a size-limited cache.
 from collections import OrderedDict, defaultdict
 from pathlib import Path
 
@@ -376,9 +374,7 @@ class ImagePreviewModel(QAbstractListModel):
         self.db_path: Path | None = None
         self.group_id: int = -1
         self.items: list[dict] = []
-        # [CHANGED] Use OrderedDict for the cache.
         self.pixmap_cache: OrderedDict[str, QPixmap] = OrderedDict()
-        # [NEW] Define a limit for how many previews to keep in memory.
         self.CACHE_SIZE_LIMIT = 200
 
     def set_group(self, db_path: Path, group_id: int):
@@ -429,9 +425,8 @@ class ImagePreviewModel(QAbstractListModel):
 
     def set_pixmap_for_path(self, path_str: str, pixmap: QPixmap):
         self.pixmap_cache[path_str] = pixmap
-        # [NEW] Eviction logic: if the cache is too large, remove the oldest item.
         if len(self.pixmap_cache) > self.CACHE_SIZE_LIMIT:
-            self.pixmap_cache.popitem(last=False)  # last=False makes it FIFO
+            self.pixmap_cache.popitem(last=False)
 
         for i, item in enumerate(self.items):
             if item["path"] == path_str:

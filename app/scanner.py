@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
 import xxhash
 from PIL import Image, ImageDraw, ImageFont
 from PySide6.QtCore import QObject, QRunnable, QThread, QThreadPool, Signal, Slot
@@ -30,7 +31,6 @@ from app.worker import init_worker, worker_get_single_vector, worker_get_text_ve
 
 if LANCEDB_AVAILABLE:
     import lancedb
-    import pyarrow as pa
 if DUCKDB_AVAILABLE:
     import duckdb
 if WIN32_AVAILABLE:
@@ -119,7 +119,6 @@ class ScannerCore(QObject):
 
         sim_engine = LanceDBSimilarityEngine(self.state, self.signals, self.config, self.table)
 
-        # [CHANGED] Perform search first, then filter by distance
         raw_hits_df = (
             self.table.search(query_vector)
             .metric("cosine")
