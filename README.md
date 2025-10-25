@@ -1,15 +1,42 @@
 # AssetPixelHand
+**An advanced AI-powered tool for finding and managing duplicate and visually similar images.**
 
-A small utility for finding duplicates and similar images.
+## Key Features
+*   **🧠 Intelligent AI-Powered Search**: The core is a vector search engine powered by image embeddings. You can choose from several leading AI models (ViT, CLIP, SigLIP, DINOv2), each optimized for different tasks: speed, overall quality, or high structural accuracy.
 
-## How to Run
+*   **🚀 GPU Acceleration**: Utilizes `ONNX Runtime` with `DirectML` support (on Windows) to harness the full power of your graphics card for lightning-fast analysis of thousands of files.
 
-### Install **Python 3.12** or newer. ~
+*   **📊 Advanced Comparison Tools**: Analyze found images with multiple sophisticated modes:
+    *   **Side-by-Side**: Classic direct comparison.
+    *   **Difference**: Visually highlights pixels that differ between two images, making it easy to spot minor edits.
+    *   **Wipe & Overlay**: Interactively compare two images using a slider or by blending them.
 
-### Download and Run the Program
+*   **⚙️ Deep Performance Tuning**: Take full control over every aspect of the scan:
+    *   **Compute Precision (FP16/FP32)**: Nearly double your performance on modern GPUs with a minimal trade-off in accuracy.
+    *   **Batch Size**: Optimize VRAM usage for maximum throughput.
+    *   **Search Precision**: Fine-tune the vector database's trade-off between speed and result completeness.
 
-1. Click and select **`Download ZIP`**.
-2. Unzip the downloaded archive to a convenient location.
-3. Open the folder and simply run the **`run.bat`** file.
+*   **📁 Universal Format Support**: Extensive, built-in support for dozens of formats thanks to a multi-layered loading system (`DirectXTex`, `OpenCV`, `PyVips`, `Pillow`):
+    *   **Supported Formats**: `PNG`, `JPG`, `WEBP`, `AVIF`, `PSD`, `EXR`, `HDR`, `TIFF`, `DDS`, `TGA` and more.
 
-The first launch may take several minutes, as the program will automatically download and install all necessary components. Subsequent launches will be fast.
+*   **💾 Efficient File Management**:
+    *   **Hardlink Replacement**: Save gigabytes of disk space by replacing duplicate files with hardlinks to a single source file, all without breaking your project's folder structure.
+    *   Safe deletion to the system's recycle bin.
+
+## Tech Stack
+*   **GUI**: PySide6 (Qt for Python)
+*   **AI Core**: ONNX Runtime, PyTorch, Transformers
+*   **Vector Search**: LanceDB
+*   **Metadata Caching**: DuckDB
+*   **Image Processing**: PyVips, OpenCV, Pillow, DirectXTex Decoder
+
+## Requirements
+*   Python 3.12+ ~
+
+## Quick Start
+The project is designed for an effortless launch.
+
+1.  Clone the repository.
+2.  Run `run.bat`.
+
+The script will automatically set up a virtual environment, install all necessary dependencies, and launch the application.
