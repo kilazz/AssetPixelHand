@@ -1,7 +1,7 @@
 # app/data_models.py
 """
 Contains all primary data structures (dataclasses) and Qt signal containers used
-throughout the application. Centralizing these models helps to ensure type
+throughout the application. Centralizing these helps to ensure type
 consistency and avoids circular import dependencies.
 """
 
@@ -17,7 +17,7 @@ from PySide6.QtCore import QObject, Signal
 from app.constants import ALL_SUPPORTED_EXTENSIONS, CONFIG_FILE, SCRIPT_DIR, SUPPORTED_MODELS, QuantizationMode
 
 if TYPE_CHECKING:
-    from app.gui_main_window import App
+    pass
 
 
 @dataclass
@@ -116,6 +116,8 @@ class AppSettings:
     device: str = "CPU"
     quantization_mode: str = QuantizationMode.FP16.value
     theme: str = "Dark"
+    thumbnail_tonemap_enabled: bool = False
+    compare_tonemap_enabled: bool = False
 
     @classmethod
     def load(cls) -> "AppSettings":
@@ -140,29 +142,11 @@ class AppSettings:
             print(f"Warning: Could not load settings file, using defaults. Error: {e}")
             return cls(selected_extensions=list(ALL_SUPPORTED_EXTENSIONS), folder_path=str(SCRIPT_DIR))
 
-    def save(self, main_window: "App"):
-        """Gathers all settings from the UI components and serializes them to JSON."""
-        opts, perf = main_window.options_panel, main_window.performance_panel
-        scan_opts, viewer = main_window.scan_options_panel, main_window.viewer_panel
-
-        self.folder_path = opts.folder_path_entry.text()
-        self.threshold = str(opts.threshold_spinbox.value())
-        self.exclude = opts.exclude_entry.text()
-        self.model_key = opts.model_combo.currentText()
-        self.preview_size = viewer.preview_size_slider.value()
-        self.show_transparency = viewer.bg_alpha_check.isChecked()
-        self.selected_extensions = opts.selected_extensions
-        self.find_exact_duplicates = scan_opts.exact_duplicates_check.isChecked()
-        self.lancedb_in_memory = scan_opts.lancedb_in_memory_check.isChecked()
-        self.perf_low_priority = scan_opts.low_priority_check.isChecked()
-        self.save_visuals = scan_opts.save_visuals_check.isChecked()
-        self.max_visuals = scan_opts.max_visuals_entry.text()
-        self.perf_model_workers = perf.cpu_workers_spin.text()
-        self.perf_batch_size = perf.batch_size_spin.text()
-        self.search_precision = perf.search_precision_combo.currentText()
-        self.device = perf.device_combo.currentText()
-        self.quantization_mode = perf.quant_combo.currentText()
-        self.theme = main_window.settings.theme
+    def save(self, settings_dict: dict[str, Any]):
+        """Updates settings from a dictionary and serializes them to JSON."""
+        for key, value in settings_dict.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
 
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:

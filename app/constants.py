@@ -15,14 +15,16 @@ except NameError:
 
 sys.path.insert(0, str(SCRIPT_DIR.resolve()))
 
+# --- Core Application Directories & Environment Setup ---
 APP_DATA_DIR = SCRIPT_DIR / "app_data"
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 MODELS_DIR = APP_DATA_DIR / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 HF_CACHE_DIR = APP_DATA_DIR / ".hf_cache"
 os.environ["HF_HOME"] = str(HF_CACHE_DIR.resolve())
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # Prevents crashes with multiple OpenMP libs
 
+# --- File Paths ---
 CONFIG_FILE = APP_DATA_DIR / "app_settings.json"
 CACHE_DIR = APP_DATA_DIR / ".cache"
 RESULTS_DB_FILE = CACHE_DIR / "results.duckdb"
@@ -30,61 +32,72 @@ CRASH_LOG_DIR = APP_DATA_DIR / "crash_logs"
 VISUALS_DIR = APP_DATA_DIR / "duplicate_visuals"
 LOG_FILE = APP_DATA_DIR / "app_log.txt"
 
+# --- Library Availability Checks ---
 WIN32_AVAILABLE = sys.platform == "win32"
 DEEP_LEARNING_AVAILABLE = all(importlib.util.find_spec(pkg) for pkg in ["onnxruntime", "transformers", "torch"])
-PYVIPS_AVAILABLE = bool(importlib.util.find_spec("pyvips"))
+OIIO_AVAILABLE = bool(importlib.util.find_spec("OpenImageIO"))
 DIRECTXTEX_AVAILABLE = bool(importlib.util.find_spec("directxtex_decoder"))
 DUCKDB_AVAILABLE = bool(importlib.util.find_spec("duckdb"))
 LANCEDB_AVAILABLE = bool(importlib.util.find_spec("lancedb"))
 ZSTD_AVAILABLE = bool(importlib.util.find_spec("zstandard"))
 
-Image.init()
+Image.init()  # Initialize Pillow's format plugins
 
+# Suppress verbose logging from the transformers library on import
 if DEEP_LEARNING_AVAILABLE:
     from transformers import logging as transformers_logging
 
     transformers_logging.set_verbosity_error()
 
+# --- Application-wide Constants ---
 DB_WRITE_BATCH_SIZE = 8192
-CACHE_VERSION = "v4"
+CACHE_VERSION = "v4"  # Increment to invalidate old caches on structural changes
 
-# [FINALIZED] List of formats confirmed to be working by diagnostic tests.
-_main_ext = [
-    # Standard raster formats
+# --- Supported File Formats ---
+_main_supported_ext = [
+    # Standard Web & Raster Formats
     ".png",
     ".jpg",
     ".jpeg",
-    ".bmp",
     ".gif",
+    ".bmp",
     ".webp",
-    ".tiff",
-    ".tif",
-    ".tga",
-    # Professional & Design formats
-    ".psd",
+    # Professional & High Bit Depth Formats
     ".exr",
     ".hdr",
-    ".svg",
-    # Modern Web & Mobile formats
+    ".tiff",
+    ".tif",
+    ".psd",
+    ".tga",
+    ".dpx",
+    ".cin",
+    # Modern & Mobile Formats
+    ".avif",
     ".heic",
     ".heif",
-    ".avif",
+    # Legacy & Niche Formats
+    ".ico",
+    ".cur",
+    ".xbm",
+    ".xpm",
 ]
 
-# Formats reliably supported only by Pillow
-_pillow_only_ext = [".ico", ".cur", ".xbm", ".xpm"]
+# Note: The following formats may work if the user has the required system libraries installed,
+# but they are not listed by default to ensure out-of-the-box stability.
+# ".svg"     # Requires 'librsvg'
+# ".cr2", ".nef", ".arw", ".dng" # Requires 'libraw'
+# ".jxl"     # Requires 'libjxl'
+# ".mov", ".mp4" # Requires 'ffmpeg'
 
-# NOTE: RAW formats (.raw, .cr2, etc.) and Document/Vector formats (.pdf, .wmf, .emf, .jxl)
-# have been removed as tests showed no reliable support from the installed libraries.
-_all_ext = []
-_all_ext.extend(_main_ext)
-_all_ext.extend(_pillow_only_ext)
+_all_ext = list(_main_supported_ext)
 
+# Add DDS support only if our specialized decoder is available
 if DIRECTXTEX_AVAILABLE:
     _all_ext.append(".dds")
 
 ALL_SUPPORTED_EXTENSIONS = sorted(set(_all_ext))
 
+# --- Supported AI Models ---
 SUPPORTED_MODELS = {
     "Fastest (OpenAI ViT-B/32)": {
         "hf_name": "openai/clip-vit-base-patch32",
@@ -118,19 +131,30 @@ SUPPORTED_MODELS = {
 }
 
 
+# --- UI Configuration & Enums ---
 class UIConfig:
     class Colors:
-        SUCCESS, WARNING, ERROR, INFO = "#4CAF50", "#FF9800", "#F44336", "#E0E0E0"
-        BEST_FILE_BG, DIVIDER = "#2C3E50", "#F39C12"
+        SUCCESS = "#4CAF50"
+        WARNING = "#FF9800"
+        ERROR = "#F44336"
+        INFO = "#E0E0E0"
+        BEST_FILE_BG = "#2C3E50"
+        DIVIDER = "#F39C12"
         HIGHLIGHT = "#4A90E2"
 
     class Sizes:
-        BROWSE_BUTTON_WIDTH, PREVIEW_LABEL_WIDTH, ALPHA_LABEL_WIDTH = 35, 40, 30
-        PREVIEW_MIN_SIZE, PREVIEW_MAX_SIZE = 100, 500
+        BROWSE_BUTTON_WIDTH = 35
+        PREVIEW_LABEL_WIDTH = 40
+        ALPHA_LABEL_WIDTH = 30
+        PREVIEW_MIN_SIZE = 100
+        PREVIEW_MAX_SIZE = 500
 
 
 class CompareMode(Enum):
-    SIDE_BY_SIDE, WIPE, OVERLAY, DIFF = "Side-by-Side", "Wipe", "Overlay", "Difference"
+    SIDE_BY_SIDE = "Side-by-Side"
+    WIPE = "Wipe"
+    OVERLAY = "Overlay"
+    DIFF = "Difference"
 
 
 class QuantizationMode(Enum):

@@ -18,7 +18,7 @@
     *   **Batch Size**: Optimize VRAM usage for maximum throughput.
     *   **Search Precision**: Fine-tune the vector database's trade-off between speed and result completeness.
 
-*   **📁 Universal Format Support**: Extensive, built-in support for dozens of formats thanks to a multi-layered loading system (`PyVips`, `OpenCV`, `Pillow`, `DirectXTex Decoder`):
+*   **📁 Universal Format Support**: Extensive, built-in support for dozens of formats thanks to a multi-layered loading system (`OpenImageIO`, `Pillow`, `DirectXTex Decoder`):
     *   **Supported Formats**: `PNG`, `JPG`, `WEBP`, `AVIF`, `HEIF`, `PSD`, `EXR`, `HDR`, `TIFF`, `DDS`, `TGA` and more.
 
 *   **💾 Efficient File Management**:
@@ -30,7 +30,7 @@
 *   **AI Core**: ONNX Runtime, PyTorch, Transformers
 *   **Vector Search**: LanceDB
 *   **Metadata Caching**: DuckDB
-*   **Image Processing**: PyVips, OpenCV, Pillow, DirectXTex Decoder
+*   **Image Processing**: OpenImageIO, Pillow, DirectXTex Decoder
 
 ## Requirements
 *   Python 3.12+ ~

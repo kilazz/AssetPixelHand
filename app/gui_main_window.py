@@ -26,13 +26,10 @@ from PySide6.QtWidgets import (
 
 from app.constants import (
     DEEP_LEARNING_AVAILABLE,
-    DIRECTXTEX_AVAILABLE,
-    PYVIPS_AVAILABLE,
     SCRIPT_DIR,
     VISUALS_DIR,
     WIN32_AVAILABLE,
     QuantizationMode,
-    UIConfig,
 )
 from app.data_models import AppSettings, PerformanceConfig, ScanConfig
 from app.gui_dialogs import ModelConversionDialog, ScanStatisticsDialog, SkippedFilesDialog
@@ -86,33 +83,51 @@ class App(QMainWindow):
         main_layout.setContentsMargins(SPACING, SPACING, SPACING, SPACING)
         main_layout.setSpacing(0)
         left_v_splitter = QSplitter(Qt.Orientation.Vertical)
+
         top_left_container = QWidget()
         top_left_layout = QVBoxLayout(top_left_container)
         top_left_layout.setSpacing(SPACING)
+        top_left_layout.setContentsMargins(0, 0, 0, 0)
+
         self.options_panel = OptionsPanel(self.settings)
         self.scan_options_panel = ScanOptionsPanel(self.settings)
         self.performance_panel = PerformancePanel(self.settings)
         self.system_status_panel = SystemStatusPanel()
+
         top_left_layout.addWidget(self.options_panel)
         top_left_layout.addWidget(self.scan_options_panel)
         top_left_layout.addWidget(self.performance_panel)
         top_left_layout.addWidget(self.system_status_panel)
         top_left_layout.addStretch(1)
+
         log_container = QWidget()
         log_layout = QVBoxLayout(log_container)
         log_layout.setContentsMargins(0, 0, 0, 0)
         self.log_panel = LogPanel()
         log_layout.addWidget(self.log_panel)
+
+        # We use simple containers. The splitter logic will handle everything.
         top_pane_wrapper = QWidget()
         top_pane_layout = QVBoxLayout(top_pane_wrapper)
         top_pane_layout.setContentsMargins(0, 0, 0, SPACING)
         top_pane_layout.addWidget(top_left_container)
+
         bottom_pane_wrapper = QWidget()
         bottom_pane_layout = QVBoxLayout(bottom_pane_wrapper)
         bottom_pane_layout.setContentsMargins(0, SPACING, 0, 0)
         bottom_pane_layout.addWidget(log_container)
+
         left_v_splitter.addWidget(top_pane_wrapper)
         left_v_splitter.addWidget(bottom_pane_wrapper)
+
+        # [FIX] This is the correct combination of settings.
+        # Top panel (0) does not stretch. Bottom panel (1) takes all space.
+        # Top panel is allowed to be collapsed by the user.
+        left_v_splitter.setStretchFactor(0, 0)
+        left_v_splitter.setStretchFactor(1, 1)
+        left_v_splitter.setCollapsible(0, True)  # Allow user to collapse top panel
+        left_v_splitter.setCollapsible(1, True)
+
         self.results_viewer_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.results_panel = ResultsPanel()
         self.viewer_panel = ImageViewerPanel(self.settings)
@@ -138,9 +153,12 @@ class App(QMainWindow):
         self.main_splitter.addWidget(left_pane_wrapper)
         self.main_splitter.addWidget(right_pane_wrapper)
         main_layout.addWidget(self.main_splitter)
+
+        # [FIX] Remove the problematic setSizes call that forces ratio-based resizing.
+        # Let the stretch factors and initial widget sizes handle the layout naturally.
         self.main_splitter.setSizes([int(self.width() * 0.25), int(self.width() * 0.75)])
         self.results_viewer_splitter.setSizes([int(self.width() * 0.4), int(self.width() * 0.35)])
-        left_v_splitter.setSizes([int(self.height() * 0.8), int(self.height() * 0.2)])
+
         self._update_low_priority_option(self.performance_panel.device_combo.currentData() == "cpu")
 
     def _create_menu_bar(self):
@@ -153,7 +171,7 @@ class App(QMainWindow):
                 break
 
     def load_theme(self, theme_id: str):
-        qss_file = SCRIPT_DIR / "app" / "styles" / theme_id / f"{theme_id}.qss"
+        qss_file = SCRIPT_DIR / "app/styles" / theme_id / f"{theme_id}.qss"
         if not qss_file.is_file():
             self.log_panel.log_message(f"Error: Theme file not found at '{qss_file}'", "error")
             return
@@ -175,9 +193,12 @@ class App(QMainWindow):
         self.context_menu_path: Path | None = None
         self.open_action = QAction("Open File", self)
         self.show_action = QAction("Show in Explorer", self)
+        self.delete_action = QAction("Move to Trash", self)
         self.context_menu = QMenu(self)
         self.context_menu.addAction(self.open_action)
         self.context_menu.addAction(self.show_action)
+        self.context_menu.addSeparator()
+        self.context_menu.addAction(self.delete_action)
         self.results_panel.results_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.viewer_panel.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
@@ -210,6 +231,7 @@ class App(QMainWindow):
         # Context menu signals
         self.open_action.triggered.connect(self._context_open_file)
         self.show_action.triggered.connect(self._context_show_in_explorer)
+        self.delete_action.triggered.connect(self._context_delete_file)
 
         # Settings save timer
         self.settings_save_timer.timeout.connect(self._save_settings)
@@ -233,24 +255,18 @@ class App(QMainWindow):
         perf.search_precision_combo.currentIndexChanged.connect(self._request_settings_save)
         perf.cpu_workers_spin.valueChanged.connect(self._request_settings_save)
         perf.batch_size_spin.valueChanged.connect(self._request_settings_save)
-        self.viewer_panel.preview_size_slider.sliderReleased.connect(self._request_settings_save)
-        self.viewer_panel.bg_alpha_check.toggled.connect(self._request_settings_save)
+        viewer = self.viewer_panel
+        viewer.preview_size_slider.sliderReleased.connect(self._request_settings_save)
+        viewer.bg_alpha_check.toggled.connect(self._request_settings_save)
+        viewer.thumbnail_tonemap_check.toggled.connect(self._request_settings_save)
+        viewer.compare_tonemap_check.toggled.connect(self._request_settings_save)
 
     @Slot()
     def _request_settings_save(self):
         self.settings_save_timer.start()
 
     def _log_system_status(self):
-        app_logger.info("Application ready. Checking system capabilities...")
-
-        def fmt(label, available):
-            color = UIConfig.Colors.SUCCESS if available else UIConfig.Colors.WARNING
-            state = "Enabled" if available else "Disabled"
-            return f"{label}: <font color='{color}'>{state}</font>"
-
-        self.system_status_panel.dl_status_label.setText(fmt("DL Backend (ONNX)", DEEP_LEARNING_AVAILABLE))
-        self.system_status_panel.pyvips_status_label.setText(fmt("Advanced Formats (pyvips)", PYVIPS_AVAILABLE))
-        self.system_status_panel.dds_status_label.setText(fmt("DDS Texture Support", DIRECTXTEX_AVAILABLE))
+        app_logger.info("Application ready. System capabilities are displayed in the status panel.")
 
     @Slot()
     def _start_scan(self):
@@ -442,7 +458,6 @@ class App(QMainWindow):
         current_op = self.results_panel.current_operation
         if current_op in [FileOperation.HARDLINKING, FileOperation.REFLINKING]:
             op_name = "Replaced"
-
         level = "success" if failed == 0 else "warning" if count > 0 else "error"
         self.log_panel.log_message(f"{op_name} {count} files. Failed: {failed}.", level)
         self.results_panel.update_after_deletion(affected_paths)
@@ -474,12 +489,10 @@ class App(QMainWindow):
 
     def _link_worker(self, paths_to_replace: list[Path], method: str):
         link_map = self.results_panel.results_model.get_link_map_for_paths(paths_to_replace)
-
         if not link_map:
             self.controller.signals.log.emit("No valid link pairs found from the model's data.", "warning")
             self.controller.signals.deletion_finished.emit([], 0, len(paths_to_replace))
             return
-
         replaced, failed, failed_list, affected = 0, 0, [], list(link_map.keys())
         can_reflink = hasattr(os, "reflink")
         for link_path, source_path in link_map.items():
@@ -518,6 +531,16 @@ class App(QMainWindow):
     def _context_show_in_explorer(self):
         self._open_path(self.context_menu_path.parent if self.context_menu_path else None)
 
+    @Slot()
+    def _context_delete_file(self):
+        if not self.context_menu_path:
+            return
+        if (
+            QMessageBox.question(self, "Confirm Move", f"Move '{self.context_menu_path.name}' to the system trash?")
+            == QMessageBox.StandardButton.Yes
+        ):
+            self._handle_deletion_request([self.context_menu_path])
+
     def _open_path(self, path: Path | None):
         if path and path.exists():
             try:
@@ -526,7 +549,33 @@ class App(QMainWindow):
                 app_logger.error(f"Could not open path '{path}': {e}")
 
     def _save_settings(self):
-        self.settings.save(self)
+        """Gathers settings from UI and saves them."""
+        opts, perf = self.options_panel, self.performance_panel
+        scan_opts, viewer = self.scan_options_panel, self.viewer_panel
+
+        settings_dict = {
+            "folder_path": opts.folder_path_entry.text(),
+            "threshold": str(opts.threshold_spinbox.value()),
+            "exclude": opts.exclude_entry.text(),
+            "model_key": opts.model_combo.currentText(),
+            "preview_size": viewer.preview_size_slider.value(),
+            "show_transparency": viewer.bg_alpha_check.isChecked(),
+            "selected_extensions": opts.selected_extensions,
+            "find_exact_duplicates": scan_opts.exact_duplicates_check.isChecked(),
+            "lancedb_in_memory": scan_opts.lancedb_in_memory_check.isChecked(),
+            "perf_low_priority": scan_opts.low_priority_check.isChecked(),
+            "save_visuals": scan_opts.save_visuals_check.isChecked(),
+            "max_visuals": scan_opts.max_visuals_entry.text(),
+            "perf_model_workers": perf.cpu_workers_spin.text(),
+            "perf_batch_size": perf.batch_size_spin.text(),
+            "search_precision": perf.search_precision_combo.currentText(),
+            "device": perf.device_combo.currentText(),
+            "quantization_mode": perf.quant_combo.currentText(),
+            "theme": self.settings.theme,
+            "thumbnail_tonemap_enabled": viewer.thumbnail_tonemap_check.isChecked(),
+            "compare_tonemap_enabled": viewer.compare_tonemap_check.isChecked(),
+        }
+        self.settings.save(settings_dict)
 
     @Slot(bool)
     def _update_low_priority_option(self, is_cpu: bool):

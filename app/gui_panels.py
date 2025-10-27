@@ -7,15 +7,13 @@ functionality, such as scan options, results display, or image viewing.
 
 import logging
 import multiprocessing
-import os
-import time
 import webbrowser
 from enum import Enum, auto
 from pathlib import Path
 
 from PIL import Image, ImageChops
 from PIL.ImageQt import ImageQt
-from PySide6.QtCore import QModelIndex, QPoint, Qt, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtCore import QModelIndex, QPoint, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QActionGroup, QIntValidator, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -43,7 +41,7 @@ from app.constants import (
     ALL_SUPPORTED_EXTENSIONS,
     DEEP_LEARNING_AVAILABLE,
     DIRECTXTEX_AVAILABLE,
-    PYVIPS_AVAILABLE,
+    OIIO_AVAILABLE,
     SCRIPT_DIR,
     SUPPORTED_MODELS,
     VISUALS_DIR,
@@ -56,7 +54,7 @@ from app.gui_dialogs import FileTypesDialog
 from app.gui_models import ImageItemDelegate, ImagePreviewModel, ResultsTreeModel
 from app.gui_tasks import ImageLoader
 from app.gui_widgets import AlphaBackgroundWidget, ImageCompareWidget, ResizedListView
-from app.utils import OPENCV_AVAILABLE, _load_image_static_cached
+from app.view_models import ImageComparerState
 
 app_logger = logging.getLogger("AssetPixelHand.gui.panels")
 
@@ -304,7 +302,6 @@ class ScanOptionsPanel(QGroupBox):
         self.lancedb_in_memory_check = QCheckBox("Use in-memory database (fastest)")
         self.lancedb_in_memory_check.setToolTip("Stores the vector index in RAM. Fastest, but not persistent.")
         self.low_priority_check = QCheckBox("Run scan at lower priority")
-
         visuals_layout = QHBoxLayout()
         self.save_visuals_check = QCheckBox("Save visualizations")
         self.max_visuals_entry = QLineEdit()
@@ -318,7 +315,6 @@ class ScanOptionsPanel(QGroupBox):
         visuals_layout.addWidget(QLabel("Max:"))
         visuals_layout.addWidget(self.max_visuals_entry)
         visuals_layout.addWidget(self.open_visuals_folder_button)
-
         layout.addWidget(self.exact_duplicates_check)
         layout.addWidget(self.lancedb_in_memory_check)
         layout.addWidget(self.low_priority_check)
@@ -331,7 +327,7 @@ class ScanOptionsPanel(QGroupBox):
     def toggle_visuals_option(self, is_checked):
         self.max_visuals_entry.setVisible(is_checked)
         self.open_visuals_folder_button.setVisible(is_checked)
-        self.layout().itemAt(3).layout().itemAt(2).widget().setVisible(is_checked)  # Max label
+        self.layout().itemAt(3).layout().itemAt(2).widget().setVisible(is_checked)
 
     @Slot()
     def _open_visuals_folder(self):
@@ -436,15 +432,13 @@ class SystemStatusPanel(QGroupBox):
         super().__init__("System Status")
         layout = QFormLayout(self)
         layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-
-        self.dl_status_label = QLabel("...")
-        self.pyvips_status_label = QLabel("...")
-        self.opencv_status_label = QLabel("...")
-        self.dds_status_label = QLabel("...")
-
+        self.dl_status_label, self.oiio_status_label, self.dds_status_label = (
+            QLabel("..."),
+            QLabel("..."),
+            QLabel("..."),
+        )
         layout.addRow(self.dl_status_label)
-        layout.addRow(self.pyvips_status_label)
-        layout.addRow(self.opencv_status_label)
+        layout.addRow(self.oiio_status_label)
         layout.addRow(self.dds_status_label)
 
         def fmt(label, available):
@@ -453,8 +447,7 @@ class SystemStatusPanel(QGroupBox):
             return f"{label}: <font color='{color}'>{state}</font>"
 
         self.dl_status_label.setText(fmt("DL Backend (ONNX)", DEEP_LEARNING_AVAILABLE))
-        self.pyvips_status_label.setText(fmt("General Formats (pyvips)", PYVIPS_AVAILABLE))
-        self.opencv_status_label.setText(fmt("HDR/EXR Formats (OpenCV)", OPENCV_AVAILABLE))
+        self.oiio_status_label.setText(fmt("Image Engine (OIIO)", OIIO_AVAILABLE))
         self.dds_status_label.setText(fmt("DDS Texture Support", DIRECTXTEX_AVAILABLE))
 
 
@@ -484,26 +477,20 @@ class LogPanel(QGroupBox):
 
 
 class FileOperation(Enum):
-    NONE = auto()
-    DELETING = auto()
-    HARDLINKING = auto()
-    REFLINKING = auto()
+    NONE, DELETING, HARDLINKING, REFLINKING = auto(), auto(), auto(), auto()
 
 
 class ResultsPanel(QGroupBox):
     """Displays scan results in a tree view and provides actions for them."""
 
-    deletion_requested = Signal(list)
-    hardlink_requested = Signal(list)
-    reflink_requested = Signal(list)
+    deletion_requested, hardlink_requested, reflink_requested = Signal(list), Signal(list), Signal(list)
     selection_in_group_changed = Signal(Path, int, object)
 
     def __init__(self):
         super().__init__("Results")
-        self.selection_timer = QTimer(self)
+        self.selection_timer, self.search_timer = QTimer(self), QTimer(self)
         self.selection_timer.setSingleShot(True)
         self.selection_timer.setInterval(150)
-        self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
         self.search_timer.setInterval(300)
         self.hardlink_available, self.reflink_available = False, False
@@ -524,13 +511,15 @@ class ResultsPanel(QGroupBox):
         layout.addWidget(self.results_view)
         self._create_action_buttons(layout)
         bottom_buttons_layout = QHBoxLayout()
-        self.hardlink_button = QPushButton("Replace with Hardlink")
+        self.hardlink_button, self.reflink_button, self.delete_button = (
+            QPushButton("Replace with Hardlink"),
+            QPushButton("Replace with Reflink"),
+            QPushButton("Move to Trash"),
+        )
         self.hardlink_button.setObjectName("hardlink_button")
         self.hardlink_button.setToolTip("Replaces duplicates with a pointer to the best file's data.")
-        self.reflink_button = QPushButton("Replace with Reflink")
         self.reflink_button.setObjectName("reflink_button")
         self.reflink_button.setToolTip("Creates a space-saving, independent copy (Copy-on-Write).")
-        self.delete_button = QPushButton("Move to Trash")
         self.delete_button.setObjectName("delete_button")
         bottom_buttons_layout.addStretch()
         bottom_buttons_layout.addWidget(self.hardlink_button)
@@ -684,18 +673,11 @@ class ResultsPanel(QGroupBox):
         if not to_link:
             QMessageBox.warning(self, "No Selection", "No duplicate files selected to replace.")
             return
-
-        # [FIX] Improved warning message for clarity
         msg = (
             f"This will replace {len(to_link)} duplicate files with hardlinks to the best file.\n\n"
-            f"⚠️ IMPORTANT:\n"
-            f"• The original file data will be preserved\n"
-            f"• Duplicate files will become pointers to the same data\n"
-            f"• If you edit any linked file, ALL linked copies will change\n"
-            f"• This operation cannot be undone\n\n"
-            f"Are you sure you want to continue?"
+            "⚠️ IMPORTANT:\n• The original file data will be preserved\n• Duplicate files will become pointers to the same data\n"
+            "• If you edit any linked file, ALL linked copies will change\n• This operation cannot be undone\n\nAre you sure you want to continue?"
         )
-
         if QMessageBox.question(self, "Confirm Hardlink Replacement", msg) == QMessageBox.StandardButton.Yes:
             self.set_operation_in_progress(FileOperation.HARDLINKING)
             self.hardlink_requested.emit(to_link)
@@ -706,18 +688,11 @@ class ResultsPanel(QGroupBox):
         if not to_link:
             QMessageBox.warning(self, "No Selection", "No duplicate files selected to replace.")
             return
-
-        # [FIX] Improved warning message for reflink
         msg = (
             f"This will replace {len(to_link)} duplicate files with reflinks (Copy-on-Write).\n\n"
-            f"ℹ️ INFO:\n"
-            f"• Creates space-saving copies that share data blocks\n"
-            f"• When you edit a file, only the changed blocks are duplicated\n"
-            f"• Safer than hardlinks but requires filesystem support (APFS, Btrfs, XFS, ReFS)\n"
-            f"• This operation cannot be undone\n\n"
-            f"Are you sure you want to continue?"
+            "ℹ️ INFO:\n• Creates space-saving copies that share data blocks\n• When you edit a file, only the changed blocks are duplicated\n"
+            "• Safer than hardlinks but requires filesystem support (APFS, Btrfs, XFS, ReFS)\n• This operation cannot be undone\n\nAre you sure you want to continue?"
         )
-
         if QMessageBox.question(self, "Confirm Reflink Replacement", msg) == QMessageBox.StandardButton.Yes:
             self.set_operation_in_progress(FileOperation.REFLINKING)
             self.reflink_requested.emit(to_link)
@@ -758,13 +733,11 @@ class ImageViewerPanel(QGroupBox):
     def __init__(self, settings: AppSettings):
         super().__init__("Image Viewer")
         self.settings = settings
+        self.state = ImageComparerState()
         self.is_transparency_enabled = settings.show_transparency
-        self.thread_pool = QThreadPool()
-        self.thread_pool.setMaxThreadCount(max(4, os.cpu_count() or 4))
         self.update_timer = QTimer(self)
         self.update_timer.setSingleShot(True)
         self.update_timer.setInterval(150)
-        self.load_timeout_timer = QTimer(self)
         self._init_state()
         self._init_ui()
         self._connect_signals()
@@ -773,11 +746,6 @@ class ImageViewerPanel(QGroupBox):
 
     def _init_state(self):
         self.current_group_id: int | None = None
-        self.compare_candidates: list[Path] = []
-        self.compare_pixmaps: dict[str, QPixmap] = {}
-        self.compare_pil_images: dict[str, Image.Image] = {}
-        self.active_loaders: dict[str, ImageLoader] = {}
-        self.active_loader_timestamps: dict[str, float] = {}
         self.channel_buttons: dict[str, QPushButton] = {}
         self.channel_states = {"R": True, "G": True, "B": True, "A": True}
 
@@ -800,7 +768,6 @@ class ImageViewerPanel(QGroupBox):
         slider_controls.addWidget(self.preview_size_slider)
         self.thumbnail_tonemap_check = QCheckBox("HDR Thumbnails")
         self.thumbnail_tonemap_check.setToolTip("Apply tonemapping for HDR thumbnails in this list.")
-        self.thumbnail_tonemap_check.setChecked(True)
         slider_controls.addWidget(self.thumbnail_tonemap_check)
         self.bg_alpha_check = QCheckBox("BG Alpha:")
         slider_controls.addWidget(self.bg_alpha_check)
@@ -832,14 +799,13 @@ class ImageViewerPanel(QGroupBox):
         top_controls.addWidget(self.back_button)
         top_controls.addWidget(self.compare_type_combo)
         top_controls.addStretch()
-        self.tonemap_mode_combo = QComboBox()
-        self.tonemap_mode_combo.addItems(["None", "Reinhard", "Drago"])
-        self.tonemap_mode_combo.setToolTip("Select Tonemapping algorithm for high-bit-depth images.")
-        top_controls.addWidget(QLabel("Tonemap Mode:"))
-        top_controls.addWidget(self.tonemap_mode_combo)
+
+        self.compare_tonemap_check = QCheckBox("HDR Tonemapping")
+        self.compare_tonemap_check.setToolTip("Apply tonemapping for high-dynamic-range (HDR) images.")
+        top_controls.addWidget(self.compare_tonemap_check)
+
         channel_layout = QHBoxLayout()
         channel_layout.setSpacing(2)
-        channel_layout.setContentsMargins(0, 0, 0, 0)
         for channel in ["R", "G", "B", "A"]:
             btn = QPushButton(channel)
             btn.setCheckable(True)
@@ -852,18 +818,16 @@ class ImageViewerPanel(QGroupBox):
         top_controls.addLayout(channel_layout)
         parent_layout.addLayout(top_controls)
         bottom_controls = QHBoxLayout()
-        overlay_widget = QWidget()
-        overlay_layout = QHBoxLayout(overlay_widget)
+        overlay_widget, bg_widget = QWidget(), QWidget()
+        overlay_layout, bg_layout = QHBoxLayout(overlay_widget), QHBoxLayout(bg_widget)
         overlay_layout.setContentsMargins(0, 0, 0, 0)
+        bg_layout.setContentsMargins(0, 0, 0, 0)
         self.overlay_alpha_label = QLabel("Overlay Alpha:")
         self.overlay_alpha_slider = QSlider(Qt.Orientation.Horizontal)
         self.overlay_alpha_slider.setRange(0, 255)
         self.overlay_alpha_slider.setValue(128)
         overlay_layout.addWidget(self.overlay_alpha_label)
         overlay_layout.addWidget(self.overlay_alpha_slider)
-        bg_widget = QWidget()
-        bg_layout = QHBoxLayout(bg_widget)
-        bg_layout.setContentsMargins(0, 0, 0, 0)
         self.compare_bg_alpha_check = QCheckBox("BG Alpha:")
         self.compare_bg_alpha_slider = QSlider(Qt.Orientation.Horizontal)
         self.compare_bg_alpha_slider.setRange(0, 255)
@@ -878,18 +842,17 @@ class ImageViewerPanel(QGroupBox):
         sbs_layout = QHBoxLayout(sbs_view)
         sbs_layout.setContentsMargins(0, 0, 0, 0)
         sbs_layout.setSpacing(1)
-        self.compare_view_1 = AlphaBackgroundWidget()
-        self.compare_view_2 = AlphaBackgroundWidget()
-        sbs_layout.addWidget(self.compare_view_1)
-        sbs_layout.addWidget(self.compare_view_2)
-        self.compare_widget = ImageCompareWidget()
-        self.diff_view = AlphaBackgroundWidget()
+        self.compare_view_1, self.compare_view_2 = AlphaBackgroundWidget(), AlphaBackgroundWidget()
+        sbs_layout.addWidget(self.compare_view_1, 1)
+        sbs_layout.addWidget(self.compare_view_2, 1)
+        self.compare_widget, self.diff_view = ImageCompareWidget(), AlphaBackgroundWidget()
         self.compare_stack.addWidget(sbs_view)
         self.compare_stack.addWidget(self.compare_widget)
         self.compare_stack.addWidget(self.diff_view)
         parent_layout.addWidget(self.compare_stack, 1)
 
     def _connect_signals(self):
+        # UI controls
         self.preview_size_slider.sliderReleased.connect(self._update_preview_sizes)
         self.alpha_slider.valueChanged.connect(self._on_alpha_change)
         self.compare_button.clicked.connect(self._show_comparison_view)
@@ -900,35 +863,17 @@ class ImageViewerPanel(QGroupBox):
         self.update_timer.timeout.connect(self._update_visible_previews)
         self.list_view.clicked.connect(self._on_item_clicked)
         self.thumbnail_tonemap_check.toggled.connect(self._on_thumbnail_tonemap_toggled)
-        self.tonemap_mode_combo.currentIndexChanged.connect(self._on_compare_tonemap_changed)
+        self.compare_tonemap_check.toggled.connect(self._on_compare_tonemap_changed)
         self.bg_alpha_check.toggled.connect(self._on_transparency_toggled)
         self.compare_bg_alpha_check.toggled.connect(self._on_transparency_toggled)
         self.overlay_alpha_slider.valueChanged.connect(self._on_overlay_alpha_change)
         self.compare_bg_alpha_slider.valueChanged.connect(self._on_alpha_change)
-        self.load_timeout_timer.timeout.connect(self._check_for_stalled_loaders)
 
-    @Slot()
-    def _check_for_stalled_loaders(self):
-        STALL_TIMEOUT_SECONDS = 15.0
-        now = time.time()
-        stalled_tasks = [
-            path_str for path_str, ts in self.active_loader_timestamps.items() if now - ts > STALL_TIMEOUT_SECONDS
-        ]
-        if not stalled_tasks:
-            return
-
-        app_logger.warning(f"Found {len(stalled_tasks)} stalled loader(s): {stalled_tasks}")
-        for path_str in stalled_tasks:
-            if loader := self.active_loaders.pop(path_str, None):
-                loader.cancel()
-                if self.list_container.isVisible():
-                    self.model.set_error_for_path(path_str, "Timeout")
-                else:
-                    self._on_full_res_image_error(path_str, "Loading timed out")
-            self.active_loader_timestamps.pop(path_str, None)
-
-        if not self.active_loaders:
-            self.load_timeout_timer.stop()
+        # State ViewModel signals
+        self.state.candidates_changed.connect(self._update_compare_button)
+        self.state.image_loaded.connect(self._on_full_res_image_loaded)
+        self.state.load_complete.connect(self._on_load_complete)
+        self.state.load_error.connect(self._on_full_res_image_error)
 
     @Slot(bool)
     def _on_thumbnail_tonemap_toggled(self, checked: bool):
@@ -936,14 +881,11 @@ class ImageViewerPanel(QGroupBox):
 
     @Slot()
     def _on_compare_tonemap_changed(self):
-        if self.compare_container.isVisible() and len(self.compare_candidates) == 2:
+        if self.compare_container.isVisible() and len(self.state.get_candidate_paths()) == 2:
             self._show_comparison_view()
 
     def _reset_and_reload_all_previews(self):
-        for loader in self.active_loaders.values():
-            loader.cancel()
-        self.active_loaders.clear()
-        self.active_loader_timestamps.clear()
+        self.state.stop_loaders()
         self.model.pixmap_cache.clear()
         self.list_view.viewport().update()
         self.update_timer.start()
@@ -951,11 +893,12 @@ class ImageViewerPanel(QGroupBox):
     def load_settings(self, settings: AppSettings):
         self.preview_size_slider.setValue(settings.preview_size)
         self.bg_alpha_check.setChecked(settings.show_transparency)
+        self.thumbnail_tonemap_check.setChecked(settings.thumbnail_tonemap_enabled)
+        self.compare_tonemap_check.setChecked(settings.compare_tonemap_enabled)
         self._on_transparency_toggled(settings.show_transparency)
 
     def clear_viewer(self):
         self.update_timer.stop()
-        self.load_timeout_timer.stop()
         self.show_image_group(Path(), -1, None)
 
     @Slot(Path, int, object)
@@ -964,12 +907,8 @@ class ImageViewerPanel(QGroupBox):
             return
         self._back_to_list_view()
         self.current_group_id = group_id
-        self.compare_candidates.clear()
-        self._update_compare_button()
-        for loader in self.active_loaders.values():
-            loader.cancel()
-        self.active_loaders.clear()
-        self.active_loader_timestamps.clear()
+        self.state.clear_candidates()
+        self.state.stop_loaders()
         self.model.set_group(db_path, group_id)
         if self.model.rowCount() > 0:
             app_logger.debug(f"Loaded group with {self.model.rowCount()} items.")
@@ -977,9 +916,6 @@ class ImageViewerPanel(QGroupBox):
             self._reset_and_reload_all_previews()
             if scroll_to_path:
                 QTimer.singleShot(100, lambda: self._scroll_to_file(scroll_to_path))
-            self.load_timeout_timer.start(5000)
-        else:
-            self.load_timeout_timer.stop()
 
     def _scroll_to_file(self, file_path: Path):
         if (row := self.model.get_row_for_path(file_path)) is not None:
@@ -995,129 +931,85 @@ class ImageViewerPanel(QGroupBox):
     def _update_visible_previews(self):
         if not (self.model.rowCount() > 0 and self.list_view.isVisible()):
             return
-
         viewport_rect = self.list_view.viewport().rect()
         for r in range(self.model.rowCount()):
             index = self.model.index(r, 0)
             if not self.list_view.visualRect(index).intersects(viewport_rect.adjusted(-200, -200, 200, 200)):
                 continue
-
             path_str = self.model.items[r]["path"]
-            if path_str not in self.model.pixmap_cache and path_str not in self.active_loaders:
+            if path_str not in self.model.pixmap_cache and path_str not in self.state._active_loaders:
                 loader = ImageLoader(
                     path_str,
                     self.delegate.preview_size,
-                    tonemap_mode="reinhard" if self.thumbnail_tonemap_check.isChecked() else "none",
-                    use_cache=True,
+                    "reinhard" if self.thumbnail_tonemap_check.isChecked() else "none",
+                    True,
                 )
-                loader.signals.finished.connect(self._on_image_loaded)
+                loader.signals.finished.connect(self._on_thumbnail_loaded)
                 loader.signals.error.connect(self._on_image_load_error)
-                self.active_loaders[path_str] = loader
-                self.active_loader_timestamps[path_str] = time.time()
-                self.thread_pool.start(loader)
+                self.state._active_loaders[path_str] = loader
+                self.state.thread_pool.start(loader)
 
     @Slot(str, object)
-    def _on_image_loaded(self, path_str: str, pixmap: QPixmap):
-        self.active_loaders.pop(path_str, None)
-        self.active_loader_timestamps.pop(path_str, None)
-        if pixmap:
-            self.model.set_pixmap_for_path(path_str, pixmap)
-        if not self.active_loaders:
-            self.load_timeout_timer.stop()
+    def _on_thumbnail_loaded(self, path_str: str, pil_img: Image.Image):
+        self.state._active_loaders.pop(path_str, None)
+        if pil_img:
+            pixmap = QPixmap.fromImage(ImageQt(pil_img))
+            if not pixmap.isNull():
+                self.model.set_pixmap_for_path(path_str, pixmap)
 
     @Slot(str, str)
     def _on_image_load_error(self, path_str: str, error_message: str):
-        self.active_loaders.pop(path_str, None)
-        self.active_loader_timestamps.pop(path_str, None)
+        self.state._active_loaders.pop(path_str, None)
         self.log_message.emit(f"Failed to load preview for '{Path(path_str).name}': {error_message}", "error")
         self.model.set_error_for_path(path_str, "Load Failed")
-        if not self.active_loaders:
-            self.load_timeout_timer.stop()
 
     @Slot(QModelIndex)
     def _on_item_clicked(self, index):
         if not (item := self.model.data(index, Qt.ItemDataRole.UserRole)):
             return
-        path = Path(item["path"])
-        item["is_compare_candidate"] = not item.get("is_compare_candidate", False)
-        if item["is_compare_candidate"]:
-            self.compare_candidates.append(path)
-            if len(self.compare_candidates) > 2:
-                oldest_path = self.compare_candidates.pop(0)
-                if (old_row := self.model.get_row_for_path(oldest_path)) is not None:
-                    self.model.items[old_row]["is_compare_candidate"] = False
-                    self.list_view.update(self.model.index(old_row, 0))
-        elif path in self.compare_candidates:
-            self.compare_candidates.remove(path)
-        self.list_view.update(index)
-        self._update_compare_button()
 
-    def _update_compare_button(self):
-        count = len(self.compare_candidates)
+        is_now_candidate = self.state.toggle_candidate(item)
+
+        # If a candidate was removed because a third was added, we need to update its view
+        if not is_now_candidate and len(self.state.get_candidate_paths()) == 2:
+            self.list_view.viewport().update()
+        else:
+            self.list_view.update(index)
+
+    @Slot(int)
+    def _update_compare_button(self, count):
         self.compare_button.setText(f"Compare ({count})")
         self.compare_button.setEnabled(count == 2)
 
     def _show_comparison_view(self):
-        if len(self.compare_candidates) != 2:
+        if len(self.state.get_candidate_paths()) != 2:
             return
-
         self._set_view_mode(is_list=False)
-        for loader in self.active_loaders.values():
-            loader.cancel()
-        self.active_loaders.clear()
-        self.active_loader_timestamps.clear()
-        self.compare_pixmaps.clear()
-        self.compare_pil_images.clear()
+        tonemap_mode = "reinhard" if self.compare_tonemap_check.isChecked() else "none"
+        self.compare_view_1.setPixmap(QPixmap())
+        self.compare_view_2.setPixmap(QPixmap())
+        self.state.load_full_res_images(tonemap_mode)
 
-        is_hbd = any(p.suffix.lower() in [".hdr", ".exr", ".tif", ".tiff", ".dds"] for p in self.compare_candidates)
-        self.tonemap_mode_combo.setEnabled(is_hbd)
-
-        tonemap_mode = self.tonemap_mode_combo.currentText().lower() if is_hbd else "none"
-
-        path1, path2 = self.compare_candidates
-        for path in [path1, path2]:
-            path_str = str(path)
-            loader = ImageLoader(path_str, target_size=None, tonemap_mode=tonemap_mode, use_cache=False)
-            loader.signals.finished.connect(self._on_full_res_image_loaded)
-            loader.signals.error.connect(self._on_full_res_image_error)
-            self.active_loaders[path_str] = loader
-            self.active_loader_timestamps[path_str] = time.time()
-            self.thread_pool.start(loader)
-
-        self.load_timeout_timer.start(5000)
-
-    @Slot(str, object)
+    @Slot(str, QPixmap)
     def _on_full_res_image_loaded(self, path_str: str, pixmap: QPixmap):
-        if path_str not in self.active_loaders:
-            return
-        del self.active_loaders[path_str]
-        self.active_loader_timestamps.pop(path_str, None)
-        self.compare_pixmaps[path_str] = pixmap
+        paths = self.state.get_candidate_paths()
+        if path_str == paths[0]:
+            self.compare_view_1.setPixmap(pixmap)
+        elif path_str == paths[1]:
+            self.compare_view_2.setPixmap(pixmap)
 
-        # [FIX] Load original PIL image separately to avoid QPixmap conversion artifacts
-        try:
-            original_img = _load_image_static_cached(
-                path_str, target_size=None, tonemap_mode=self.tonemap_mode_combo.currentText().lower()
-            )
-            if original_img:
-                self.compare_pil_images[path_str] = original_img
-            else:
-                # Fallback to converting from pixmap
-                self.compare_pil_images[path_str] = Image.fromqpixmap(pixmap)
-        except Exception as e:
-            app_logger.warning(f"Could not load original image for comparison, using pixmap: {e}")
-            self.compare_pil_images[path_str] = Image.fromqpixmap(pixmap)
+        self.compare_widget.setPixmaps(self.compare_view_1.pixmap, self.compare_view_2.pixmap)
 
-        if len(self.compare_pixmaps) == 2:
-            self.load_timeout_timer.stop()
-            self._update_channel_controls_based_on_images()
-            self._update_compare_views()
+    @Slot()
+    def _on_load_complete(self):
+        self._update_channel_controls_based_on_images()
+        self._update_compare_views()
 
     def _update_channel_controls_based_on_images(self):
-        if len(self.compare_pil_images) != 2:
+        images = self.state.get_pil_images()
+        if len(images) != 2:
             return
-        img1, img2 = list(self.compare_pil_images.values())
-        act1, act2 = self._get_channel_activity(img1), self._get_channel_activity(img2)
+        act1, act2 = self._get_channel_activity(images[0]), self._get_channel_activity(images[1])
         for channel, button in self.channel_buttons.items():
             is_active = act1.get(channel, False) or act2.get(channel, False)
             button.setEnabled(is_active)
@@ -1126,31 +1018,20 @@ class ImageViewerPanel(QGroupBox):
 
     @Slot(str, str)
     def _on_full_res_image_error(self, path_str: str, error_msg: str):
-        if path_str not in self.active_loaders:
-            return
-        del self.active_loaders[path_str]
-        self.active_loader_timestamps.pop(path_str, None)
         self.log_message.emit(f"Failed to load full-res image for '{Path(path_str).name}': {error_msg}", "error")
-        view = self.compare_view_1 if path_str == str(self.compare_candidates[0]) else self.compare_view_2
+        paths = self.state.get_candidate_paths()
+        view = self.compare_view_1 if path_str == paths[0] else self.compare_view_2
         view.setError(f"Error: {error_msg}")
-        if not self.active_loaders:
-            self.load_timeout_timer.stop()
 
     def _back_to_list_view(self):
         for button in self.channel_buttons.values():
             button.setEnabled(True)
             button.setChecked(True)
             self._update_channel_button_style(button, True)
-        for loader in self.active_loaders.values():
-            loader.cancel()
-        self.active_loaders.clear()
-        self.active_loader_timestamps.clear()
+        self.state.stop_loaders()
         self._set_view_mode(is_list=True)
-        self.compare_pixmaps.clear()
-        self.compare_pil_images.clear()
         self.list_view.viewport().update()
         if self.model.rowCount() > 0:
-            self.load_timeout_timer.start(5000)
             self._update_visible_previews()
 
     def _set_view_mode(self, is_list: bool):
@@ -1179,9 +1060,7 @@ class ImageViewerPanel(QGroupBox):
     def _on_transparency_toggled(self, state: bool):
         self.is_transparency_enabled = state
         for w in [self.bg_alpha_check, self.compare_bg_alpha_check]:
-            w.blockSignals(True)
             w.setChecked(state)
-            w.blockSignals(False)
         for w in [self.alpha_slider, self.alpha_label, self.compare_bg_alpha_slider]:
             w.setEnabled(state)
         self.delegate.set_transparency_enabled(state)
@@ -1217,44 +1096,52 @@ class ImageViewerPanel(QGroupBox):
         if not button.isEnabled():
             button.setStyleSheet("background-color: #3c3c3c; color: #7f8c8d;")
             return
+        color = {"R": "red", "G": "lime", "B": "deepskyblue", "A": "white"}[channel]
         if is_checked:
-            color = {"R": "red", "G": "lime", "B": "deepskyblue", "A": "white"}[channel]
             button.setStyleSheet(f"background-color: {color}; color: black; font-weight: bold;")
         else:
-            color = {"R": "#c0392b", "G": "#27ae60", "B": "#2980b9", "A": "#bdc3c7"}[channel]
-            button.setStyleSheet(f"background-color: #2c3e50; border: 1px solid {color}; color: {color};")
+            border_color = {"R": "#c0392b", "G": "#27ae60", "B": "#2980b9", "A": "#bdc3c7"}[channel]
+            button.setStyleSheet(f"background-color: #2c3e50; border: 1px solid {border_color}; color: {border_color};")
 
     def _update_compare_views(self):
-        if len(self.compare_pil_images) != 2:
+        images = self.state.get_pil_images()
+        if len(images) != 2:
             return
-        if CompareMode(self.compare_type_combo.currentText()) == CompareMode.DIFF:
+
+        def get_processed_pixmap(pil_image: Image.Image) -> QPixmap:
+            if pil_image.mode != "RGBA":
+                pil_image = pil_image.convert("RGBA")
+
+            if all(self.channel_states.values()):
+                return QPixmap.fromImage(ImageQt(pil_image))
+
+            r, g, b, a = pil_image.split()
+            if not self.channel_states["R"]:
+                r = r.point(lambda _: 0)
+            if not self.channel_states["G"]:
+                g = g.point(lambda _: 0)
+            if not self.channel_states["B"]:
+                b = b.point(lambda _: 0)
+            if not self.channel_states["A"]:
+                a = a.point(lambda _: 255)
+
+            processed_pil = Image.merge("RGBA", (r, g, b, a))
+            return QPixmap.fromImage(ImageQt(processed_pil))
+
+        current_mode = CompareMode(self.compare_type_combo.currentText())
+
+        if current_mode == CompareMode.DIFF:
             self.diff_view.setPixmap(self._calculate_diff_pixmap())
             return
-        p1_path, p2_path = str(self.compare_candidates[0]), str(self.compare_candidates[1])
-        if (p1 := self._process_image_channels(p1_path)) and (p2 := self._process_image_channels(p2_path)):
+
+        p1 = get_processed_pixmap(images[0])
+        p2 = get_processed_pixmap(images[1])
+
+        if current_mode == CompareMode.SIDE_BY_SIDE:
             self.compare_view_1.setPixmap(p1)
             self.compare_view_2.setPixmap(p2)
+        else:  # Wipe and Overlay
             self.compare_widget.setPixmaps(p1, p2)
-            self._on_overlay_alpha_change(self.overlay_alpha_slider.value())
-            self._on_alpha_change(self.compare_bg_alpha_slider.value())
-
-    def _process_image_channels(self, path_str: str) -> QPixmap | None:
-        if not (pil_image := self.compare_pil_images.get(path_str)):
-            return None
-        if pil_image.mode != "RGBA":
-            pil_image = pil_image.convert("RGBA")
-        if all(self.channel_states.values()):
-            return self.compare_pixmaps.get(path_str)
-        r, g, b, a = pil_image.split()
-        if not self.channel_states["R"]:
-            r = r.point(lambda _: 0)
-        if not self.channel_states["G"]:
-            g = g.point(lambda _: 0)
-        if not self.channel_states["B"]:
-            b = b.point(lambda _: 0)
-        if not self.channel_states["A"]:
-            a = a.point(lambda _: 255)
-        return QPixmap.fromImage(ImageQt(Image.merge("RGBA", (r, g, b, a))))
 
     def _get_channel_activity(self, img: Image.Image) -> dict[str, bool]:
         if img.mode != "RGBA":
@@ -1269,9 +1156,11 @@ class ImageViewerPanel(QGroupBox):
         return activity
 
     def _calculate_diff_pixmap(self) -> QPixmap | None:
-        if len(self.compare_pil_images) != 2:
+        images = self.state.get_pil_images()
+        if len(images) != 2:
             return None
-        img1, img2 = list(self.compare_pil_images.values())
+
+        img1, img2 = images[0], images[1]
         if img1.size != img2.size:
             target_size = (max(img1.width, img2.width), max(img1.height, img2.height))
             img1 = img1.resize(target_size, Image.Resampling.LANCZOS)
@@ -1280,10 +1169,14 @@ class ImageViewerPanel(QGroupBox):
             img1 = img1.convert("RGBA")
         if img2.mode != "RGBA":
             img2 = img2.convert("RGBA")
+
         r1, g1, b1, a1 = img1.split()
         r2, g2, b2, a2 = img2.split()
+
         r_diff = ImageChops.difference(r1, r2) if self.channel_states["R"] else Image.new("L", img1.size, 0)
         g_diff = ImageChops.difference(g1, g2) if self.channel_states["G"] else Image.new("L", img1.size, 0)
         b_diff = ImageChops.difference(b1, b2) if self.channel_states["B"] else Image.new("L", img1.size, 0)
         a_diff = ImageChops.difference(a1, a2) if self.channel_states["A"] else Image.new("L", img1.size, 255)
-        return QPixmap.fromImage(ImageQt(Image.merge("RGBA", (r_diff, g_diff, b_diff, a_diff))))
+
+        diff_img = Image.merge("RGBA", (r_diff, g_diff, b_diff, a_diff))
+        return QPixmap.fromImage(ImageQt(diff_img))

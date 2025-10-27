@@ -8,8 +8,6 @@ import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 
-# [FIX] Import sys to check the platform
-
 # --- SCRIPT PATH SETUP ---
 try:
     script_dir = Path(__file__).resolve().parent
@@ -17,42 +15,11 @@ except NameError:
     script_dir = Path(sys.executable).resolve().parent
 sys.path.insert(0, str(script_dir))
 
-
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
 from app.logging_config import setup_logging
 
-# [MODIFIED] Check for the --debug flag right at the start.
 IS_DEBUG_MODE = "--debug" in sys.argv
-
-
-def setup_dll_paths():
-    """
-    Directly modifies the PATH environment variable for the current process
-    to ensure all bundled pyvips DLLs are found by the OS on Windows.
-    """
-    if sys.platform == "win32":
-        import sysconfig
-
-        packages_dir = sysconfig.get_path("purelib")
-
-        # [FIX] Added fallback for frozen/bundled applications
-        if not packages_dir or not Path(packages_dir).exists():
-            packages_dir = os.path.join(sys.prefix, "Lib", "site-packages")
-            print(f"[INFO] Using fallback packages directory: {packages_dir}")
-
-        if packages_dir and Path(packages_dir).exists():
-            current_path = os.environ.get("PATH", "")
-            new_path = f"{packages_dir};{current_path}"
-            os.environ["PATH"] = new_path
-            print(f"[INFO] Prepended to process PATH: {packages_dir}")
-            return True
-        else:
-            print("[CRITICAL WARNING] Could not find site-packages directory.", file=sys.stderr)
-    return False
-
-
-setup_dll_paths()
 
 
 def log_global_crash(exc_type, exc_value, exc_traceback):
@@ -94,10 +61,7 @@ def run_application():
     app_logger.info("Starting AssetPixelHand application...")
     app = QApplication(sys.argv)
     log_emitter = LogSignalEmitter()
-
-    # [MODIFIED] Pass the debug flag to the second logging setup.
     setup_logging(log_emitter, force_debug=IS_DEBUG_MODE)
-
     main_window = App(log_emitter=log_emitter)
     log_emitter.log_signal.connect(main_window.log_panel.log_message)
     main_window.show()
@@ -106,8 +70,6 @@ def run_application():
 
 
 if __name__ == "__main__":
-    # [FIX] Initialize COM for the main UI thread on Windows.
-    # This prevents crashes when opening native file dialogs.
     if sys.platform == "win32":
         import pythoncom
 
@@ -118,8 +80,6 @@ if __name__ == "__main__":
         multiprocessing.set_start_method("spawn", force=True)
 
     faulthandler.enable()
-
-    # [MODIFIED] Pass the debug flag to the initial logging setup.
     setup_logging(force_debug=IS_DEBUG_MODE)
     app_logger = logging.getLogger("AssetPixelHand.main")
 

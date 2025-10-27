@@ -56,12 +56,11 @@ class CMakeBuild(build_ext):
 # The main setup function
 setup(
     name="directxtex_decoder",
-    version="0.2.0",  # Incremented version for the fixes
+    version="0.2.0",
     description="A Python wrapper for DirectXTex to decode various DDS files.",
-    author="Zed",  # You can change this
-    author_email="your.email@example.com",  # You can change this
+    author="Kilazz",
     ext_modules=[CMakeExtension("directxtex_decoder", sourcedir=".")],
     cmdclass={"build_ext": CMakeBuild},
     zip_safe=False,
-    python_requires=">=3.8",
+    python_requires=">=3.12",
 )

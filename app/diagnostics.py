@@ -62,11 +62,9 @@ def check_library_imports() -> bool:
             "lancedb": "lancedb",
             "xxhash": "xxhash",
             "sentencepiece": "sentencepiece",
-            "pyvips": "pyvips-binary",
+            "OpenImageIO": "OpenImageIO",
         },
-        "Optional (for extended file format support and features)": {
-            "directxtex_decoder": "directxtex_decoder",
-        },
+        "Optional (for extended file format support and features)": {"directxtex_decoder": "directxtex_decoder"},
     }
     overall_ok = True
     for category, libs in libraries.items():
@@ -90,7 +88,7 @@ def check_library_imports() -> bool:
     print("-" * 70)
     print_status("All critical libraries imported successfully.", overall_ok)
     if not overall_ok:
-        print("       Tip: Ensure all required packages are installed, e.g., 'pip install pyvips-binary'.")
+        print("       Tip: Ensure all required packages are installed, e.g., 'pip install OpenImageIO'.")
     return overall_ok
 
 
@@ -149,7 +147,6 @@ def check_onnx_model_compatibility() -> bool:
             )
             onnx.save(model, str(model_path))
             print_status("Generated test model", True)
-
             session = ort.InferenceSession(str(model_path), providers=ort.get_available_providers())
             session.run(None, {session.get_inputs()[0].name: np.ones((1, 2), dtype=config["numpy_type"])})
             print_status("Loaded model and ran inference", True)

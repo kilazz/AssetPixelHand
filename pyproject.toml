@@ -9,7 +9,7 @@ version = "1.0.0"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-authors = [{ name = "kilazz", email = "vladzed2012@gmail.com" }]
+authors = [{ name = "kilazz"}]
 
 dependencies = [
     # Core Application & GUI
@@ -33,12 +33,11 @@ dependencies = [
     "xxhash",
     "zstandard",
     # Image Processing
-    "Pillow",                 # Base for standard formats
-    "pyvips",                 # For high-speed image loading
-    "pyvips-binary",          # Helper for pyvips
-    "opencv-python-headless", # Helper
-    "pymediainfo",            # Fast metadata reading without full load
-    #"directxtex-decoder",    # For DDS
+    "Pillow",
+    #"OpenImageIO",
+    "oiio-python",
+    "types-oiio-python",
+    #"directxtex-decoder", # For DDS
 ]
 
 [project.optional-dependencies]

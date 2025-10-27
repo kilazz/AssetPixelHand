@@ -11,9 +11,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PIL.ImageQt import ImageQt
 from PySide6.QtCore import QObject, QRunnable, Signal
-from PySide6.QtGui import QPixmap
 
 from app.constants import DEEP_LEARNING_AVAILABLE, QuantizationMode
 from app.model_adapter import get_model_adapter
@@ -170,10 +168,10 @@ class ImageLoader(QRunnable):
     """A cancellable task to load an image in a background thread for the UI."""
 
     class Signals(QObject):
+        # [FIX] The finished signal only emits the PIL image. The QPixmap must be created in the main thread.
         finished = Signal(str, object)
         error = Signal(str, str)
 
-    # [FIX] Changed 'tonemap_exr' to 'tonemap_mode' to accept the new string-based parameter.
     def __init__(self, path_str: str, target_size: int | None, tonemap_mode: str = "reinhard", use_cache: bool = True):
         super().__init__()
         self.path_str = path_str
@@ -188,15 +186,11 @@ class ImageLoader(QRunnable):
         return self._is_cancelled
 
     def run(self):
-        app_logger.debug(f"ImageLoader task started for: {self.path_str} (use_cache={self.use_cache})")
         try:
             if self.is_cancelled:
-                app_logger.debug(f"Task for {self.path_str} was cancelled before starting.")
                 return
 
             loader_func = _load_image_static_cached if self.use_cache else _load_image_core
-
-            # [FIX] Pass the correct 'tonemap_mode' parameter to the loading function.
             img = loader_func(
                 self.path_str,
                 target_size=(self.target_size, self.target_size) if self.target_size else None,
@@ -204,25 +198,18 @@ class ImageLoader(QRunnable):
             )
 
             if self.is_cancelled:
-                app_logger.debug(f"Task for {self.path_str} was cancelled after loading.")
                 return
 
             if img:
-                app_logger.debug(f"Image loaded for {self.path_str}, converting to QPixmap.")
-                pixmap = QPixmap.fromImage(ImageQt(img))
-                if not pixmap.isNull() and not self.is_cancelled:
-                    app_logger.debug(f"Pixmap created for {self.path_str}, emitting 'finished'.")
-                    self.signals.finished.emit(self.path_str, pixmap)
-                elif not self.is_cancelled:
-                    self.signals.error.emit(self.path_str, "Error converting image to pixmap.")
+                if not self.is_cancelled:
+                    # [FIX] Emit the raw PIL.Image object. Do NOT create QPixmap here.
+                    self.signals.finished.emit(self.path_str, img)
             elif not self.is_cancelled:
                 self.signals.error.emit(self.path_str, "Image loader returned None.")
         except Exception as e:
             if not self.is_cancelled:
                 app_logger.error(f"ImageLoader crashed for {self.path_str}", exc_info=True)
                 self.signals.error.emit(self.path_str, f"Loader error: {e}")
-
-        app_logger.debug(f"ImageLoader task finished execution for: {self.path_str}")
 
     def cancel(self):
         self._is_cancelled = True
