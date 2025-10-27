@@ -138,7 +138,6 @@ def _load_image_core(
 
         return final_rgb
 
-    # --- START OF SIMPLIFIED DDS LOGIC ---
     # Priority 1: Use the "Smart" DirectXTex decoder for DDS files
     if ext == ".dds" and DIRECTXTEX_AVAILABLE:
         try:
@@ -146,24 +145,55 @@ def _load_image_core(
                 decoded = directxtex_decoder.decode_dds(f.read())
 
             numpy_array = decoded["data"]
+            dtype = numpy_array.dtype
 
-            # If the decoder returned HDR data (float), apply tonemapping
-            if np.issubdtype(numpy_array.dtype, np.floating):
+            # ==============================================================================
+            # START OF FIX: Handle multiple data types returned by the new C++ module
+            # ==============================================================================
+
+            pil_image = None
+
+            # Case 1: HDR float data - requires tonemapping
+            if np.issubdtype(dtype, np.floating):
                 tonemapped_array = tonemap_float_array(numpy_array.astype(np.float32), tonemap_mode)
                 pil_image = Image.fromarray(tonemapped_array)
-            else:
-                # For all SDR formats, the C++ decoder has ALREADY created a perfect RGBA uint8 array.
-                # No more complex checks are needed here.
+
+            # Case 2: 16-bit unsigned data (e.g., from R16G16_UNORM) -> convert to 8-bit for display
+            elif np.issubdtype(dtype, np.uint16):
+                # Using // 257 provides a more accurate mapping of 0-65535 to 0-255
+                converted_array = (numpy_array // 257).astype(np.uint8)
+                pil_image = Image.fromarray(converted_array)
+
+            # Case 3: Signed integer data (e.g., from _SINT formats) -> normalize to 0-255 range
+            elif np.issubdtype(dtype, np.integer) and np.issubdtype(dtype, np.signedinteger):
+                # Convert from [-128, 127] or [-32768, 32767] to [0, 255]
+                # We use float32 for intermediate calculation to avoid overflow/underflow
+                float_arr = numpy_array.astype(np.float32)
+                min_val = np.iinfo(dtype).min
+                max_val = np.iinfo(dtype).max
+                normalized_arr = (float_arr - min_val) / (max_val - min_val)
+                converted_array = (normalized_arr * 255).astype(np.uint8)
+                pil_image = Image.fromarray(converted_array)
+
+            # Case 4: Standard 8-bit unsigned data (the most common case)
+            elif np.issubdtype(dtype, np.uint8):
+                # The C++ module may have already converted this to a nice RGBA8 array.
                 pil_image = Image.fromarray(numpy_array)
+
+            # If no case matched, something is wrong.
+            if pil_image is None:
+                raise TypeError(f"Unhandled NumPy dtype from C++ module: {dtype}")
+
+            # ==============================================================================
+            # END OF FIX
+            # ==============================================================================
 
             if target_size:
                 pil_image.thumbnail(target_size, Image.Resampling.LANCZOS)
 
-            # The convert call is a good safety net, though it should already be RGBA.
             return pil_image.convert("RGBA")
         except Exception as e:
             utils_logger.warning(f"DirectXTex Decoder pipeline failed for {path.name}: {e}")
-    # --- END OF SIMPLIFIED DDS LOGIC ---
 
     # Priority 2: Use OpenImageIO for all other formats if available.
     if OIIO_AVAILABLE:

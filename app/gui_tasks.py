@@ -15,7 +15,7 @@ from PySide6.QtCore import QObject, QRunnable, Signal
 
 from app.constants import DEEP_LEARNING_AVAILABLE, QuantizationMode
 from app.model_adapter import get_model_adapter
-from app.utils import _load_image_core, _load_image_static_cached
+from app.utils import _load_image_static_cached
 
 if TYPE_CHECKING:
     import torch
@@ -165,33 +165,47 @@ class ModelConverter(QRunnable):
 
 
 class ImageLoader(QRunnable):
-    """A cancellable task to load an image in a background thread for the UI."""
+    """
+    A cancellable task to load an image in a background thread for the UI.
+    This version converts the loaded PIL image to a thread-safe QImage
+    before passing it to the main thread.
+    """
 
-    class Signals(QObject):
-        # [FIX] The finished signal only emits the PIL image. The QPixmap must be created in the main thread.
-        finished = Signal(str, object)
-        error = Signal(str, str)
-
-    def __init__(self, path_str: str, target_size: int | None, tonemap_mode: str = "reinhard", use_cache: bool = True):
+    def __init__(
+        self,
+        path_str: str,
+        target_size: int | None,
+        tonemap_mode: str = "reinhard",
+        use_cache: bool = True,
+        receiver: QObject | None = None,
+        on_finish_slot=None,
+        on_error_slot=None,
+    ):
         super().__init__()
         self.path_str = path_str
         self.target_size = target_size
         self.tonemap_mode = tonemap_mode
-        self.signals = self.Signals()
-        self._is_cancelled = False
         self.use_cache = use_cache
+        self._is_cancelled = False
+        self.receiver = receiver
+        self.on_finish_slot = on_finish_slot
+        self.on_error_slot = on_error_slot
 
     @property
     def is_cancelled(self) -> bool:
         return self._is_cancelled
 
     def run(self):
+        # Import necessary Qt/PIL components inside the run method
+        from PIL.ImageQt import ImageQt
+        from PySide6.QtCore import Q_ARG, QMetaObject, Qt
+        from PySide6.QtGui import QImage
+
         try:
             if self.is_cancelled:
                 return
 
-            loader_func = _load_image_static_cached if self.use_cache else _load_image_core
-            img = loader_func(
+            pil_img = _load_image_static_cached(
                 self.path_str,
                 target_size=(self.target_size, self.target_size) if self.target_size else None,
                 tonemap_mode=self.tonemap_mode,
@@ -200,16 +214,37 @@ class ImageLoader(QRunnable):
             if self.is_cancelled:
                 return
 
-            if img:
-                if not self.is_cancelled:
-                    # [FIX] Emit the raw PIL.Image object. Do NOT create QPixmap here.
-                    self.signals.finished.emit(self.path_str, img)
-            elif not self.is_cancelled:
-                self.signals.error.emit(self.path_str, "Image loader returned None.")
+            if self.receiver and self.on_finish_slot:
+                if pil_img:
+                    # [FIX] Convert PIL.Image to QImage, which is thread-safe and known to Qt's meta-type system.
+                    q_img = ImageQt(pil_img)
+
+                    QMetaObject.invokeMethod(
+                        self.receiver,
+                        self.on_finish_slot,
+                        Qt.ConnectionType.QueuedConnection,
+                        Q_ARG(str, self.path_str),
+                        Q_ARG(QImage, q_img),  # Pass the QImage object
+                    )
+                elif self.on_error_slot:
+                    QMetaObject.invokeMethod(
+                        self.receiver,
+                        self.on_error_slot,
+                        Qt.ConnectionType.QueuedConnection,
+                        Q_ARG(str, self.path_str),
+                        Q_ARG(str, "Image loader returned None."),
+                    )
+
         except Exception as e:
-            if not self.is_cancelled:
+            if not self.is_cancelled and self.receiver and self.on_error_slot:
                 app_logger.error(f"ImageLoader crashed for {self.path_str}", exc_info=True)
-                self.signals.error.emit(self.path_str, f"Loader error: {e}")
+                QMetaObject.invokeMethod(
+                    self.receiver,
+                    self.on_error_slot,
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(str, self.path_str),
+                    Q_ARG(str, f"Loader error: {e}"),
+                )
 
     def cancel(self):
         self._is_cancelled = True

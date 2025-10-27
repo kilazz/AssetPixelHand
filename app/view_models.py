@@ -1,12 +1,13 @@
 # app/view_models.py
 """
 Contains View-Model classes that manage UI state and logic, separating it from the view widgets.
+This is the final, corrected version.
 """
 
 from PIL import Image
-from PIL.ImageQt import ImageQt
-from PySide6.QtCore import QObject, QThreadPool, Signal
-from PySide6.QtGui import QPixmap
+from PIL.ImageQt import fromqimage
+from PySide6.QtCore import QObject, QThreadPool, Signal, Slot
+from PySide6.QtGui import QImage, QPixmap
 
 from app.gui_tasks import ImageLoader
 
@@ -20,13 +21,20 @@ class ImageComparerState(QObject):
     load_complete = Signal()
     load_error = Signal(str, str)
 
-    def __init__(self):
+    # ==============================================================================
+    # START OF FIX: The __init__ method now accepts the shared QThreadPool.
+    # ==============================================================================
+    def __init__(self, thread_pool: QThreadPool):
         super().__init__()
-        self.thread_pool = QThreadPool()
-        self.thread_pool.setMaxThreadCount(4)
+        # It no longer creates its own pool, but uses the one passed from the main window.
+        self.thread_pool = thread_pool
         self._candidates: dict[str, dict] = {}
         self._pil_images: dict[str, Image.Image] = {}
         self._active_loaders: dict[str, ImageLoader] = {}
+
+    # ==============================================================================
+    # END OF FIX
+    # ==============================================================================
 
     def toggle_candidate(self, item_data: dict) -> bool:
         """Adds or removes an item from the comparison candidates list."""
@@ -66,27 +74,37 @@ class ImageComparerState(QObject):
 
         self.images_loading.emit()
         for path_str in self._candidates:
-            loader = ImageLoader(path_str, None, tonemap_mode, use_cache=False)
-            loader.signals.finished.connect(self._on_pil_loaded)
-            loader.signals.error.connect(self._on_load_error)
+            loader = ImageLoader(
+                path_str=path_str,
+                target_size=None,
+                tonemap_mode=tonemap_mode,
+                use_cache=False,
+                receiver=self,
+                on_finish_slot="_on_pil_loaded",
+                on_error_slot="_on_load_error",
+            )
             self._active_loaders[path_str] = loader
             self.thread_pool.start(loader)
 
-    def _on_pil_loaded(self, path_str: str, pil_img: Image.Image):
-        """Handles a successfully loaded PIL image from a worker."""
+    @Slot(str, QImage)
+    def _on_pil_loaded(self, path_str: str, q_img: QImage):
+        """Handles a successfully loaded image from a worker."""
         if path_str not in self._active_loaders:
-            return  # Cancelled or timed out
+            return
 
         del self._active_loaders[path_str]
-        self._pil_images[path_str] = pil_img
 
-        # Convert to QPixmap in the main thread and emit
-        pixmap = QPixmap.fromImage(ImageQt(pil_img))
-        self.image_loaded.emit(path_str, pixmap)
+        if not q_img.isNull():
+            pil_img = fromqimage(q_img)
+            self._pil_images[path_str] = pil_img
+
+            pixmap = QPixmap.fromImage(q_img)
+            self.image_loaded.emit(path_str, pixmap)
 
         if len(self._pil_images) == 2:
             self.load_complete.emit()
 
+    @Slot(str, str)
     def _on_load_error(self, path_str: str, error_msg: str):
         if path_str not in self._active_loaders:
             return

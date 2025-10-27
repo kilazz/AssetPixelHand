@@ -1,4 +1,7 @@
 # test_image_libs.py
+# A focused diagnostic script to test compatibility with Pillow, OpenImageIO,
+# and the custom DirectXTex decoder.
+
 import argparse
 import contextlib
 import io
@@ -8,10 +11,8 @@ from pathlib import Path
 
 # --- Add project root to Python path ---
 try:
-    # This will work when running as a script
     script_dir = Path(__file__).resolve().parent
 except NameError:
-    # Fallback for interactive environments (like Jupyter)
     script_dir = Path(sys.executable).resolve().parent
 sys.path.insert(0, str(script_dir))
 
@@ -41,23 +42,16 @@ try:
     Image.init()
     PILLOW_AVAILABLE = True
 except ImportError:
+    Image = None
     PILLOW_AVAILABLE = False
 
 try:
-    import pyvips
+    import OpenImageIO as oiio
 
-    PYVIPS_AVAILABLE = True
+    OIIO_AVAILABLE = True
 except ImportError:
-    pyvips = None
-    PYVIPS_AVAILABLE = False
-
-try:
-    import cv2
-
-    OPENCV_AVAILABLE = True
-except ImportError:
-    cv2 = None
-    OPENCV_AVAILABLE = False
+    oiio = None
+    OIIO_AVAILABLE = False
 
 try:
     import directxtex_decoder
@@ -75,14 +69,6 @@ except ImportError:
     TABULATE_AVAILABLE = False
 
 try:
-    import rawpy
-
-    RAWPY_AVAILABLE = True
-except ImportError:
-    rawpy = None
-    RAWPY_AVAILABLE = False
-
-try:
     from app.constants import ALL_SUPPORTED_EXTENSIONS
 except ImportError:
     print(colorize("Warning: Could not import from 'app.constants'. Using fallback list.", Colors.YELLOW))
@@ -95,13 +81,14 @@ except ImportError:
         ".tif",
         ".tiff",
         ".exr",
-        ".raw",
-        ".cr2",
-        ".nef",
+        ".hdr",
+        ".bmp",
+        ".webp",
+        ".psd",
     }
 
 
-# --- Test Functions (Now Fully Universal) ---
+# --- Test Functions ---
 
 
 def test_pillow(file_path: Path) -> str:
@@ -110,59 +97,33 @@ def test_pillow(file_path: Path) -> str:
         return colorize("N/A", Colors.GRAY)
     try:
         with Image.open(file_path) as img:
-            img.load()  # Force loading the image data
+            img.load()
         return colorize("OK", Colors.GREEN)
     except Exception:
         return colorize("FAIL", Colors.RED)
 
 
-def test_pyvips(file_path: Path) -> str:
-    """Tests if pyvips can open an image file."""
-    if not PYVIPS_AVAILABLE:
+def test_oiio(file_path: Path) -> str:
+    """Tests if OpenImageIO can open an image file."""
+    if not OIIO_AVAILABLE:
         return colorize("N/A", Colors.GRAY)
     try:
-        pyvips.Image.new_from_file(str(file_path), access="sequential")
-        return colorize("OK", Colors.GREEN)
-    except Exception:
-        return colorize("FAIL", Colors.RED)
-
-
-def test_opencv(file_path: Path) -> str:
-    """Tests if OpenCV can open an image file."""
-    if not OPENCV_AVAILABLE:
-        return colorize("N/A", Colors.GRAY)
-    try:
-        # Suppress potential error messages from OpenCV C++ backend
         with contextlib.redirect_stderr(io.StringIO()):
-            img = cv2.imread(str(file_path), cv2.IMREAD_UNCHANGED)
-        if img is None:
-            return colorize("FAIL", Colors.RED)
-        return colorize("OK", Colors.GREEN)
+            buf = oiio.ImageBuf(str(file_path))
+            if not buf.has_error:
+                return colorize("OK", Colors.GREEN)
+        return colorize("FAIL", Colors.RED)
     except Exception:
         return colorize("FAIL", Colors.RED)
 
 
 def test_directxtex(file_path: Path) -> str:
-    """Tests if directxtex_decoder can handle a file."""
+    """Tests if directxtex_decoder can handle a DDS file."""
     if not DIRECTXTEX_AVAILABLE:
         return colorize("N/A", Colors.GRAY)
     try:
         with file_path.open("rb") as f:
-            # Attempt to decode any file as if it were a DDS
             directxtex_decoder.decode_dds(f.read())
-        return colorize("OK", Colors.GREEN)
-    except Exception:
-        return colorize("FAIL", Colors.RED)
-
-
-def test_rawpy(file_path: Path) -> str:
-    """Tests if rawpy can open a raw image file."""
-    if not RAWPY_AVAILABLE:
-        return colorize("N/A", Colors.GRAY)
-    try:
-        # Attempt to decode any file as if it were a RAW image
-        with rawpy.imread(str(file_path)) as raw:
-            raw.postprocess()
         return colorize("OK", Colors.GREEN)
     except Exception:
         return colorize("FAIL", Colors.RED)
@@ -170,7 +131,7 @@ def test_rawpy(file_path: Path) -> str:
 
 def main():
     """Main function to parse arguments and run the tests."""
-    parser = argparse.ArgumentParser(description="Universal image library compatibility tester.")
+    parser = argparse.ArgumentParser(description="Image library compatibility tester for Pillow, OIIO, and DirectXTex.")
     parser.add_argument("folder", type=str, help="Path to the folder to scan.")
     parser.add_argument(
         "--errors-only", action="store_true", help="Only show files that failed in at least one library."
@@ -193,23 +154,24 @@ def main():
         print(colorize("No supported image files found.", Colors.YELLOW))
         sys.exit(0)
 
-    results, headers = [], ["File", "Pillow", "PyVips", "OpenCV", "DirectXTex", "RawPy"]
+    results = []
+    headers = ["File", "Pillow", "OpenImageIO", "DirectXTex"]
     print(f"Found {len(image_files)} image files to test...")
 
     failed_files_count = 0
     for i, file_path in enumerate(image_files, 1):
         relative_path = file_path.relative_to(image_folder)
         progress_line = f"  ({i}/{len(image_files)}) Testing: {relative_path}"
-        # Ensure progress line doesn't wrap and overwrite correctly
         sys.stdout.write(progress_line.ljust(os.get_terminal_size().columns - 1) + "\r")
         sys.stdout.flush()
 
+        # Run DirectXTex test only for .dds files
+        dds_result = test_directxtex(file_path) if file_path.suffix.lower() == ".dds" else colorize("N/A", Colors.GRAY)
+
         test_results = [
             test_pillow(file_path),
-            test_pyvips(file_path),
-            test_opencv(file_path),
-            test_directxtex(file_path),
-            test_rawpy(file_path),
+            test_oiio(file_path),
+            dds_result,
         ]
 
         has_failure = any("FAIL" in msg for msg in test_results)
@@ -218,7 +180,6 @@ def main():
         if not args.errors_only or has_failure:
             results.append([str(relative_path)] + test_results)
 
-    # Clear the progress line before printing the report
     sys.stdout.write(" " * (os.get_terminal_size().columns - 1) + "\r")
     sys.stdout.flush()
 
@@ -242,7 +203,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # Enable ANSI colors on Windows
     if sys.platform == "win32":
         os.system("color")
     main()

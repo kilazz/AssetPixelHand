@@ -6,7 +6,7 @@
 // This version resolves compilation errors by replacing ambiguous initializer-list
 // constructors for py::array_t with the explicit std::vector<py::ssize_t> form,
 // ensuring maximum compiler compatibility. The core "intelligent channel mapping"
-// logic remains the same.
+// logic has been significantly expanded to support more DXGI formats.
 // =======================================================================================
 
 #include <pybind11/pybind11.h>
@@ -386,13 +386,39 @@ DXGI_FORMAT GetDXGIFormatFromHeader(const DDS_HEADER& header, const uint8_t* fil
 }
 
 // =======================================================================================
-// NumPy Array Creation Helper (The "Smart" Converter)
+// NumPy Array Creation Helper (The "Smart" Converter) - V2 (Robust Version)
 // =======================================================================================
 py::object CreateNumpyArrayFromImage(const DirectX::Image* image) {
     if (!image || !image->pixels) {
         throw std::runtime_error("Cannot create NumPy array from an invalid image.");
     }
 
+    // --- Helper lambdas to reduce code duplication ---
+
+    // Helper for direct memory copy into a new NumPy array of a specific type
+    auto direct_copy = [&](auto dtype_example, int channels) -> py::object {
+        using T = decltype(dtype_example);
+        std::vector<py::ssize_t> shape = {(py::ssize_t)image->height, (py::ssize_t)image->width};
+        if (channels > 0) {
+            shape.push_back(channels);
+        }
+        auto arr = py::array_t<T>(shape);
+        py::buffer_info buf = arr.request();
+        // Check if row pitches match for a single memcpy, otherwise copy row by row
+        size_t numpy_row_pitch = image->width * sizeof(T) * (channels > 0 ? channels : 1);
+        if (image->rowPitch == numpy_row_pitch) {
+            memcpy(buf.ptr, image->pixels, image->slicePitch);
+        } else {
+            uint8_t* dst_ptr = static_cast<uint8_t*>(buf.ptr);
+            const uint8_t* src_ptr = image->pixels;
+            for(size_t y = 0; y < image->height; ++y) {
+                memcpy(dst_ptr + y * numpy_row_pitch, src_ptr + y * image->rowPitch, numpy_row_pitch);
+            }
+        }
+        return arr;
+    };
+
+    // Helper to convert 16-bit float (half) to 32-bit float
     auto convert_half_to_float = [&](size_t num_components) {
         std::vector<py::ssize_t> shape = {(py::ssize_t)image->height, (py::ssize_t)image->width};
         if (num_components > 1) {
@@ -415,50 +441,34 @@ py::object CreateNumpyArrayFromImage(const DirectX::Image* image) {
 
     // The core logic: decide what to return based on the image format.
     switch (image->format) {
-        // --- HDR (Floating Point) Formats ---
-        // These are returned as raw float arrays for tonemapping in Python.
-        case DXGI_FORMAT_R32G32B32A32_FLOAT: {
-            auto arr = py::array_t<float>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
-            py::buffer_info buf = arr.request();
-            memcpy(buf.ptr, image->pixels, image->slicePitch);
-            return arr;
-        }
-        case DXGI_FORMAT_R32G32B32_FLOAT: {
-             auto arr = py::array_t<float>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 3});
-             py::buffer_info buf = arr.request();
-             memcpy(buf.ptr, image->pixels, image->slicePitch);
-             return arr;
-        }
-        case DXGI_FORMAT_R32G32_FLOAT: {
-             auto arr = py::array_t<float>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 2});
-             py::buffer_info buf = arr.request();
-             memcpy(buf.ptr, image->pixels, image->slicePitch);
-             return arr;
-        }
-        case DXGI_FORMAT_R32_FLOAT: {
-             auto arr = py::array_t<float>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width});
-             py::buffer_info buf = arr.request();
-             memcpy(buf.ptr, image->pixels, image->slicePitch);
-             return arr;
-        }
+        // --- 32-bit per channel FLOATING POINT formats (HDR) -> returns float32 array ---
+        case DXGI_FORMAT_R32G32B32A32_FLOAT: return direct_copy(float(), 4);
+        case DXGI_FORMAT_R32G32B32_FLOAT:    return direct_copy(float(), 3);
+        case DXGI_FORMAT_R32G32_FLOAT:       return direct_copy(float(), 2);
+        case DXGI_FORMAT_R32_FLOAT:          return direct_copy(float(), 0);
+
+        // --- 16-bit per channel FLOATING POINT formats (Half/HDR) -> returns float32 array ---
         case DXGI_FORMAT_R16G16B16A16_FLOAT: return convert_half_to_float(4);
         case DXGI_FORMAT_R16G16_FLOAT:       return convert_half_to_float(2);
         case DXGI_FORMAT_R16_FLOAT:          return convert_half_to_float(1);
 
-        // --- SDR (Integer) Formats ---
-        // All these formats are intelligently converted to a standard RGBA8 NumPy array.
+        // --- 16-bit per channel INTEGER formats -> returns uint16/int16 array ---
+        case DXGI_FORMAT_R16G16B16A16_UNORM: return direct_copy(uint16_t(), 4);
+        case DXGI_FORMAT_R16G16_UNORM:       return direct_copy(uint16_t(), 2);
+        case DXGI_FORMAT_R16_UNORM:          return direct_copy(uint16_t(), 0);
+        case DXGI_FORMAT_R16G16B16A16_UINT:  return direct_copy(uint16_t(), 4);
+        case DXGI_FORMAT_R16G16_UINT:        return direct_copy(uint16_t(), 2);
+        case DXGI_FORMAT_R16_UINT:           return direct_copy(uint16_t(), 0);
+        case DXGI_FORMAT_R16G16B16A16_SINT:  return direct_copy(int16_t(), 4);
+        case DXGI_FORMAT_R16G16_SINT:        return direct_copy(int16_t(), 2);
+        case DXGI_FORMAT_R16_SINT:           return direct_copy(int16_t(), 0);
 
-        // Case 1: Already RGBA - direct copy
+        // --- 8-bit per channel UNORM formats (SDR) -> returns uint8 array ---
         case DXGI_FORMAT_R8G8B8A8_UNORM:
         case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-        case DXGI_FORMAT_R8G8B8A8_UINT: {
-            auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
-            py::buffer_info buf = arr.request();
-            memcpy(buf.ptr, image->pixels, image->slicePitch);
-            return arr;
-        }
+            return direct_copy(uint8_t(), 4);
 
-        // Case 2: BGRA format - requires channel swap
+        // BGRA format -> requires channel swap to RGBA, returns uint8 array
         case DXGI_FORMAT_B8G8R8A8_UNORM:
         case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: {
             auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
@@ -466,71 +476,164 @@ py::object CreateNumpyArrayFromImage(const DirectX::Image* image) {
             uint8_t* dst_ptr = static_cast<uint8_t*>(buf.ptr);
             const uint8_t* src_ptr = image->pixels;
             for (size_t y = 0; y < image->height; ++y) {
+                const uint8_t* src_row = src_ptr + y * image->rowPitch;
+                uint8_t* dst_row = dst_ptr + y * image->width * 4;
                 for (size_t x = 0; x < image->width; ++x) {
-                    const uint8_t* src_pixel = src_ptr + y * image->rowPitch + x * 4;
-                    uint8_t* dst_pixel = dst_ptr + (y * image->width + x) * 4;
-                    dst_pixel[0] = src_pixel[2]; // R <- B
-                    dst_pixel[1] = src_pixel[1]; // G <- G
-                    dst_pixel[2] = src_pixel[0]; // B <- R
-                    dst_pixel[3] = src_pixel[3]; // A <- A
+                    dst_row[x*4 + 0] = src_row[x*4 + 2]; // R
+                    dst_row[x*4 + 1] = src_row[x*4 + 1]; // G
+                    dst_row[x*4 + 2] = src_row[x*4 + 0]; // B
+                    dst_row[x*4 + 3] = src_row[x*4 + 3]; // A
                 }
             }
             return arr;
         }
 
-        // Case 3: Two-channel formats (from BC5/ATI2 Normal Maps)
-        case DXGI_FORMAT_R8G8_UNORM:
-        case DXGI_FORMAT_R8G8_UINT: {
+        // --- 8-bit per channel INTEGER formats -> returns uint8/int8 array ---
+        case DXGI_FORMAT_R8G8B8A8_UINT: return direct_copy(uint8_t(), 4);
+        case DXGI_FORMAT_R8G8_UINT:     return direct_copy(uint8_t(), 2);
+        case DXGI_FORMAT_R8_UINT:       return direct_copy(uint8_t(), 0);
+        case DXGI_FORMAT_R8G8B8A8_SINT: return direct_copy(int8_t(), 4);
+        case DXGI_FORMAT_R8G8_SINT:     return direct_copy(int8_t(), 2);
+        case DXGI_FORMAT_R8_SINT:       return direct_copy(int8_t(), 0);
+
+        // --- SNORM formats -> convert to float32 to preserve [-1, 1] range ---
+        case DXGI_FORMAT_R8G8B8A8_SNORM:
+        case DXGI_FORMAT_R8G8_SNORM:
+        case DXGI_FORMAT_R8_SNORM:
+        case DXGI_FORMAT_R16G16B16A16_SNORM:
+        case DXGI_FORMAT_R16G16_SNORM:
+        case DXGI_FORMAT_R16_SNORM: {
+            int channels;
+            bool is16bit = false;
+            if (image->format == DXGI_FORMAT_R8G8B8A8_SNORM || image->format == DXGI_FORMAT_R16G16B16A16_SNORM) channels = 4;
+            else if (image->format == DXGI_FORMAT_R8G8_SNORM || image->format == DXGI_FORMAT_R16G16_SNORM) channels = 2;
+            else channels = 1;
+            if (image->format == DXGI_FORMAT_R16G16B16A16_SNORM || image->format == DXGI_FORMAT_R16G16_SNORM || image->format == DXGI_FORMAT_R16_SNORM) is16bit = true;
+
+            auto arr = py::array_t<float>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, (py::ssize_t)channels});
+            py::buffer_info buf = arr.request();
+            float* dst_ptr = static_cast<float*>(buf.ptr);
+            const uint8_t* src_ptr = image->pixels;
+            for (size_t y = 0; y < image->height; ++y) {
+                const void* src_row = src_ptr + y * image->rowPitch;
+                float* dst_row = dst_ptr + y * image->width * channels;
+                for (size_t x = 0; x < image->width * channels; ++x) {
+                    if (is16bit) {
+                        dst_row[x] = std::max(-1.f, static_cast<float>(reinterpret_cast<const int16_t*>(src_row)[x]) / 32767.f);
+                    } else {
+                        dst_row[x] = std::max(-1.f, static_cast<float>(reinterpret_cast<const int8_t*>(src_row)[x]) / 127.f);
+                    }
+                }
+            }
+            return arr;
+        }
+
+        // --- Packed 16-bit formats -> unpack to RGBA8 uint8 array ---
+        case DXGI_FORMAT_B5G6R5_UNORM: {
             auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
             py::buffer_info buf = arr.request();
             uint8_t* dst_ptr = static_cast<uint8_t*>(buf.ptr);
             const uint8_t* src_ptr = image->pixels;
             for (size_t y = 0; y < image->height; ++y) {
+                const uint16_t* src_row = reinterpret_cast<const uint16_t*>(src_ptr + y * image->rowPitch);
+                uint8_t* dst_row = dst_ptr + y * image->width * 4;
                 for (size_t x = 0; x < image->width; ++x) {
-                    uint8_t* dst_pixel = dst_ptr + (y * image->width + x) * 4;
-                    const uint8_t* src_pixel = src_ptr + y * image->rowPitch + x * 2;
-                    dst_pixel[0] = src_pixel[0]; // R
-                    dst_pixel[1] = src_pixel[1]; // G
-                    dst_pixel[2] = 0;            // B (Blue channel is empty)
-                    dst_pixel[3] = 255;          // A
+                    uint16_t p = src_row[x];
+                    dst_row[x*4 + 0] = static_cast<uint8_t>(((p >> 11) & 0x1F) * 255 / 31); // R
+                    dst_row[x*4 + 1] = static_cast<uint8_t>(((p >> 5)  & 0x3F) * 255 / 63); // G
+                    dst_row[x*4 + 2] = static_cast<uint8_t>(( p        & 0x1F) * 255 / 31); // B
+                    dst_row[x*4 + 3] = 255; // A
+                }
+            }
+            return arr;
+        }
+        case DXGI_FORMAT_B5G5R5A1_UNORM: {
+            auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+            py::buffer_info buf = arr.request();
+            uint8_t* dst_ptr = static_cast<uint8_t*>(buf.ptr);
+            const uint8_t* src_ptr = image->pixels;
+            for (size_t y = 0; y < image->height; ++y) {
+                const uint16_t* src_row = reinterpret_cast<const uint16_t*>(src_ptr + y * image->rowPitch);
+                uint8_t* dst_row = dst_ptr + y * image->width * 4;
+                for (size_t x = 0; x < image->width; ++x) {
+                    uint16_t p = src_row[x];
+                    dst_row[x*4 + 0] = static_cast<uint8_t>(((p >> 10) & 0x1F) * 255 / 31); // R
+                    dst_row[x*4 + 1] = static_cast<uint8_t>(((p >> 5)  & 0x1F) * 255 / 31); // G
+                    dst_row[x*4 + 2] = static_cast<uint8_t>(( p        & 0x1F) * 255 / 31); // B
+                    dst_row[x*4 + 3] = static_cast<uint8_t>(((p >> 15) & 0x01) * 255);      // A
+                }
+            }
+            return arr;
+        }
+        case DXGI_FORMAT_B4G4R4A4_UNORM: {
+            auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+            py::buffer_info buf = arr.request();
+            uint8_t* dst_ptr = static_cast<uint8_t*>(buf.ptr);
+            const uint8_t* src_ptr = image->pixels;
+            for (size_t y = 0; y < image->height; ++y) {
+                const uint16_t* src_row = reinterpret_cast<const uint16_t*>(src_ptr + y * image->rowPitch);
+                uint8_t* dst_row = dst_ptr + y * image->width * 4;
+                for (size_t x = 0; x < image->width; ++x) {
+                    uint16_t p = src_row[x];
+                    uint8_t r = (p >> 8) & 0x0F, g = (p >> 4) & 0x0F, b = p & 0x0F, a = (p >> 12) & 0x0F;
+                    dst_row[x*4 + 0] = (r << 4) | r; // R
+                    dst_row[x*4 + 1] = (g << 4) | g; // G
+                    dst_row[x*4 + 2] = (b << 4) | b; // B
+                    dst_row[x*4 + 3] = (a << 4) | a; // A
                 }
             }
             return arr;
         }
 
-        // Case 4: A8 format (Alpha channel)
+        // --- Single and Dual channel UNORM formats -> expand to RGBA8 for visualization ---
+        case DXGI_FORMAT_R8G8_UNORM: {
+            auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+            py::buffer_info buf = arr.request();
+            uint8_t* dst_ptr = static_cast<uint8_t*>(buf.ptr);
+            const uint8_t* src_ptr = image->pixels;
+            for (size_t y = 0; y < image->height; ++y) {
+                const uint8_t* src_row = src_ptr + y * image->rowPitch;
+                uint8_t* dst_row = dst_ptr + y * image->width * 4;
+                for (size_t x = 0; x < image->width; ++x) {
+                    dst_row[x*4 + 0] = src_row[x*2 + 0]; // R
+                    dst_row[x*4 + 1] = src_row[x*2 + 1]; // G
+                    dst_row[x*4 + 2] = 0;                // B
+                    dst_row[x*4 + 3] = 255;              // A
+                }
+            }
+            return arr;
+        }
+        case DXGI_FORMAT_R8_UNORM: {
+            auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+            py::buffer_info buf = arr.request();
+            uint8_t* dst_ptr = static_cast<uint8_t*>(buf.ptr);
+            const uint8_t* src_ptr = image->pixels;
+            for (size_t y = 0; y < image->height; ++y) {
+                const uint8_t* src_row = src_ptr + y * image->rowPitch;
+                uint8_t* dst_row = dst_ptr + y * image->width * 4;
+                for (size_t x = 0; x < image->width; ++x) {
+                    uint8_t val = src_row[x];
+                    dst_row[x*4 + 0] = val; // R
+                    dst_row[x*4 + 1] = val; // G
+                    dst_row[x*4 + 2] = val; // B
+                    dst_row[x*4 + 3] = 255; // A
+                }
+            }
+            return arr;
+        }
         case DXGI_FORMAT_A8_UNORM: {
             auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
             py::buffer_info buf = arr.request();
             uint8_t* dst_ptr = static_cast<uint8_t*>(buf.ptr);
             const uint8_t* src_ptr = image->pixels;
             for (size_t y = 0; y < image->height; ++y) {
+                const uint8_t* src_row = src_ptr + y * image->rowPitch;
+                uint8_t* dst_row = dst_ptr + y * image->width * 4;
                 for (size_t x = 0; x < image->width; ++x) {
-                    uint8_t* dst_pixel = dst_ptr + (y * image->width + x) * 4;
-                    dst_pixel[0] = 255; // R (White for visibility)
-                    dst_pixel[1] = 255; // G
-                    dst_pixel[2] = 255; // B
-                    dst_pixel[3] = src_ptr[y * image->rowPitch + x]; // A
-                }
-            }
-            return arr;
-        }
-
-        // Case 5: R8 formats (from BC4/ATI1 Grayscale/Masks)
-        case DXGI_FORMAT_R8_UNORM:
-        case DXGI_FORMAT_R8_UINT: {
-            auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
-            py::buffer_info buf = arr.request();
-            uint8_t* dst_ptr = static_cast<uint8_t*>(buf.ptr);
-            const uint8_t* src_ptr = image->pixels;
-            for (size_t y = 0; y < image->height; ++y) {
-                for (size_t x = 0; x < image->width; ++x) {
-                    uint8_t* dst_pixel = dst_ptr + (y * image->width + x) * 4;
-                    uint8_t value = src_ptr[y * image->rowPitch + x];
-                    dst_pixel[0] = value; // R
-                    dst_pixel[1] = value; // G
-                    dst_pixel[2] = value; // B
-                    dst_pixel[3] = 255;   // A
+                    dst_row[x*4 + 0] = 255;      // R
+                    dst_row[x*4 + 1] = 255;      // G
+                    dst_row[x*4 + 2] = 255;      // B
+                    dst_row[x*4 + 3] = src_row[x]; // A
                 }
             }
             return arr;
@@ -827,7 +930,7 @@ PYBIND11_MODULE(directxtex_decoder, m) {
           "Extracts DDS metadata without decoding pixel data.",
           py::arg("dds_bytes"));
 
-    m.attr("__version__") = "15.1.0";
+    m.attr("__version__") = "15.2.0"; // Version updated to reflect significant change
     m.attr("__author__") = "DirectXTex Wrapper";
 }
 

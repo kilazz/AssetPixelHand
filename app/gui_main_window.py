@@ -62,11 +62,15 @@ class App(QMainWindow):
         self.log_emitter = log_emitter
         self.delete_thread: threading.Thread | None = None
         self.stats_dialog: ScanStatisticsDialog | None = None
+
+        # This thread pool is now created early and passed to the viewer panel
         self.image_load_pool = QThreadPool()
         self.image_load_pool.setMaxThreadCount(max(4, os.cpu_count() or 4))
+
         self.settings_save_timer = QTimer(self)
         self.settings_save_timer.setSingleShot(True)
         self.settings_save_timer.setInterval(1000)
+
         self._setup_ui()
         self._create_menu_bar()
         self._create_context_menu()
@@ -106,7 +110,6 @@ class App(QMainWindow):
         self.log_panel = LogPanel()
         log_layout.addWidget(self.log_panel)
 
-        # We use simple containers. The splitter logic will handle everything.
         top_pane_wrapper = QWidget()
         top_pane_layout = QVBoxLayout(top_pane_wrapper)
         top_pane_layout.setContentsMargins(0, 0, 0, SPACING)
@@ -119,43 +122,50 @@ class App(QMainWindow):
 
         left_v_splitter.addWidget(top_pane_wrapper)
         left_v_splitter.addWidget(bottom_pane_wrapper)
-
-        # [FIX] This is the correct combination of settings.
-        # Top panel (0) does not stretch. Bottom panel (1) takes all space.
-        # Top panel is allowed to be collapsed by the user.
         left_v_splitter.setStretchFactor(0, 0)
         left_v_splitter.setStretchFactor(1, 1)
-        left_v_splitter.setCollapsible(0, True)  # Allow user to collapse top panel
+        left_v_splitter.setCollapsible(0, True)
         left_v_splitter.setCollapsible(1, True)
 
         self.results_viewer_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.results_panel = ResultsPanel()
-        self.viewer_panel = ImageViewerPanel(self.settings)
+
+        # ==============================================================================
+        # START OF FIX: Pass the global image_load_pool to the ImageViewerPanel
+        # ==============================================================================
+        self.viewer_panel = ImageViewerPanel(self.settings, self.image_load_pool)
+        # ==============================================================================
+        # END OF FIX
+        # ==============================================================================
+
         results_pane_wrapper = QWidget()
         results_pane_layout = QHBoxLayout(results_pane_wrapper)
         results_pane_layout.setContentsMargins(0, 0, SPACING, 0)
         results_pane_layout.addWidget(self.results_panel)
+
         viewer_pane_wrapper = QWidget()
         viewer_pane_layout = QHBoxLayout(viewer_pane_wrapper)
         viewer_pane_layout.setContentsMargins(SPACING, 0, 0, 0)
         viewer_pane_layout.addWidget(self.viewer_panel)
+
         self.results_viewer_splitter.addWidget(results_pane_wrapper)
         self.results_viewer_splitter.addWidget(viewer_pane_wrapper)
+
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         left_pane_wrapper = QWidget()
         left_pane_layout = QHBoxLayout(left_pane_wrapper)
         left_pane_layout.setContentsMargins(0, 0, SPACING, 0)
         left_pane_layout.addWidget(left_v_splitter)
+
         right_pane_wrapper = QWidget()
         right_pane_layout = QHBoxLayout(right_pane_wrapper)
         right_pane_layout.setContentsMargins(SPACING, 0, 0, 0)
         right_pane_layout.addWidget(self.results_viewer_splitter)
+
         self.main_splitter.addWidget(left_pane_wrapper)
         self.main_splitter.addWidget(right_pane_wrapper)
         main_layout.addWidget(self.main_splitter)
 
-        # [FIX] Remove the problematic setSizes call that forces ratio-based resizing.
-        # Let the stretch factors and initial widget sizes handle the layout naturally.
         self.main_splitter.setSizes([int(self.width() * 0.25), int(self.width() * 0.75)])
         self.results_viewer_splitter.setSizes([int(self.width() * 0.4), int(self.width() * 0.35)])
 
