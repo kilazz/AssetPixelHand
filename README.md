@@ -22,7 +22,8 @@
     *   **Hardlink Replacement**: Save gigabytes of disk space by replacing duplicate files with hardlinks to a single source file, all without breaking your project's folder structure.
     *   Safe deletion to the system's recycle bin.
 
-*   **📁 Supported Formats**: `JPG/JPEG`, `PNG`, `WEBP`, `BMP`, `TGA`, `CUR`, `ICO`, `GIF`, `AVIF`, `HEIF/HEIC`, `PSD`, `EXR`, `HDR`, `TIF/TIFF`, `DDS` and more.
+*   **📁 Supported Formats**:
+    *   `JPG/JPEG`, `PNG`, `WEBP`, `BMP`, `TGA`, `CUR`, `ICO`, `GIF`, `AVIF`, `HEIF/HEIC`, `PSD`, `EXR`, `HDR`, `TIF/TIFF`, `DDS` and more.
 
 ## Tech Stack
 *   **GUI**: PySide6 (Qt for Python)
