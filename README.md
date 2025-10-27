@@ -10,8 +10,8 @@
 
 *   **📊 Comparison Tools**: Analyze found images with multiple sophisticated modes:
     *   **Side-by-Side**: Classic direct comparison.
-    *   **Difference**: Visually highlights pixels that differ between two images, making it easy to spot minor edits.
     *   **Wipe & Overlay**: Interactively compare two images using a slider or by blending them.
+    *   **Difference**: Visually highlights pixels that differ between two images, making it easy to spot minor edits.
 
 *   **⚙️ Performance Tuning**: Take full control over every aspect of the scan:
     *   **Compute Precision (FP32/FP16)**: Nearly double your performance on modern GPUs with a minimal trade-off in accuracy.
