@@ -23,7 +23,7 @@
     *   Safe deletion to the system's recycle bin.
 
 *   **📁 Supported Formats**:
-    *   `JPG/JPEG`, `PNG`, `WEBP`, `BMP`, `TGA`, `CUR`, `ICO`, `GIF`, `AVIF`, `HEIF/HEIC`, `PSD`, `EXR`, `HDR`, `TIF/TIFF`, `DDS` and more.
+    *   `JPG/JPEG`, `PNG`, `WEBP`, `BMP`, `TGA`, `CUR`, `ICO`, `GIF`, `AVIF`, `HEIF/HEIC`, `PSD`, `EXR`, `HDR`, `TIF/TIFF`, `DDS` and more. ~
 
 ## Tech Stack
 *   **GUI**: PySide6 (Qt for Python)
