@@ -5,10 +5,10 @@ These classes encapsulate the most computationally intensive parts of the applic
 """
 
 import logging
-import math
 import multiprocessing
 import threading
 import uuid
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
@@ -25,6 +25,16 @@ from app.utils import find_best_in_group
 
 if LANCEDB_AVAILABLE:
     import lancedb
+
+# The graph clustering approach requires SciPy.
+try:
+    import scipy.sparse as sparse
+    from scipy.sparse.csgraph import connected_components, minimum_spanning_tree
+
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
 
 app_logger = logging.getLogger("AssetPixelHand.engines")
 
@@ -82,7 +92,6 @@ class FingerprintEngine(QObject):
     def _handle_batch_results(
         self, batch_result: list[ImageFingerprint], skipped_paths: list[str], cache: CacheManager, fps_to_cache: list
     ):
-        """Helper to process a finished batch: log skips, upsert to DB, and cache."""
         for path_str in skipped_paths:
             self.signals.log.emit(f"Skipped problematic file: {Path(path_str).name}", "warning")
         if batch_result:
@@ -93,7 +102,6 @@ class FingerprintEngine(QObject):
                 fps_to_cache.clear()
 
     def _add_to_lancedb(self, fingerprints: list[ImageFingerprint]):
-        """Adds a batch of fingerprints to the LanceDB table asynchronously."""
         if not fingerprints or not LANCEDB_AVAILABLE:
             return
 
@@ -117,7 +125,6 @@ class FingerprintEngine(QObject):
         self.db_executor.submit(self.lancedb_table.add, data=data_to_add)
 
     def _run_gpu_pipeline(self, files, stop_event, total, cache, num_workers) -> tuple[bool, list[str]]:
-        """Manages the 3-stage GPU processing pipeline (Preload -> Preprocess -> Inference)."""
         ctx = multiprocessing.get_context("spawn")
         tensor_q, results_q = ctx.Queue(maxsize=64), ctx.Queue(maxsize=total + 1)
         infer_cfg = {
@@ -155,7 +162,6 @@ class FingerprintEngine(QObject):
     def _gpu_pipeline_loop(
         self, preproc_results, tensor_q, results_q, stop_event, infer_proc, total, cache
     ) -> tuple[int | None, list[str]]:
-        """The core consumer/producer loop for the GPU pipeline."""
         processed, fps_to_cache, all_skipped = 0, [], []
         feeding_done = False
         while processed < total:
@@ -185,7 +191,7 @@ class FingerprintEngine(QObject):
             except Empty:
                 pass
 
-        while True:  # Drain the results queue
+        while True:
             try:
                 gpu_result = results_q.get(timeout=1.0)
                 if gpu_result is None:
@@ -202,7 +208,6 @@ class FingerprintEngine(QObject):
         return processed, all_skipped
 
     def _run_cpu_pipeline(self, files, stop_event, total, cache, num_workers) -> tuple[bool, list[str]]:
-        """Manages a simple multiprocessing pool for CPU-only tasks."""
         if "_fp16" not in self.config.model_name and num_workers > 1:
             self.signals.log.emit("FP32 model is large. Limiting to 1 CPU worker to save RAM.", "warning")
             num_workers = 1
@@ -240,7 +245,9 @@ class FingerprintEngine(QObject):
 
 
 class LanceDBSimilarityEngine(QObject):
-    """Finds groups of similar images using a LanceDB index via graph traversal."""
+    """Finds groups of similar images using graph clustering on a sparse distance matrix."""
+
+    K_NEIGHBORS = 50
 
     def __init__(
         self,
@@ -252,153 +259,104 @@ class LanceDBSimilarityEngine(QObject):
         super().__init__()
         self.state, self.signals, self.config = state, signals, config
         self.table = lancedb_table
-        self.similarity_threshold = self.config.similarity_threshold / 100.0
-        self.CLUSTER_SEARCH_LIMIT = 50
 
-        self.distance_threshold = 1.0 - self.similarity_threshold
+        self.distance_threshold = 1.0 - (self.config.similarity_threshold / 100.0)
 
         nprobes_map = {"Fast": 10, "Balanced (Default)": 20, "Thorough": 40, "Exhaustive (Slow)": 256}
         self.nprobes = nprobes_map.get(self.config.search_precision, 20)
-
         refine_map = {"Fast": 1, "Balanced (Default)": 2, "Thorough": 5, "Exhaustive (Slow)": 10}
         self.refine_factor = refine_map.get(self.config.search_precision, 2)
-
-        log_msg = f"Search precision: '{config.search_precision}' (nprobes: {self.nprobes}, refine_factor: {self.refine_factor})"
+        log_msg = f"Graph clustering with precision '{config.search_precision}' (k={self.K_NEIGHBORS}, nprobes={self.nprobes})"
         self.signals.log.emit(log_msg, "info")
 
     def _score_to_percentage(self, distance: float) -> int:
-        """Converts a LanceDB cosine distance (0.0-2.0) to a similarity percentage (0-100)."""
         similarity = 1.0 - distance
         return int(max(0.0, min(1.0, similarity)) * 100)
 
-    def create_index(self, stop_event: threading.Event):
-        """Creates the IVF-PQ index on the table before searching."""
-        if stop_event.is_set():
-            return
-        try:
-            num_vectors = len(self.table)
-            self.state.update_progress(0, 1, f"Found {num_vectors} vectors to index.")
-
-            MIN_VECTORS_FOR_INDEX_CREATION = 256
-            if num_vectors >= MIN_VECTORS_FOR_INDEX_CREATION:
-                num_partitions = int(math.sqrt(num_vectors))
-                if num_partitions >= num_vectors:
-                    num_partitions = max(1, num_vectors // 4)
-                num_partitions = min(256, max(16, num_partitions))
-                num_sub_vectors = 64
-
-                if num_partitions > 1:
-                    self.signals.log.emit(f"Building IVF-PQ index with {num_partitions} partitions.", "info")
-                    self.table.create_index(
-                        num_partitions=num_partitions, num_sub_vectors=num_sub_vectors, metric="cosine"
-                    )
-                else:
-                    self.signals.log.emit("Too few vectors for partitioning. Using brute-force search.", "info")
-            else:
-                self.signals.log.emit(
-                    f"Too few images ({num_vectors}) to build an optimized index. Using brute-force search.", "info"
-                )
-        except Exception as e:
-            self.signals.log.emit(f"Failed to build index: {e}", "error")
-
     def find_similar_groups(self, stop_event: threading.Event) -> DuplicateResults:
-        """Finds clusters using an efficient breadth-first search on the neighbor graph."""
+        """
+        Finds clusters using a memory-efficient graph clustering algorithm with SciPy.
+        """
+        if not SCIPY_AVAILABLE:
+            self.signals.log.emit("SciPy not found. Please run 'pip install scipy'.", "error")
+            return {}
+
         self.state.update_progress(0, 1, "Fetching image index from database...")
         try:
-            point_ids = self.table.to_lance().to_table().column("id").to_pylist()
+            arrow_table = self.table.to_lance().to_table(columns=["id", "vector"])
+            point_ids = arrow_table.column("id").to_pylist()
+
             if not point_ids or stop_event.is_set():
                 return {}
+
+            vectors = np.array(arrow_table.column("vector").to_pylist())
+
         except Exception as e:
-            self.signals.log.emit(f"Failed to fetch point IDs: {e}", "error")
+            self.signals.log.emit(f"Failed to fetch data: {e}", "error")
             return {}
 
         id_to_idx = {pid: i for i, pid in enumerate(point_ids)}
-        num_points, visited_indices, final_groups_indices = len(point_ids), set(), []
-        self.state.update_progress(0, num_points, "Clustering groups (graph traversal)...")
+        num_points = len(point_ids)
 
-        BATCH_SIZE = 16
+        self.state.update_progress(0, num_points, "Finding nearest neighbors...")
+        rows, cols, data = [], [], []
 
         for i in range(num_points):
             if stop_event.is_set():
                 return {}
-            if i in visited_indices:
-                continue
 
-            queue, current_cluster = [i], {i}
-            visited_indices.add(i)
-            head = 0
-            while head < len(queue):
-                batch_indices = queue[head : head + BATCH_SIZE]
-                if not batch_indices:
-                    break
+            hits = self.table.search(vectors[i]).limit(self.K_NEIGHBORS).nprobes(self.nprobes).to_pandas()
 
-                batch_ids = [point_ids[idx] for idx in batch_indices]
-                head += len(batch_indices)
+            for _, hit in hits.iterrows():
+                j = id_to_idx.get(hit["id"])
+                distance = hit["_distance"]
+                if j is not None and i != j:
+                    rows.append(i)
+                    cols.append(j)
+                    data.append(distance)
 
-                try:
-                    quoted_ids = ", ".join([f"'{_id}'" for _id in batch_ids])
-                    where_clause = f"id IN ({quoted_ids})"
-                    batch_df = self.table.search(None).where(where_clause).limit(len(batch_ids)).to_pandas()
-                    if batch_df.empty:
-                        continue
-                except Exception as e:
-                    self.signals.log.emit(f"Could not retrieve vector batch: {e}", "warning")
-                    continue
+            self.state.update_progress(i + 1, num_points)
 
-                for _, row in batch_df.iterrows():
-                    current_vector = row["vector"]
-                    if current_vector is None:
-                        continue
+        if stop_event.is_set():
+            return {}
 
-                    try:
-                        raw_hits_df = (
-                            self.table.search(current_vector)
-                            .metric("cosine")
-                            .limit(self.CLUSTER_SEARCH_LIMIT)
-                            .nprobes(self.nprobes)
-                            .refine_factor(self.refine_factor)
-                            .to_pandas()
-                        )
-                        hits_df = raw_hits_df[raw_hits_df["_distance"] < self.distance_threshold]
-                    except Exception as e:
-                        self.signals.log.emit(f"LanceDB search failed for a point: {e}", "warning")
-                        continue
+        graph = sparse.csr_matrix((data, (rows, cols)), shape=(num_points, num_points))
 
-                    for hit_id in hits_df["id"]:
-                        hit_idx = id_to_idx.get(hit_id)
-                        if hit_idx is not None and hit_idx not in visited_indices:
-                            visited_indices.add(hit_idx)
-                            current_cluster.add(hit_idx)
-                            queue.append(hit_idx)
+        self.state.update_progress(0, 1, "Building Minimum Spanning Tree...")
+        mst = minimum_spanning_tree(graph)
 
-            if len(current_cluster) > 1:
-                final_groups_indices.append(list(current_cluster))
-            self.state.update_progress(len(visited_indices), num_points)
+        mst.data[mst.data > self.distance_threshold] = 0
+        mst.eliminate_zeros()
 
-        return self._build_duplicate_results(final_groups_indices, point_ids, stop_event)
+        self.state.update_progress(0, 1, "Finding connected components...")
+        n_components, labels = connected_components(csgraph=mst, directed=False, return_labels=True)
+
+        self.signals.log.emit(f"Graph analysis found {n_components} potential groups.", "info")
+
+        grouped_by_label = defaultdict(list)
+        for i, label in enumerate(labels):
+            grouped_by_label[label].append(point_ids[i])
+
+        final_groups_ids = [group for group in grouped_by_label.values() if len(group) > 1]
+
+        return self._build_duplicate_results(final_groups_ids, stop_event)
 
     def _build_duplicate_results(
-        self, final_groups_indices: list[list[int]], point_ids: list[str], stop_event: threading.Event
+        self, final_groups_ids: list[list[str]], stop_event: threading.Event
     ) -> DuplicateResults:
-        """Converts clustered indices into the final DuplicateResults structure."""
-        if not final_groups_indices:
+        if not final_groups_ids:
             return {}
         duplicate_results: DuplicateResults = {}
-        self.state.update_progress(0, len(final_groups_indices), "Finalizing results...")
+        self.state.update_progress(0, len(final_groups_ids), "Finalizing results...")
 
         def cosine_similarity(v1, v2):
-            """Calculates cosine similarity, assuming vectors are already normalized."""
             dot_product = np.dot(v1, v2)
             return int(max(0.0, min(1.0, dot_product)) * 100)
 
-        for i, component_indices in enumerate(final_groups_indices):
+        for i, id_group in enumerate(final_groups_ids):
             if stop_event.is_set():
                 return {}
-            self.state.update_progress(i + 1, len(final_groups_indices))
-
-            id_group = [point_ids[idx] for idx in component_indices]
-            if not id_group:
-                continue
+            self.state.update_progress(i + 1, len(final_groups_ids))
 
             try:
                 quoted_ids = ", ".join([f"'{_id}'" for _id in id_group])
@@ -408,22 +366,26 @@ class LanceDBSimilarityEngine(QObject):
                 self.signals.log.emit(f"Failed to fetch group data: {e}", "warning")
                 continue
 
+            if points_in_group_df.empty:
+                continue
+
             component_fps = [self._create_fp_from_row(row) for _, row in points_in_group_df.iterrows()]
             if not component_fps:
                 continue
 
-            best_fp, dups_set = find_best_in_group(component_fps), set()
+            best_fp = find_best_in_group(component_fps)
+            dups_set = set()
             for fp in component_fps:
                 if fp != best_fp:
-                    best_hashes = np.array(best_fp.hashes)
-                    fp_hashes = np.array(fp.hashes)
-                    dups_set.add((fp, cosine_similarity(best_hashes, fp_hashes)))
+                    sim = cosine_similarity(np.array(best_fp.hashes), np.array(fp.hashes))
+                    if sim >= self.config.similarity_threshold:
+                        dups_set.add((fp, sim))
+
             if dups_set:
                 duplicate_results[best_fp] = dups_set
         return duplicate_results
 
     def _create_fp_from_row(self, row) -> ImageFingerprint:
-        """Helper to construct an ImageFingerprint from a pandas row."""
         return ImageFingerprint(
             path=Path(row["path"]),
             hashes=np.array(row["vector"]),

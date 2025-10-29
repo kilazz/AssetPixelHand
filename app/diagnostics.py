@@ -62,9 +62,11 @@ def check_library_imports() -> bool:
             "lancedb": "lancedb",
             "xxhash": "xxhash",
             "sentencepiece": "sentencepiece",
-            "OpenImageIO": "OpenImageIO",
+            "OpenImageIO": "oiio-python",  # The package is oiio-python, but it's imported as OpenImageIO
+            "scipy": "scipy",
+            "fast_hdbscan": "fast-hdbscan",
         },
-        "Optional (for extended file format support and features)": {"directxtex_decoder": "directxtex_decoder"},
+        "Optional (for extended file format support and features)": {},  # directxtex-decoder removed
     }
     overall_ok = True
     for category, libs in libraries.items():
@@ -88,7 +90,7 @@ def check_library_imports() -> bool:
     print("-" * 70)
     print_status("All critical libraries imported successfully.", overall_ok)
     if not overall_ok:
-        print("       Tip: Ensure all required packages are installed, e.g., 'pip install OpenImageIO'.")
+        print("       Tip: Ensure all required packages are installed, e.g., 'pip install oiio-python'.")
     return overall_ok
 
 

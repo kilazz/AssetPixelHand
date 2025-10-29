@@ -43,32 +43,24 @@ class FindDuplicatesStrategy(ScanStrategy):
     """Strategy for finding duplicate and similar images."""
 
     def execute(self, stop_event: threading.Event, start_time: float):
-        all_files = self.scanner_core._find_files(stop_event)
+        phase_count = 4 if self.config.find_exact_duplicates else 3
+
+        all_files = self.scanner_core._find_files(stop_event, phase_count)
         if self.scanner_core._check_stop_or_empty(stop_event, all_files, "duplicates", [], start_time):
             return
 
-        exact_groups, files_for_ai = self.scanner_core._find_exact_duplicates(all_files, stop_event)
+        exact_groups, files_for_ai = self.scanner_core._find_exact_duplicates(all_files, stop_event, phase_count)
         if stop_event.is_set():
             return
 
-        success, skipped = self.scanner_core._generate_fingerprints(files_for_ai, stop_event)
+        success, skipped = self.scanner_core._generate_fingerprints(files_for_ai, stop_event, phase_count)
         self.scanner_core.all_skipped_files.extend(skipped)
         if not success:
             self.scanner_core._check_stop_or_empty(stop_event, [], "duplicates", exact_groups, start_time)
             return
 
+        self.state.set_phase(f"Phase {phase_count}/{phase_count}: Finding similar images...", 0.15)
         sim_engine = LanceDBSimilarityEngine(self.state, self.signals, self.config, self.table)
-
-        # OPTIMIZATION: Create the index as a separate, visible phase for better UX.
-        # This phase occurs after fingerprinting but before the final search.
-        phase_count = 5 if self.config.find_exact_duplicates else 4
-        self.state.set_phase(f"Phase {phase_count - 1}/{phase_count}: Optimizing search index...", 0.05)
-        sim_engine.create_index(stop_event)
-        if stop_event.is_set():
-            return
-
-        # Final Phase: Finding similar images
-        self.state.set_phase(f"Phase {phase_count}/{phase_count}: Finding similar images...", 0.1)
         similar_groups = sim_engine.find_similar_groups(stop_event)
         if stop_event.is_set():
             return
@@ -81,22 +73,15 @@ class SearchStrategy(ScanStrategy):
     """Strategy for text or image-based similarity search."""
 
     def execute(self, stop_event: threading.Event, start_time: float):
-        all_files = self.scanner_core._find_files(stop_event)
+        all_files = self.scanner_core._find_files(stop_event, 2)
         if self.scanner_core._check_stop_or_empty(stop_event, all_files, self.config.scan_mode, [], start_time):
             return
 
-        success, skipped = self.scanner_core._generate_fingerprints(all_files, stop_event)
+        success, skipped = self.scanner_core._generate_fingerprints(all_files, stop_event, 2)
         self.scanner_core.all_skipped_files.extend(skipped)
         if not success:
             if not stop_event.is_set():
                 self.signals.error.emit("Failed to generate fingerprints.")
-            return
-
-        # OPTIMIZATION: Ensure index is created before searching in search modes too.
-        sim_engine = LanceDBSimilarityEngine(self.state, self.signals, self.config, self.table)
-        self.state.set_phase("Optimizing search index...", 0.05)
-        sim_engine.create_index(stop_event)
-        if stop_event.is_set():
             return
 
         self.state.set_phase("Searching for similar images...", 0.1)
@@ -104,6 +89,8 @@ class SearchStrategy(ScanStrategy):
         if query_vector is None:
             self.signals.error.emit("Could not generate a vector for the search query.")
             return
+
+        sim_engine = LanceDBSimilarityEngine(self.state, self.signals, self.config, self.table)
 
         raw_hits_df = (
             self.table.search(query_vector)

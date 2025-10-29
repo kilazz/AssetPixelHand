@@ -152,9 +152,9 @@ class ScannerCore(QObject):
             self.signals.error.emit(f"Failed to initialize vector database: {e}")
             return False
 
-    def _find_files(self, stop_event: threading.Event) -> list[Path]:
+    # FIX: Added 'phase_count' parameter to the method signature.
+    def _find_files(self, stop_event: threading.Event, phase_count: int) -> list[Path]:
         """Finds all image files to be processed."""
-        phase_count = 5 if self.config.find_exact_duplicates else 4
         self.state.set_phase(f"Phase 1/{phase_count}: Finding image files...", 0.1)
         finder = FileFinder(
             self.state, self.config.folder_path, self.config.excluded_folders, self.config.selected_extensions
@@ -164,23 +164,22 @@ class ScannerCore(QObject):
             files.sort()
         return files
 
+    # FIX: Added 'phase_count' parameter to the method signature.
     def _find_exact_duplicates(
-        self, all_files: list[Path], stop_event: threading.Event
+        self, all_files: list[Path], stop_event: threading.Event, phase_count: int
     ) -> tuple[DuplicateResults, list[Path]]:
         """Identifies exact duplicates by hashing and separates unique files."""
         if not self.config.find_exact_duplicates:
             return {}, all_files
-        self.state.set_phase("Phase 2/5: Finding exact duplicates...", 0.2)
+        self.state.set_phase(f"Phase 2/{phase_count}: Finding exact duplicates...", 0.2)
         self.state.update_progress(0, len(all_files), "Hashing files...")
         self.hash_map.clear()
         for i, file_path in enumerate(all_files):
             if stop_event.is_set():
                 return {}, []
             try:
-                # OPTIMIZATION: Use streaming hashing to handle large files without high memory usage.
                 hasher = xxhash.xxh64()
                 with open(file_path, "rb") as f:
-                    # Read file in 4MB chunks to keep memory usage low.
                     while chunk := f.read(4 * 1024 * 1024):
                         hasher.update(chunk)
                 self.hash_map[hasher.hexdigest()].append(file_path)
@@ -209,9 +208,12 @@ class ScannerCore(QObject):
             return None
         return ImageFingerprint(path=path, hashes=np.array([]), **meta)
 
-    def _generate_fingerprints(self, files: list[Path], stop_event: threading.Event) -> tuple[bool, list[str]]:
+    # FIX: Added 'phase_count' parameter to the method signature.
+    def _generate_fingerprints(
+        self, files: list[Path], stop_event: threading.Event, phase_count: int
+    ) -> tuple[bool, list[str]]:
         """Runs the AI fingerprinting engine on the given files."""
-        phase_num, phase_count = (3, 5) if self.config.find_exact_duplicates else (2, 4)
+        phase_num = 3 if self.config.find_exact_duplicates else 2
         self.state.set_phase(f"Phase {phase_num}/{phase_count}: Creating AI fingerprints...", 0.6)
         fp_engine = FingerprintEngine(self.config, self.state, self.signals, self.table)
         return fp_engine.process_all(files, stop_event)
