@@ -5,17 +5,22 @@ This includes tasks for model conversion, image loading, and file system operati
 """
 
 import inspect
+import io
 import logging
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import send2trash
-from PySide6.QtCore import QObject, QRunnable, Signal
+from PySide6.QtCore import QModelIndex, QObject, QRunnable, Signal
 
-from app.constants import DEEP_LEARNING_AVAILABLE, QuantizationMode
+from app.cache import thumbnail_cache
+from app.constants import DEEP_LEARNING_AVAILABLE, DUCKDB_AVAILABLE, QuantizationMode
 from app.model_adapter import get_model_adapter
-from app.utils import _load_image_static_cached
+from app.utils import _load_image_static_cached, get_thumbnail_cache_key
+
+if DUCKDB_AVAILABLE:
+    import duckdb
 
 if TYPE_CHECKING:
     import torch
@@ -40,7 +45,6 @@ class ModelConverter(QRunnable):
         self.adapter = get_model_adapter(self.hf_model_name)
 
     def run(self):
-        # Import heavy libraries here to avoid loading them in the main GUI thread.
         import torch
         from PIL import Image
 
@@ -171,6 +175,7 @@ class ImageLoader(QRunnable):
     def __init__(
         self,
         path_str: str,
+        mtime: float,
         target_size: int | None,
         tonemap_mode: str = "reinhard",
         use_cache: bool = True,
@@ -180,6 +185,7 @@ class ImageLoader(QRunnable):
     ):
         super().__init__()
         self.path_str = path_str
+        self.mtime = mtime
         self.target_size = target_size
         self.tonemap_mode = tonemap_mode
         self.use_cache = use_cache
@@ -193,7 +199,7 @@ class ImageLoader(QRunnable):
         return self._is_cancelled
 
     def run(self):
-        # Import necessary Qt/PIL components inside the run method to ensure worker-safety.
+        from PIL import Image
         from PIL.ImageQt import ImageQt
         from PySide6.QtCore import Q_ARG, QMetaObject, Qt
         from PySide6.QtGui import QImage
@@ -202,18 +208,37 @@ class ImageLoader(QRunnable):
             if self.is_cancelled:
                 return
 
-            pil_img = _load_image_static_cached(
-                self.path_str,
-                target_size=(self.target_size, self.target_size) if self.target_size else None,
-                tonemap_mode=self.tonemap_mode,
-            )
+            pil_img = None
+            cache_key = get_thumbnail_cache_key(self.path_str, self.mtime, self.target_size, self.tonemap_mode)
+
+            cached_data = thumbnail_cache.get(cache_key)
+            if cached_data:
+                try:
+                    pil_img = Image.open(io.BytesIO(cached_data))
+                except Exception as e:
+                    app_logger.warning(f"Could not load from thumbnail cache for {self.path_str}: {e}")
+                    pil_img = None
+
+            if pil_img is None:
+                pil_img = _load_image_static_cached(
+                    self.path_str,
+                    target_size=(self.target_size, self.target_size) if self.target_size else None,
+                    tonemap_mode=self.tonemap_mode,
+                )
+
+                if pil_img and not self.is_cancelled:
+                    try:
+                        buffer = io.BytesIO()
+                        pil_img.save(buffer, "WEBP", quality=90)
+                        thumbnail_cache.put(cache_key, buffer.getvalue())
+                    except Exception as e:
+                        app_logger.warning(f"Could not save thumbnail to cache for {self.path_str}: {e}")
 
             if self.is_cancelled:
                 return
 
             if self.receiver and self.on_finish_slot:
                 if pil_img:
-                    # Convert PIL.Image to QImage, which is thread-safe for Qt signals.
                     q_img = ImageQt(pil_img)
                     QMetaObject.invokeMethod(
                         self.receiver,
@@ -246,11 +271,59 @@ class ImageLoader(QRunnable):
         self._is_cancelled = True
 
 
+class GroupFetcherTask(QRunnable):
+    """A task to fetch children of a results group from DuckDB in a background thread."""
+
+    class Signals(QObject):
+        finished = Signal(list, int, QModelIndex)
+        error = Signal(str)
+
+    def __init__(self, db_path: Path, group_id: int, mode: str, parent: QModelIndex):
+        super().__init__()
+        self.db_path = db_path
+        self.group_id = group_id
+        self.mode = mode
+        self.parent = parent
+        self.signals = self.Signals()
+
+    def run(self):
+        """Executes the database query in a background thread."""
+        if not DUCKDB_AVAILABLE:
+            self.signals.error.emit("DuckDB not available.")
+            return
+
+        try:
+            with duckdb.connect(database=str(self.db_path), read_only=True) as conn:
+                query = "SELECT * FROM results WHERE group_id = ? ORDER BY is_best DESC, distance DESC"
+                cols = [desc[0] for desc in conn.execute(query, [self.group_id]).description]
+                children = [
+                    dict(zip(cols, row, strict=False)) for row in conn.execute(query, [self.group_id]).fetchall()
+                ]
+
+                for child in children:
+                    child["distance"] = int(child.get("distance", -1) or -1)
+
+                is_search = self.mode in ["text_search", "sample_search"]
+                if is_search and children and children[0].get("is_best"):
+                    children.pop(0)
+
+                self.signals.finished.emit(children, self.group_id, self.parent)
+
+        except duckdb.Error as e:
+            error_msg = f"Failed to fetch children for group {self.group_id}: {e}"
+            app_logger.error(error_msg)
+            self.signals.error.emit(error_msg)
+        except Exception as e:
+            error_msg = f"An unexpected error occurred during group fetch: {e}"
+            app_logger.error(error_msg, exc_info=True)
+            self.signals.error.emit(error_msg)
+
+
 class FileOperationTask(QRunnable):
     """A task to perform file operations (delete, link) in a background thread."""
 
     class Signals(QObject):
-        finished = Signal(list, int, int)  # affected_paths, success_count, failed_count
+        finished = Signal(list, int, int)
         log = Signal(str, str)
 
     def __init__(self, mode: str, paths: list[Path] = None, link_map: dict[Path, Path] = None):

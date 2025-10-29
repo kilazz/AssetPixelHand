@@ -112,6 +112,7 @@ class AppSettings:
     perf_low_priority: bool = True
     perf_batch_size: str = "256"
     lancedb_in_memory: bool = True
+    disk_thumbnail_cache_enabled: bool = True
     search_precision: str = "Balanced (Default)"
     device: str = "CPU"
     quantization_mode: str = QuantizationMode.FP16.value

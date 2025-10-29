@@ -13,7 +13,7 @@ from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QImage, QPen, QPi
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate
 
 from app.constants import DUCKDB_AVAILABLE, UIConfig
-from app.gui_tasks import ImageLoader
+from app.gui_tasks import GroupFetcherTask, ImageLoader
 from app.gui_widgets import AlphaBackgroundWidget
 from app.utils import find_common_base_name
 
@@ -24,7 +24,7 @@ app_logger = logging.getLogger("AssetPixelHand.gui.models")
 
 
 class ResultsTreeModel(QAbstractItemModel):
-    """Data model for the results tree view, backed by a DuckDB database."""
+    """Data model for the results tree view, with asynchronous data fetching."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -36,6 +36,7 @@ class ResultsTreeModel(QAbstractItemModel):
         self.filter_text = ""
         self.path_to_group_id: dict[str, int] = {}
         self.group_id_to_best_path: dict[int, str] = {}
+        self.running_tasks: dict[int, GroupFetcherTask] = {}
 
     def clear(self):
         self.beginResetModel()
@@ -46,6 +47,7 @@ class ResultsTreeModel(QAbstractItemModel):
         self.filter_text = ""
         self.path_to_group_id.clear()
         self.group_id_to_best_path.clear()
+        self.running_tasks.clear()
         self.endResetModel()
 
     def filter(self, text: str):
@@ -152,35 +154,54 @@ class ResultsTreeModel(QAbstractItemModel):
         if not parent.isValid():
             return False
         node = parent.internalPointer()
-        return node and node.get("type") == "group" and not node.get("fetched")
+        if not node or node.get("type") != "group":
+            return False
+        return not node.get("fetched") and node.get("group_id") not in self.running_tasks
 
     def fetchMore(self, parent):
-        if not (DUCKDB_AVAILABLE and self.db_path):
+        """Starts an asynchronous task to fetch child items for a group."""
+        if not self.canFetchMore(parent):
             return
+
         node = parent.internalPointer()
-        if not (group_id := node.get("group_id")):
+        group_id = node.get("group_id")
+
+        task = GroupFetcherTask(self.db_path, group_id, self.mode, parent)
+        task.signals.finished.connect(self._on_fetch_finished)
+        task.signals.error.connect(self._on_fetch_error)
+
+        self.running_tasks[group_id] = task
+        QThreadPool.globalInstance().start(task)
+
+    @Slot(list, int, QModelIndex)
+    def _on_fetch_finished(self, children: list, group_id: int, parent_index: QModelIndex):
+        """Safely inserts fetched data into the model from the main thread."""
+        if group_id not in self.running_tasks or group_id not in self.groups_data:
             return
-        try:
-            with duckdb.connect(database=str(self.db_path), read_only=True) as conn:
-                query = "SELECT * FROM results WHERE group_id = ? ORDER BY is_best DESC, distance DESC"
-                cols = [desc[0] for desc in conn.execute(query, [group_id]).description]
-                children = [dict(zip(cols, row, strict=False)) for row in conn.execute(query, [group_id]).fetchall()]
-                for child in children:
-                    child["distance"] = int(child.get("distance", -1) or -1)
-                is_search = self.mode in ["text_search", "sample_search"]
-                if is_search and children and children[0].get("is_best"):
-                    children.pop(0)
-                for child in children:
-                    child["group_id"] = group_id
-                    path_str = child["path"]
-                    self.path_to_group_id[path_str] = group_id
-                    if child.get("is_best"):
-                        self.group_id_to_best_path[group_id] = path_str
-                self.beginInsertRows(parent, 0, len(children) - 1)
-                node["children"], node["fetched"] = children, True
-                self.endInsertRows()
-        except duckdb.Error as e:
-            app_logger.error(f"Failed to fetch children for group {group_id}: {e}")
+
+        node = self.groups_data[group_id]
+
+        for child in children:
+            child["group_id"] = group_id
+            path_str = child["path"]
+            self.path_to_group_id[path_str] = group_id
+            if child.get("is_best"):
+                self.group_id_to_best_path[group_id] = path_str
+
+        self.beginInsertRows(parent_index, 0, len(children) - 1)
+        node["children"] = children
+        node["fetched"] = True
+        self.endInsertRows()
+
+        del self.running_tasks[group_id]
+
+    @Slot(str)
+    def _on_fetch_error(self, error_message: str):
+        app_logger.error(f"Background fetch error: {error_message}")
+        for group_id, task in list(self.running_tasks.items()):
+            if task.signals.error is self.sender():
+                del self.running_tasks[group_id]
+                break
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
@@ -431,6 +452,7 @@ class ImagePreviewModel(QAbstractListModel):
                 self.loading_paths.add(path_str)
                 loader = ImageLoader(
                     path_str=path_str,
+                    mtime=item.get("mtime", 0.0),
                     target_size=self.target_size,
                     tonemap_mode=self.tonemap_mode,
                     use_cache=True,

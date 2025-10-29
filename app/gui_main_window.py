@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.cache import setup_thumbnail_cache, thumbnail_cache
 from app.constants import (
     DEEP_LEARNING_AVAILABLE,
     SCRIPT_DIR,
@@ -63,12 +64,13 @@ class App(QMainWindow):
         self.setWindowTitle("AssetPixelHand")
         self.setGeometry(100, 100, 1600, 900)
         self.controller = ScannerController()
+
         self.settings = AppSettings.load()
+        setup_thumbnail_cache(self.settings)
+
         self.log_emitter = log_emitter
         self.stats_dialog: ScanStatisticsDialog | None = None
 
-        # This is the single, shared thread pool for the entire application.
-        # It handles image loading, file operations, and other background tasks.
         self.shared_thread_pool = QThreadPool()
         self.shared_thread_pool.setMaxThreadCount(max(4, os.cpu_count() or 4))
 
@@ -209,7 +211,6 @@ class App(QMainWindow):
         self.viewer_panel.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
     def _connect_signals(self):
-        # Panel signals
         self.options_panel.scan_requested.connect(self._start_scan)
         self.options_panel.clear_scan_cache_requested.connect(self._clear_scan_cache)
         self.options_panel.clear_models_cache_requested.connect(self._clear_models_cache)
@@ -226,19 +227,16 @@ class App(QMainWindow):
         self.viewer_panel.list_view.customContextMenuRequested.connect(self._show_viewer_context_menu)
         self.viewer_panel.log_message.connect(self.log_panel.log_message)
 
-        # Controller signals
         conn = Qt.ConnectionType.QueuedConnection
         self.controller.signals.finished.connect(self.on_scan_complete, conn)
         self.controller.signals.error.connect(self.on_scan_error, conn)
         self.controller.signals.log.connect(self.log_panel.log_message, conn)
         self.controller.signals.save_visuals_finished.connect(self._on_save_visuals_finished, conn)
 
-        # Context menu signals
         self.open_action.triggered.connect(self._context_open_file)
         self.show_action.triggered.connect(self._context_show_in_explorer)
         self.delete_action.triggered.connect(self._context_delete_file)
 
-        # Settings save timer
         self.settings_save_timer.timeout.connect(self._save_settings)
         self._connect_settings_signals()
 
@@ -248,18 +246,22 @@ class App(QMainWindow):
         opts.threshold_spinbox.valueChanged.connect(self._request_settings_save)
         opts.exclude_entry.textChanged.connect(self._request_settings_save)
         opts.model_combo.currentIndexChanged.connect(self._request_settings_save)
+
         scan_opts = self.scan_options_panel
         scan_opts.exact_duplicates_check.toggled.connect(self._request_settings_save)
         scan_opts.lancedb_in_memory_check.toggled.connect(self._request_settings_save)
+        scan_opts.disk_thumbnail_cache_check.toggled.connect(self._on_thumbnail_cache_toggled)
         scan_opts.low_priority_check.toggled.connect(self._request_settings_save)
         scan_opts.save_visuals_check.toggled.connect(self._request_settings_save)
         scan_opts.max_visuals_entry.textChanged.connect(self._request_settings_save)
+
         perf = self.performance_panel
         perf.device_combo.currentIndexChanged.connect(self._request_settings_save)
         perf.quant_combo.currentIndexChanged.connect(self._request_settings_save)
         perf.search_precision_combo.currentIndexChanged.connect(self._request_settings_save)
         perf.cpu_workers_spin.valueChanged.connect(self._request_settings_save)
         perf.batch_size_spin.valueChanged.connect(self._request_settings_save)
+
         viewer = self.viewer_panel
         viewer.preview_size_slider.sliderReleased.connect(self._request_settings_save)
         viewer.bg_alpha_check.toggled.connect(self._request_settings_save)
@@ -269,6 +271,13 @@ class App(QMainWindow):
     @Slot()
     def _request_settings_save(self):
         self.settings_save_timer.start()
+
+    @Slot()
+    def _on_thumbnail_cache_toggled(self):
+        """Applies the thumbnail cache setting change immediately."""
+        self.settings.disk_thumbnail_cache_enabled = self.scan_options_panel.disk_thumbnail_cache_check.isChecked()
+        setup_thumbnail_cache(self.settings)
+        self._request_settings_save()
 
     def _log_system_status(self):
         app_logger.info("Application ready. System capabilities are displayed in the status panel.")
@@ -401,11 +410,13 @@ class App(QMainWindow):
 
     def _clear_scan_cache(self):
         if self._confirm_action("Clear Scan Cache", "This will delete all temporary scan data. Are you sure?"):
-            msg, level = (
-                ("Scan cache cleared.", "success") if clear_scan_cache() else ("Failed to clear scan cache.", "error")
-            )
+            thumbnail_cache.close()
+            success = clear_scan_cache()
+            setup_thumbnail_cache(self.settings)
+
+            msg, level = ("Scan cache cleared.", "success") if success else ("Failed to clear scan cache.", "error")
             self.log_panel.log_message(msg, level)
-            if level == "success":
+            if success:
                 self.results_panel.clear_results()
                 self.viewer_panel.clear_viewer()
 
@@ -423,11 +434,15 @@ class App(QMainWindow):
             "Clear All App Data",
             "This will delete ALL caches, logs, settings, and models. This cannot be undone. Are you sure?",
         ):
+            thumbnail_cache.close()
             logging.shutdown()
+
             try:
                 success = clear_all_app_data()
             finally:
                 setup_logging(self.log_emitter)
+                setup_thumbnail_cache(self.settings)
+
             if success:
                 self.results_panel.clear_results()
                 self.viewer_panel.clear_viewer()
@@ -539,6 +554,7 @@ class App(QMainWindow):
             "selected_extensions": opts.selected_extensions,
             "find_exact_duplicates": scan_opts.exact_duplicates_check.isChecked(),
             "lancedb_in_memory": scan_opts.lancedb_in_memory_check.isChecked(),
+            "disk_thumbnail_cache_enabled": scan_opts.disk_thumbnail_cache_check.isChecked(),
             "perf_low_priority": scan_opts.low_priority_check.isChecked(),
             "save_visuals": scan_opts.save_visuals_check.isChecked(),
             "max_visuals": scan_opts.max_visuals_entry.text(),
@@ -559,6 +575,7 @@ class App(QMainWindow):
 
     def closeEvent(self, event):
         self._save_settings()
+        thumbnail_cache.close()
         if self.shared_thread_pool.activeThreadCount() > 0:
             QMessageBox.warning(
                 self, "Operation in Progress", "Please wait for the current file operation to complete."

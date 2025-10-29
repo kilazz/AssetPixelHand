@@ -136,7 +136,6 @@ def _load_image_core(
 
         return final_rgb
 
-    # Priority 1: Use DirectXTex decoder for DDS files
     if ext == ".dds" and DIRECTXTEX_AVAILABLE:
         try:
             with path.open("rb") as f:
@@ -146,26 +145,18 @@ def _load_image_core(
             dtype = numpy_array.dtype
             pil_image = None
 
-            # Handle HDR float data by tonemapping
             if np.issubdtype(dtype, np.floating):
                 tonemapped_array = tonemap_float_array(numpy_array.astype(np.float32), tonemap_mode)
                 pil_image = Image.fromarray(tonemapped_array)
-
-            # Handle 16-bit unsigned data by scaling down to 8-bit
             elif np.issubdtype(dtype, np.uint16):
-                # Using // 257 provides a more accurate mapping of 0-65535 to 0-255
                 converted_array = (numpy_array // 257).astype(np.uint8)
                 pil_image = Image.fromarray(converted_array)
-
-            # Handle signed integer data by normalizing to the 0-255 range
             elif np.issubdtype(dtype, np.integer) and np.issubdtype(dtype, np.signedinteger):
                 float_arr = numpy_array.astype(np.float32)
                 min_val, max_val = np.iinfo(dtype).min, np.iinfo(dtype).max
                 normalized_arr = (float_arr - min_val) / (max_val - min_val)
                 converted_array = (normalized_arr * 255).astype(np.uint8)
                 pil_image = Image.fromarray(converted_array)
-
-            # Handle standard 8-bit unsigned data
             elif np.issubdtype(dtype, np.uint8):
                 pil_image = Image.fromarray(numpy_array)
 
@@ -178,7 +169,6 @@ def _load_image_core(
         except Exception as e:
             utils_logger.warning(f"DirectXTex Decoder failed for {path.name}: {e}")
 
-    # Priority 2: Use OpenImageIO for other formats
     if OIIO_AVAILABLE:
         try:
             image_buf = oiio.ImageBuf(str(path))
@@ -202,7 +192,6 @@ def _load_image_core(
         except Exception as e:
             utils_logger.debug(f"OIIO failed for {path.name}: {e}. Trying Pillow.")
 
-    # Priority 3: Fallback to Pillow
     if PILLOW_AVAILABLE:
         try:
             with Image.open(path) as img:
@@ -222,6 +211,12 @@ def _load_image_static_cached(
 ) -> Image.Image | None:
     """Cached wrapper for the core image loading function."""
     return _load_image_core(path_or_buffer, target_size, tonemap_mode)
+
+
+def get_thumbnail_cache_key(path_str: str, mtime: float, target_size: int, tonemap_mode: str) -> str:
+    """Generates a unique string key for a cached thumbnail."""
+    key_str = f"{path_str}|{mtime}|{target_size}|{tonemap_mode}"
+    return hashlib.sha1(key_str.encode()).hexdigest()
 
 
 def is_dds_hdr(format_str: str) -> tuple[bool, int]:
@@ -369,7 +364,6 @@ def is_onnx_model_cached(onnx_model_name: str) -> bool:
     if not (model_path.exists() and (model_path / "visual.onnx").exists()):
         return False
     cfg = next((c for c in SUPPORTED_MODELS.values() if onnx_model_name.startswith(c["onnx_name"])), None)
-    # If the model supports text search, the text model must also exist.
     return not (cfg and cfg.get("supports_text_search") and not (model_path / "text.onnx").exists())
 
 
@@ -404,7 +398,6 @@ def check_link_support(folder_path: Path) -> dict[str, bool]:
     if not (folder_path.is_dir() and hasattr(os, "reflink")):
         return support
 
-    # Use unique filenames to avoid conflicts
     source = folder_path / f"__reflink_test_{uuid.uuid4()}"
     dest = folder_path / f"__reflink_test_{uuid.uuid4()}"
     try:
@@ -412,7 +405,6 @@ def check_link_support(folder_path: Path) -> dict[str, bool]:
         os.reflink(source, dest)
         support["reflink"] = True
     except OSError as e:
-        # EOPNOTSUPP is the expected error on unsupported filesystems (e.g., FAT32, NTFS)
         if e.errno != errno.EOPNOTSUPP:
             utils_logger.warning(f"Could not confirm reflink support: {e}")
     except Exception as e:

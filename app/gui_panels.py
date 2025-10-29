@@ -299,6 +299,12 @@ class ScanOptionsPanel(QGroupBox):
         self.exact_duplicates_check = QCheckBox("First find exact duplicates (faster)")
         self.lancedb_in_memory_check = QCheckBox("Use in-memory database (fastest)")
         self.lancedb_in_memory_check.setToolTip("Stores the vector index in RAM. Fastest, but not persistent.")
+
+        self.disk_thumbnail_cache_check = QCheckBox("Enable persistent thumbnail cache")
+        self.disk_thumbnail_cache_check.setToolTip(
+            "Saves generated thumbnails to disk to speed up future sessions.\nCan use significant disk space over time."
+        )
+
         self.low_priority_check = QCheckBox("Run scan at lower priority")
         visuals_layout = QHBoxLayout()
         self.save_visuals_check = QCheckBox("Save visualizations")
@@ -313,8 +319,10 @@ class ScanOptionsPanel(QGroupBox):
         visuals_layout.addWidget(QLabel("Max:"))
         visuals_layout.addWidget(self.max_visuals_entry)
         visuals_layout.addWidget(self.open_visuals_folder_button)
+
         layout.addWidget(self.exact_duplicates_check)
         layout.addWidget(self.lancedb_in_memory_check)
+        layout.addWidget(self.disk_thumbnail_cache_check)
         layout.addWidget(self.low_priority_check)
         layout.addLayout(visuals_layout)
 
@@ -325,7 +333,7 @@ class ScanOptionsPanel(QGroupBox):
     def toggle_visuals_option(self, is_checked):
         self.max_visuals_entry.setVisible(is_checked)
         self.open_visuals_folder_button.setVisible(is_checked)
-        self.layout().itemAt(3).layout().itemAt(2).widget().setVisible(is_checked)
+        self.layout().itemAt(4).layout().itemAt(2).widget().setVisible(is_checked)  # Adjusted index for new checkbox
 
     @Slot()
     def _open_visuals_folder(self):
@@ -340,6 +348,7 @@ class ScanOptionsPanel(QGroupBox):
     def load_settings(self, s: AppSettings):
         self.exact_duplicates_check.setChecked(s.find_exact_duplicates)
         self.lancedb_in_memory_check.setChecked(s.lancedb_in_memory)
+        self.disk_thumbnail_cache_check.setChecked(s.disk_thumbnail_cache_enabled)
         self.low_priority_check.setChecked(s.perf_low_priority)
         self.save_visuals_check.setChecked(s.save_visuals)
         self.max_visuals_entry.setText(s.max_visuals)

@@ -152,7 +152,6 @@ class ScannerCore(QObject):
             self.signals.error.emit(f"Failed to initialize vector database: {e}")
             return False
 
-    # FIX: Added 'phase_count' parameter to the method signature.
     def _find_files(self, stop_event: threading.Event, phase_count: int) -> list[Path]:
         """Finds all image files to be processed."""
         self.state.set_phase(f"Phase 1/{phase_count}: Finding image files...", 0.1)
@@ -164,7 +163,6 @@ class ScannerCore(QObject):
             files.sort()
         return files
 
-    # FIX: Added 'phase_count' parameter to the method signature.
     def _find_exact_duplicates(
         self, all_files: list[Path], stop_event: threading.Event, phase_count: int
     ) -> tuple[DuplicateResults, list[Path]]:
@@ -208,7 +206,6 @@ class ScannerCore(QObject):
             return None
         return ImageFingerprint(path=path, hashes=np.array([]), **meta)
 
-    # FIX: Added 'phase_count' parameter to the method signature.
     def _generate_fingerprints(
         self, files: list[Path], stop_event: threading.Event, phase_count: int
     ) -> tuple[bool, list[str]]:

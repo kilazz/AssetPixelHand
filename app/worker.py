@@ -135,13 +135,15 @@ def init_worker(config: dict):
         _log_worker_crash(e, "init_worker")
 
 
-def _process_batch_from_paths(paths: list[Path], input_size) -> tuple[list, list[ImageFingerprint], list[str]]:
-    images, fingerprints, skipped_paths = [], [], []
+def _process_batch_from_paths(
+    paths: list[Path], input_size
+) -> tuple[list, list[ImageFingerprint], list[tuple[str, str]]]:
+    images, fingerprints, skipped_tuples = [], [], []
     for path in paths:
         try:
             metadata = get_image_metadata(path)
             if not metadata or metadata["resolution"][0] == 0:
-                skipped_paths.append(str(path))
+                skipped_tuples.append((str(path), "Metadata extraction failed"))
                 continue
 
             img_obj = _load_image_static_cached(path, target_size=input_size, tonemap_mode="none")
@@ -150,27 +152,29 @@ def _process_batch_from_paths(paths: list[Path], input_size) -> tuple[list, list
                 images.append(img_obj)
                 fingerprints.append(ImageFingerprint(path=path, hashes=np.array([]), **metadata))
             else:
-                skipped_paths.append(str(path))
-        except Exception:
+                skipped_tuples.append((str(path), "Image loading failed"))
+        except Exception as e:
             app_logger.error(f"Error processing file in batch: {path.name}", exc_info=True)
-            skipped_paths.append(str(path))
-    return images, fingerprints, skipped_paths
+            error_message = f"{type(e).__name__}: {str(e).splitlines()[0]}"
+            skipped_tuples.append((str(path), error_message))
+    return images, fingerprints, skipped_tuples
 
 
-def worker_wrapper_from_paths(paths: list[Path]) -> tuple[list[ImageFingerprint], list[str]]:
+def worker_wrapper_from_paths(paths: list[Path]) -> tuple[list[ImageFingerprint], list[tuple[str, str]]]:
     if g_inference_engine is None:
-        return [], [str(p) for p in paths]
+        return [], [(str(p), "Worker process not initialized") for p in paths]
     try:
-        images, fps, skipped = _process_batch_from_paths(paths, g_inference_engine.input_size)
+        images, fps, skipped_tuples = _process_batch_from_paths(paths, g_inference_engine.input_size)
         if images:
             embeddings = g_inference_engine.get_image_features(images)
             if embeddings.size > 0:
                 for i, fp in enumerate(fps):
                     fp.hashes = embeddings[i].flatten()
-        return fps, skipped
+        return fps, skipped_tuples
     except Exception as e:
         _log_worker_crash(e, "worker_wrapper_from_paths")
-        return [], [str(p) for p in paths]
+        error_message = f"Batch failed in worker: {type(e).__name__}"
+        return [], [(str(p), error_message) for p in paths]
 
 
 def worker_wrapper_from_paths_cpu(paths: list[Path], model_name: str) -> tuple:
@@ -181,15 +185,16 @@ def worker_wrapper_from_paths_cpu(paths: list[Path], model_name: str) -> tuple:
         image_proc = getattr(proc, "image_processor", proc)
         size_cfg = getattr(image_proc, "size", {}) or getattr(image_proc, "crop_size", {})
         input_size = (size_cfg["height"], size_cfg["width"]) if "height" in size_cfg else (224, 224)
-        images, fps, skipped = _process_batch_from_paths(paths, input_size)
+        images, fps, skipped_tuples = _process_batch_from_paths(paths, input_size)
         if not images:
-            return None, [], skipped
+            return None, [], skipped_tuples
         np_images = [np.array(img.convert("RGB")) for img in images]
         pixel_values = proc(images=np_images, return_tensors="np").pixel_values
-        return pixel_values.astype(np.float16 if "_fp16" in model_name.lower() else np.float32), fps, skipped
+        return pixel_values.astype(np.float16 if "_fp16" in model_name.lower() else np.float32), fps, skipped_tuples
     except Exception as e:
         _log_worker_crash(e, "worker_wrapper_from_paths_cpu")
-        return None, [], [str(p) for p in paths]
+        error_message = f"Batch failed in worker: {type(e).__name__}"
+        return None, [], [(str(p), error_message) for p in paths]
 
 
 def inference_worker_loop(config: dict, tensor_q: "multiprocessing.Queue", results_q: "multiprocessing.Queue"):
@@ -203,21 +208,24 @@ def inference_worker_loop(config: dict, tensor_q: "multiprocessing.Queue", resul
             if item is None:
                 results_q.put(None)
                 break
-            pixel_values, fps, skipped = item
+            pixel_values, fps, skipped_tuples = item
             if pixel_values is not None and pixel_values.size > 0:
                 outputs = g_inference_engine.visual_session.run(None, {"pixel_values": pixel_values})
                 if not outputs or len(outputs) == 0:
                     app_logger.error("Inference worker: model returned empty output")
-                    results_q.put(([], skipped))
+                    # Add reason for the files that were meant to be processed here
+                    for fp in fps:
+                        skipped_tuples.append((str(fp.path), "Inference returned empty output"))
+                    results_q.put(([], skipped_tuples))
                     continue
 
                 embeddings = outputs[0]
                 embeddings = normalize_vectors_numpy(embeddings)
                 for i, data in enumerate(fps):
                     data.hashes = embeddings[i].flatten()
-                results_q.put((fps, skipped))
-            elif fps or skipped:
-                results_q.put(([], skipped))
+                results_q.put((fps, skipped_tuples))
+            elif fps or skipped_tuples:
+                results_q.put(([], skipped_tuples))
         except Exception as e:
             _log_worker_crash(e, "inference_worker_loop")
             results_q.put(None)
@@ -237,7 +245,10 @@ def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
     if g_inference_engine is None:
         return None
     try:
-        images, _, _ = _process_batch_from_paths([image_path], g_inference_engine.input_size)
+        images, _, skipped_tuples = _process_batch_from_paths([image_path], g_inference_engine.input_size)
+        if skipped_tuples:
+            app_logger.warning(f"Failed to process single vector for {image_path}: {skipped_tuples[0][1]}")
+            return None
         if images:
             return g_inference_engine.get_image_features(images).flatten()
     except Exception as e:

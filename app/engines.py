@@ -90,10 +90,14 @@ class FingerprintEngine(QObject):
         return success, all_skipped
 
     def _handle_batch_results(
-        self, batch_result: list[ImageFingerprint], skipped_paths: list[str], cache: CacheManager, fps_to_cache: list
+        self,
+        batch_result: list[ImageFingerprint],
+        skipped_items: list[tuple[str, str]],
+        cache: CacheManager,
+        fps_to_cache: list,
     ):
-        for path_str in skipped_paths:
-            self.signals.log.emit(f"Skipped problematic file: {Path(path_str).name}", "warning")
+        for path_str, reason in skipped_items:
+            self.signals.log.emit(f"Skipped {Path(path_str).name}: {reason}", "warning")
         if batch_result:
             self._add_to_lancedb(batch_result)
             fps_to_cache.extend(batch_result)
@@ -183,10 +187,10 @@ class FingerprintEngine(QObject):
                 gpu_result = results_q.get(timeout=0.01)
                 if gpu_result is None:
                     break
-                batch_fps, skipped = gpu_result
-                self._handle_batch_results(batch_fps, skipped, cache, fps_to_cache)
-                all_skipped.extend(skipped)
-                processed += len(batch_fps) + len(skipped)
+                batch_fps, skipped_items = gpu_result
+                self._handle_batch_results(batch_fps, skipped_items, cache, fps_to_cache)
+                all_skipped.extend([path for path, _ in skipped_items])
+                processed += len(batch_fps) + len(skipped_items)
                 self.state.update_progress(processed, total)
             except Empty:
                 pass
@@ -196,10 +200,10 @@ class FingerprintEngine(QObject):
                 gpu_result = results_q.get(timeout=1.0)
                 if gpu_result is None:
                     break
-                batch_fps, skipped = gpu_result
-                self._handle_batch_results(batch_fps, skipped, cache, fps_to_cache)
-                all_skipped.extend(skipped)
-                processed += len(batch_fps) + len(skipped)
+                batch_fps, skipped_items = gpu_result
+                self._handle_batch_results(batch_fps, skipped_items, cache, fps_to_cache)
+                all_skipped.extend([path for path, _ in skipped_items])
+                processed += len(batch_fps) + len(skipped_items)
                 self.state.update_progress(processed, total)
             except Empty:
                 break
@@ -231,13 +235,13 @@ class FingerprintEngine(QObject):
             results = pool.imap_unordered(
                 worker.worker_wrapper_from_paths, data_gen(files, self.config.perf.batch_size)
             )
-            for batch_result, skipped_paths in results:
+            for batch_result, skipped_items in results:
                 if stop_event.is_set():
                     pool.terminate()
                     return False, all_skipped
-                self._handle_batch_results(batch_result, skipped_paths, cache, fps_to_cache)
-                all_skipped.extend(skipped_paths)
-                processed += len(batch_result) + len(skipped_paths)
+                self._handle_batch_results(batch_result, skipped_items, cache, fps_to_cache)
+                all_skipped.extend([path for path, _ in skipped_items])
+                processed += len(batch_result) + len(skipped_items)
                 self.state.update_progress(processed, total)
         if fps_to_cache:
             cache.put_many(fps_to_cache)
