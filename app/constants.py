@@ -22,7 +22,7 @@ MODELS_DIR = APP_DATA_DIR / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 HF_CACHE_DIR = APP_DATA_DIR / ".hf_cache"
 os.environ["HF_HOME"] = str(HF_CACHE_DIR.resolve())
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # Prevents crashes with multiple OpenMP libs
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 # --- File Paths ---
 CONFIG_FILE = APP_DATA_DIR / "app_settings.json"
@@ -41,9 +41,8 @@ DUCKDB_AVAILABLE = bool(importlib.util.find_spec("duckdb"))
 LANCEDB_AVAILABLE = bool(importlib.util.find_spec("lancedb"))
 ZSTD_AVAILABLE = bool(importlib.util.find_spec("zstandard"))
 
-Image.init()  # Initialize Pillow's format plugins
+Image.init()
 
-# Suppress verbose logging from the transformers library on import
 if DEEP_LEARNING_AVAILABLE:
     from transformers import logging as transformers_logging
 
@@ -51,42 +50,46 @@ if DEEP_LEARNING_AVAILABLE:
 
 # --- Application-wide Constants ---
 DB_WRITE_BATCH_SIZE = 8192
-CACHE_VERSION = "v4"  # Increment to invalidate old caches on structural changes
+CACHE_VERSION = "v4"
 
 # --- Supported File Formats ---
+# This list is based on the libraries confirmed to be bundled with the oiio-python package
+# and other core dependencies. It ensures maximum out-of-the-box compatibility.
 _main_supported_ext = [
     # Standard Web & Raster Formats
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
+    ".avif",
     ".bmp",
+    ".cur",
+    ".gif",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".png",
     ".webp",
     # Professional & High Bit Depth Formats
+    ".cin",
+    ".dpx",
     ".exr",
     ".hdr",
-    ".tiff",
-    ".tif",
     ".psd",
     ".tga",
-    ".dpx",
-    ".cin",
-    # Modern & Mobile Formats
-    ".avif",
+    ".tif",
+    ".tiff",
+    # Modern & Niche Formats
     ".heic",
     ".heif",
-    # Legacy & Niche Formats
-    ".ico",
-    ".cur",
+    ".j2k",
+    ".jp2",
+    ".jxl",
     ".xbm",
     ".xpm",
 ]
 
-# Note: The following formats may work if the user has the required system libraries installed,
-# but they are not listed by default to ensure out-of-the-box stability.
+# Note: The following formats require system-level libraries NOT bundled with dependencies
+# and are therefore EXCLUDED by default to ensure stability.
+# To enable them, the user must manually install the required libraries (e.g., LibRaw, librsvg).
 # ".svg"     # Requires 'librsvg'
 # ".cr2", ".nef", ".arw", ".dng" # Requires 'libraw'
-# ".jxl"     # Requires 'libjxl'
 # ".mov", ".mp4" # Requires 'ffmpeg'
 
 _all_ext = list(_main_supported_ext)

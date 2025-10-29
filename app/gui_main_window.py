@@ -6,11 +6,9 @@ assembles all UI components and manages the overall application state and logic.
 
 import logging
 import os
-import threading
 import webbrowser
 from pathlib import Path
 
-import send2trash
 from PySide6.QtCore import Qt, QThreadPool, QTimer, Slot
 from PySide6.QtGui import QAction, QCursor
 from PySide6.QtWidgets import (
@@ -43,9 +41,16 @@ from app.gui_panels import (
     ScanOptionsPanel,
     SystemStatusPanel,
 )
+from app.gui_tasks import FileOperationTask
 from app.logging_config import setup_logging
 from app.scanner import ScannerController
-from app.utils import check_link_support, clear_all_app_data, clear_models_cache, clear_scan_cache, is_onnx_model_cached
+from app.utils import (
+    check_link_support,
+    clear_all_app_data,
+    clear_models_cache,
+    clear_scan_cache,
+    is_onnx_model_cached,
+)
 
 app_logger = logging.getLogger("AssetPixelHand.gui.main")
 
@@ -60,12 +65,12 @@ class App(QMainWindow):
         self.controller = ScannerController()
         self.settings = AppSettings.load()
         self.log_emitter = log_emitter
-        self.delete_thread: threading.Thread | None = None
         self.stats_dialog: ScanStatisticsDialog | None = None
 
-        # This thread pool is now created early and passed to the viewer panel
-        self.image_load_pool = QThreadPool()
-        self.image_load_pool.setMaxThreadCount(max(4, os.cpu_count() or 4))
+        # This is the single, shared thread pool for the entire application.
+        # It handles image loading, file operations, and other background tasks.
+        self.shared_thread_pool = QThreadPool()
+        self.shared_thread_pool.setMaxThreadCount(max(4, os.cpu_count() or 4))
 
         self.settings_save_timer = QTimer(self)
         self.settings_save_timer.setSingleShot(True)
@@ -124,19 +129,10 @@ class App(QMainWindow):
         left_v_splitter.addWidget(bottom_pane_wrapper)
         left_v_splitter.setStretchFactor(0, 0)
         left_v_splitter.setStretchFactor(1, 1)
-        left_v_splitter.setCollapsible(0, True)
-        left_v_splitter.setCollapsible(1, True)
 
         self.results_viewer_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.results_panel = ResultsPanel()
-
-        # ==============================================================================
-        # START OF FIX: Pass the global image_load_pool to the ImageViewerPanel
-        # ==============================================================================
-        self.viewer_panel = ImageViewerPanel(self.settings, self.image_load_pool)
-        # ==============================================================================
-        # END OF FIX
-        # ==============================================================================
+        self.viewer_panel = ImageViewerPanel(self.settings, self.shared_thread_pool)
 
         results_pane_wrapper = QWidget()
         results_pane_layout = QHBoxLayout(results_pane_wrapper)
@@ -235,7 +231,6 @@ class App(QMainWindow):
         self.controller.signals.finished.connect(self.on_scan_complete, conn)
         self.controller.signals.error.connect(self.on_scan_error, conn)
         self.controller.signals.log.connect(self.log_panel.log_message, conn)
-        self.controller.signals.deletion_finished.connect(self._on_delete_complete, conn)
         self.controller.signals.save_visuals_finished.connect(self._on_save_visuals_finished, conn)
 
         # Context menu signals
@@ -405,7 +400,7 @@ class App(QMainWindow):
         return QMessageBox.question(self, title, text) == QMessageBox.StandardButton.Yes
 
     def _clear_scan_cache(self):
-        if self._confirm_action("Clear Scan Cache", "This will delete all temporary scan data... Are you sure?"):
+        if self._confirm_action("Clear Scan Cache", "This will delete all temporary scan data. Are you sure?"):
             msg, level = (
                 ("Scan cache cleared.", "success") if clear_scan_cache() else ("Failed to clear scan cache.", "error")
             )
@@ -415,7 +410,7 @@ class App(QMainWindow):
                 self.viewer_panel.clear_viewer()
 
     def _clear_models_cache(self):
-        if self._confirm_action("Clear AI Models", "This will delete all downloaded AI models... Are you sure?"):
+        if self._confirm_action("Clear AI Models", "This will delete all downloaded AI models. Are you sure?"):
             msg, level = (
                 ("AI models cache cleared.", "success")
                 if clear_models_cache()
@@ -440,44 +435,36 @@ class App(QMainWindow):
             else:
                 QMessageBox.critical(self, "Error", "Failed to clear all app data.")
 
-    def _handle_deletion_request(self, paths_to_delete: list[Path]):
-        if self.delete_thread and self.delete_thread.is_alive():
+    def _execute_file_operation(self, task: FileOperationTask):
+        """Helper to run a file operation task on the shared thread pool."""
+        if self.shared_thread_pool.activeThreadCount() > 0:
             self.log_panel.log_message("Another file operation is in progress.", "warning")
             return
         self.set_ui_scan_state(is_scanning=True)
-        self.log_panel.log_message(f"Moving {len(paths_to_delete)} files to trash...", "info")
-        self.delete_thread = threading.Thread(target=self._delete_worker, args=(paths_to_delete,), daemon=True)
-        self.delete_thread.start()
+        task.signals.finished.connect(self._on_file_op_complete)
+        task.signals.log.connect(self.log_panel.log_message)
+        self.shared_thread_pool.start(task)
 
-    def _delete_worker(self, paths: list[Path]):
-        moved, failed = [], 0
-        for path in paths:
-            try:
-                if path.exists():
-                    send2trash.send2trash(str(path))
-                    moved.append(path)
-                else:
-                    failed += 1
-            except Exception:
-                failed += 1
-        self.controller.signals.deletion_finished.emit(moved, len(moved), failed)
+    def _handle_deletion_request(self, paths_to_delete: list[Path]):
+        self.log_panel.log_message(f"Moving {len(paths_to_delete)} files to trash...", "info")
+        task = FileOperationTask(mode="delete", paths=paths_to_delete)
+        self._execute_file_operation(task)
 
     @Slot(list, int, int)
-    def _on_delete_complete(self, affected_paths, count, failed):
-        op_name = "Moved"
+    def _on_file_op_complete(self, affected_paths, count, failed):
+        """Handles completion of any file operation (delete, link, etc.)."""
         current_op = self.results_panel.current_operation
+        op_name = "Moved"
         if current_op in [FileOperation.HARDLINKING, FileOperation.REFLINKING]:
             op_name = "Replaced"
+
         level = "success" if failed == 0 else "warning" if count > 0 else "error"
         self.log_panel.log_message(f"{op_name} {count} files. Failed: {failed}.", level)
+
         self.results_panel.update_after_deletion(affected_paths)
         self.viewer_panel.clear_viewer()
         self.set_ui_scan_state(is_scanning=False)
         self.results_panel.clear_operation_in_progress()
-
-    @Slot()
-    def _on_save_visuals_finished(self):
-        self.log_panel.log_message(f"Visualizations saved to '{VISUALS_DIR.resolve()}'.", "success")
 
     def _handle_hardlink_request(self, paths: list[Path]):
         self._handle_link_request(paths, "hardlink")
@@ -486,43 +473,22 @@ class App(QMainWindow):
         self._handle_link_request(paths, "reflink")
 
     def _handle_link_request(self, paths: list[Path], method: str):
-        if self.delete_thread and self.delete_thread.is_alive():
-            self.log_panel.log_message("Another file operation is already in progress.", "warning")
-            return
         if not paths:
             self.log_panel.log_message("No valid duplicates selected for linking.", "warning")
             return
-        self.set_ui_scan_state(is_scanning=True)
-        self.log_panel.log_message(f"Replacing {len(paths)} files with {method}s...", "info")
-        self.delete_thread = threading.Thread(target=self._link_worker, args=(paths, method), daemon=True)
-        self.delete_thread.start()
 
-    def _link_worker(self, paths_to_replace: list[Path], method: str):
-        link_map = self.results_panel.results_model.get_link_map_for_paths(paths_to_replace)
+        link_map = self.results_panel.results_model.get_link_map_for_paths(paths)
         if not link_map:
-            self.controller.signals.log.emit("No valid link pairs found from the model's data.", "warning")
-            self.controller.signals.deletion_finished.emit([], 0, len(paths_to_replace))
+            self.log_panel.log_message("No valid link pairs found from the model's data.", "warning")
             return
-        replaced, failed, failed_list, affected = 0, 0, [], list(link_map.keys())
-        can_reflink = hasattr(os, "reflink")
-        for link_path, source_path in link_map.items():
-            try:
-                if not (link_path.exists() and source_path.exists()):
-                    raise FileNotFoundError
-                if os.name == "nt" and link_path.drive.lower() != source_path.drive.lower():
-                    raise OSError("Cross-drive link")
-                os.remove(link_path)
-                if method == "reflink" and can_reflink:
-                    os.reflink(source_path, link_path)
-                else:
-                    os.link(source_path, link_path)
-                replaced += 1
-            except Exception as e:
-                failed += 1
-                failed_list.append(f"{link_path.name} ({type(e).__name__})")
-        self.controller.signals.deletion_finished.emit(affected, replaced, failed)
-        if failed_list:
-            self.controller.signals.log.emit(f"Failed to link: {', '.join(failed_list)}", "error")
+
+        self.log_panel.log_message(f"Replacing {len(paths)} files with {method}s...", "info")
+        task = FileOperationTask(mode=method, link_map=link_map)
+        self._execute_file_operation(task)
+
+    @Slot()
+    def _on_save_visuals_finished(self):
+        self.log_panel.log_message(f"Visualizations saved to '{VISUALS_DIR.resolve()}'.", "success")
 
     def _show_results_context_menu(self, pos):
         idx = self.results_panel.results_view.indexAt(pos)
@@ -559,7 +525,7 @@ class App(QMainWindow):
                 app_logger.error(f"Could not open path '{path}': {e}")
 
     def _save_settings(self):
-        """Gathers settings from UI and saves them."""
+        """Gathers settings from UI panels and saves them."""
         opts, perf = self.options_panel, self.performance_panel
         scan_opts, viewer = self.scan_options_panel, self.viewer_panel
 
@@ -593,7 +559,7 @@ class App(QMainWindow):
 
     def closeEvent(self, event):
         self._save_settings()
-        if self.delete_thread and self.delete_thread.is_alive():
+        if self.shared_thread_pool.activeThreadCount() > 0:
             QMessageBox.warning(
                 self, "Operation in Progress", "Please wait for the current file operation to complete."
             )

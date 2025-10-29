@@ -630,9 +630,9 @@ py::object CreateNumpyArrayFromImage(const DirectX::Image* image) {
                 const uint8_t* src_row = src_ptr + y * image->rowPitch;
                 uint8_t* dst_row = dst_ptr + y * image->width * 4;
                 for (size_t x = 0; x < image->width; ++x) {
-                    dst_row[x*4 + 0] = 255;      // R
-                    dst_row[x*4 + 1] = 255;      // G
-                    dst_row[x*4 + 2] = 255;      // B
+                    dst_row[x*4 + 0] = 255;        // R
+                    dst_row[x*4 + 1] = 255;        // G
+                    dst_row[x*4 + 2] = 255;        // B
                     dst_row[x*4 + 3] = src_row[x]; // A
                 }
             }

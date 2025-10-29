@@ -1,9 +1,7 @@
 # app/utils.py
 """
-General utility functions for image processing, metadata extraction, file system
-operations, and other helper logic. This version uses a clean, prioritized
-chain of libraries with OpenImageIO as the primary engine and specialized
-fallbacks.
+General utility functions for image processing, metadata extraction, and file system operations.
+This module uses a prioritized chain of libraries for robust image handling.
 """
 
 import contextlib
@@ -105,14 +103,14 @@ def _load_image_core(
 ) -> Image.Image | None:
     """
     Core image loading logic using a prioritized chain: DirectXTex -> OIIO -> Pillow.
-    Tonemapping for HDR formats is handled consistently using NumPy.
+    Handles HDR tonemapping and various data types consistently.
     """
     Image.MAX_IMAGE_PIXELS = None
     path = Path(path_or_buffer)
     ext = path.suffix.lower()
 
-    # Helper function for consistent HDR tonemapping
     def tonemap_float_array(float_array: np.ndarray, mode: str) -> np.ndarray:
+        """Helper function for consistent HDR tonemapping."""
         if float_array.ndim == 3 and float_array.shape[2] == 4:
             rgb, alpha = float_array[..., :3], float_array[..., 3:4]
         else:
@@ -124,7 +122,7 @@ def _load_image_core(
             tonemapped_rgb = rgb / (1.0 + rgb)
             gamma_corrected_rgb = np.power(tonemapped_rgb, 1.0 / 2.2)
         elif mode == "drago":
-            # A simplified logarithmic curve inspired by Drago
+            # A simplified logarithmic curve for tonemapping
             tonemapped_rgb = np.log(1.0 + 5.0 * rgb) / np.log(6.0)
             gamma_corrected_rgb = np.power(tonemapped_rgb, 1.0 / 1.9)
         else:  # "none" or any other mode
@@ -138,7 +136,7 @@ def _load_image_core(
 
         return final_rgb
 
-    # Priority 1: Use the "Smart" DirectXTex decoder for DDS files
+    # Priority 1: Use DirectXTex decoder for DDS files
     if ext == ".dds" and DIRECTXTEX_AVAILABLE:
         try:
             with path.open("rb") as f:
@@ -146,73 +144,55 @@ def _load_image_core(
 
             numpy_array = decoded["data"]
             dtype = numpy_array.dtype
-
-            # ==============================================================================
-            # START OF FIX: Handle multiple data types returned by the new C++ module
-            # ==============================================================================
-
             pil_image = None
 
-            # Case 1: HDR float data - requires tonemapping
+            # Handle HDR float data by tonemapping
             if np.issubdtype(dtype, np.floating):
                 tonemapped_array = tonemap_float_array(numpy_array.astype(np.float32), tonemap_mode)
                 pil_image = Image.fromarray(tonemapped_array)
 
-            # Case 2: 16-bit unsigned data (e.g., from R16G16_UNORM) -> convert to 8-bit for display
+            # Handle 16-bit unsigned data by scaling down to 8-bit
             elif np.issubdtype(dtype, np.uint16):
                 # Using // 257 provides a more accurate mapping of 0-65535 to 0-255
                 converted_array = (numpy_array // 257).astype(np.uint8)
                 pil_image = Image.fromarray(converted_array)
 
-            # Case 3: Signed integer data (e.g., from _SINT formats) -> normalize to 0-255 range
+            # Handle signed integer data by normalizing to the 0-255 range
             elif np.issubdtype(dtype, np.integer) and np.issubdtype(dtype, np.signedinteger):
-                # Convert from [-128, 127] or [-32768, 32767] to [0, 255]
-                # We use float32 for intermediate calculation to avoid overflow/underflow
                 float_arr = numpy_array.astype(np.float32)
-                min_val = np.iinfo(dtype).min
-                max_val = np.iinfo(dtype).max
+                min_val, max_val = np.iinfo(dtype).min, np.iinfo(dtype).max
                 normalized_arr = (float_arr - min_val) / (max_val - min_val)
                 converted_array = (normalized_arr * 255).astype(np.uint8)
                 pil_image = Image.fromarray(converted_array)
 
-            # Case 4: Standard 8-bit unsigned data (the most common case)
+            # Handle standard 8-bit unsigned data
             elif np.issubdtype(dtype, np.uint8):
-                # The C++ module may have already converted this to a nice RGBA8 array.
                 pil_image = Image.fromarray(numpy_array)
 
-            # If no case matched, something is wrong.
             if pil_image is None:
-                raise TypeError(f"Unhandled NumPy dtype from C++ module: {dtype}")
-
-            # ==============================================================================
-            # END OF FIX
-            # ==============================================================================
+                raise TypeError(f"Unhandled NumPy dtype from decoder: {dtype}")
 
             if target_size:
                 pil_image.thumbnail(target_size, Image.Resampling.LANCZOS)
-
             return pil_image.convert("RGBA")
         except Exception as e:
-            utils_logger.warning(f"DirectXTex Decoder pipeline failed for {path.name}: {e}")
+            utils_logger.warning(f"DirectXTex Decoder failed for {path.name}: {e}")
 
-    # Priority 2: Use OpenImageIO for all other formats if available.
+    # Priority 2: Use OpenImageIO for other formats
     if OIIO_AVAILABLE:
         try:
             image_buf = oiio.ImageBuf(str(path))
             numpy_array = image_buf.get_pixels()
 
-            # If it's an HDR format, tonemap with the common helper.
             if np.issubdtype(numpy_array.dtype, np.floating):
                 tonemapped_array = tonemap_float_array(numpy_array, tonemap_mode)
                 pil_image = Image.fromarray(tonemapped_array)
-            # Handle other non-8-bit formats like uint16
             elif numpy_array.dtype != np.uint8:
                 if np.issubdtype(numpy_array.dtype, np.floating):
                     numpy_array = np.clip(numpy_array, 0, 1) * 255
                 elif numpy_array.dtype == np.uint16:
-                    numpy_array = numpy_array / 256
-                numpy_array = numpy_array.astype(np.uint8)
-                pil_image = Image.fromarray(numpy_array)
+                    numpy_array = numpy_array // 256
+                pil_image = Image.fromarray(numpy_array.astype(np.uint8))
             else:
                 pil_image = Image.fromarray(numpy_array)
 
@@ -220,9 +200,9 @@ def _load_image_core(
                 pil_image.thumbnail(target_size, Image.Resampling.LANCZOS)
             return pil_image.convert("RGBA")
         except Exception as e:
-            utils_logger.debug(f"OIIO failed for {path.name}: {e}. Trying fallbacks.")
+            utils_logger.debug(f"OIIO failed for {path.name}: {e}. Trying Pillow.")
 
-    # Priority 3: Fallback to Pillow for anything that failed.
+    # Priority 3: Fallback to Pillow
     if PILLOW_AVAILABLE:
         try:
             with Image.open(path) as img:
@@ -286,13 +266,10 @@ def get_image_metadata(path: Path) -> dict[str, Any] | None:
             try:
                 buf = oiio.ImageBuf(str(path))
                 spec = buf.spec()
-
                 bit_depth_map = {oiio.UINT8: 8, oiio.UINT16: 16, oiio.HALF: 16, oiio.FLOAT: 32, oiio.DOUBLE: 64}
                 bit_depth = bit_depth_map.get(spec.format.basetype, 8)
-
                 channel_map = {1: "Grayscale", 2: "GA", 3: "RGB", 4: "RGBA"}
                 channel_str = channel_map.get(spec.nchannels, f"{spec.nchannels}ch")
-
                 format_details = f"{bit_depth}-bit {channel_str}"
 
                 result = {
@@ -305,7 +282,6 @@ def get_image_metadata(path: Path) -> dict[str, Any] | None:
                     "capture_date": None,
                     "bit_depth": bit_depth,
                 }
-
                 if dt := spec.get_string_attribute("DateTime"):
                     with contextlib.suppress(ValueError, TypeError):
                         result["capture_date"] = datetime.strptime(dt, "%Y:%m:%d %H:%M:%S").timestamp()
@@ -349,16 +325,17 @@ def get_image_metadata(path: Path) -> dict[str, Any] | None:
 
 
 def find_best_in_group(group: list) -> any:
+    """Heuristically finds the 'best' file in a group based on resolution, format, and size."""
     if not group:
         raise ValueError("Input group cannot be empty.")
 
     def get_format_score(fp) -> int:
         fmt = str(fp.format_str).upper()
         if fmt in ["PNG", "BMP", "TIFF", "TIF", "EXR"]:
-            return 2
+            return 2  # Lossless formats
         if fmt in ["JPEG", "JPG", "WEBP", "AVIF", "TGA"]:
-            return 1
-        return 0
+            return 1  # Good lossy/common formats
+        return 0  # Other/unknown formats
 
     return max(
         group,
@@ -372,6 +349,7 @@ def find_best_in_group(group: list) -> any:
 
 
 def find_common_base_name(paths: list[Path]) -> str:
+    """Finds the longest common starting substring for a list of file paths."""
     if not paths:
         return ""
     stems = [p.stem for p in paths]
@@ -386,14 +364,17 @@ def find_common_base_name(paths: list[Path]) -> str:
 
 
 def is_onnx_model_cached(onnx_model_name: str) -> bool:
+    """Checks if a given ONNX model is fully cached and ready to use."""
     model_path = MODELS_DIR / onnx_model_name
     if not (model_path.exists() and (model_path / "visual.onnx").exists()):
         return False
     cfg = next((c for c in SUPPORTED_MODELS.values() if onnx_model_name.startswith(c["onnx_name"])), None)
+    # If the model supports text search, the text model must also exist.
     return not (cfg and cfg.get("supports_text_search") and not (model_path / "text.onnx").exists())
 
 
 def _clear_directory(dir_path: Path) -> bool:
+    """Safely removes and recreates a directory."""
     if not dir_path.exists():
         return True
     try:
@@ -418,15 +399,20 @@ def clear_all_app_data() -> bool:
 
 
 def check_link_support(folder_path: Path) -> dict[str, bool]:
+    """Checks if the filesystem at a given path supports hardlinks and reflinks."""
     support = {"hardlink": True, "reflink": False}
     if not (folder_path.is_dir() and hasattr(os, "reflink")):
         return support
-    source, dest = folder_path / f"__reflink_test_{uuid.uuid4()}", folder_path / f"__reflink_test_{uuid.uuid4()}"
+
+    # Use unique filenames to avoid conflicts
+    source = folder_path / f"__reflink_test_{uuid.uuid4()}"
+    dest = folder_path / f"__reflink_test_{uuid.uuid4()}"
     try:
         source.write_text("test")
         os.reflink(source, dest)
         support["reflink"] = True
     except OSError as e:
+        # EOPNOTSUPP is the expected error on unsupported filesystems (e.g., FAT32, NTFS)
         if e.errno != errno.EOPNOTSUPP:
             utils_logger.warning(f"Could not confirm reflink support: {e}")
     except Exception as e:

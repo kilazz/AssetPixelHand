@@ -1,8 +1,7 @@
 # app/gui_models.py
 """
 Contains Qt Item Models and Delegates for displaying data in views like QTreeView
-and QListView. This final version includes performance refactoring for the
-ImagePreviewModel to eliminate redundant loops.
+and QListView. These components are responsible for managing and presenting data to the user.
 """
 
 import logging
@@ -25,7 +24,8 @@ app_logger = logging.getLogger("AssetPixelHand.gui.models")
 
 
 class ResultsTreeModel(QAbstractItemModel):
-    # This class is unchanged.
+    """Data model for the results tree view, backed by a DuckDB database."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.db_path: Path | None = None
@@ -353,8 +353,8 @@ class ResultsTreeModel(QAbstractItemModel):
 
 class ImagePreviewModel(QAbstractListModel):
     """
-    Data model for the image preview list. It now manages the loading process
-    itself, following a robust "fetch-on-demand" pattern.
+    Data model for the image preview list. It manages the loading process
+    itself, following a robust "fetch-on-demand" pattern using a background thread pool.
     """
 
     def __init__(self, thread_pool: QThreadPool, parent=None):
@@ -463,20 +463,13 @@ class ImagePreviewModel(QAbstractListModel):
                 self._emit_data_changed_for_path(path_str)
                 break
 
-    # ==============================================================================
-    # START OF FIX: Refactor to a single, efficient method that finds the index
-    # and emits the dataChanged signal, fixing the B007 linting error.
-    # ==============================================================================
     def _emit_data_changed_for_path(self, path_str: str):
+        """Finds the row for a given path and emits dataChanged for it."""
         for i, item in enumerate(self.items):
             if item["path"] == path_str:
                 index = self.index(i, 0)
                 self.dataChanged.emit(index, index, [Qt.ItemDataRole.DecorationRole])
                 return
-
-    # ==============================================================================
-    # END OF FIX
-    # ==============================================================================
 
     def get_row_for_path(self, path: Path) -> int | None:
         path_str = str(path)
@@ -487,7 +480,8 @@ class ImagePreviewModel(QAbstractListModel):
 
 
 class ImageItemDelegate(QStyledItemDelegate):
-    # This class is unchanged.
+    """Custom delegate for rendering items in the ImagePreviewModel."""
+
     def __init__(self, preview_size: int, parent=None):
         super().__init__(parent)
         self.preview_size = preview_size

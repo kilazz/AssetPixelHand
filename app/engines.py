@@ -15,7 +15,6 @@ from pathlib import Path
 from queue import Empty
 
 import numpy as np
-import pandas as pd
 from PySide6.QtCore import QObject
 
 import app.worker as worker
@@ -256,14 +255,11 @@ class LanceDBSimilarityEngine(QObject):
         self.similarity_threshold = self.config.similarity_threshold / 100.0
         self.CLUSTER_SEARCH_LIMIT = 50
 
-        # LanceDB uses distance (lower is better), so we convert similarity to max distance
         self.distance_threshold = 1.0 - self.similarity_threshold
 
-        # Map UI precision names to LanceDB search parameters
         nprobes_map = {"Fast": 10, "Balanced (Default)": 20, "Thorough": 40, "Exhaustive (Slow)": 256}
         self.nprobes = nprobes_map.get(self.config.search_precision, 20)
 
-        # Refine factor is how many extra items to look at for more accuracy.
         refine_map = {"Fast": 1, "Balanced (Default)": 2, "Thorough": 5, "Exhaustive (Slow)": 10}
         self.refine_factor = refine_map.get(self.config.search_precision, 2)
 
@@ -275,22 +271,20 @@ class LanceDBSimilarityEngine(QObject):
         similarity = 1.0 - distance
         return int(max(0.0, min(1.0, similarity)) * 100)
 
-    def find_similar_groups(self, stop_event: threading.Event) -> DuplicateResults:
-        """Finds clusters using an efficient breadth-first search on the neighbor graph."""
-        self.state.update_progress(0, 1, "Fetching image index from database...")
+    def create_index(self, stop_event: threading.Event):
+        """Creates the IVF-PQ index on the table before searching."""
+        if stop_event.is_set():
+            return
         try:
             num_vectors = len(self.table)
-            self.state.update_progress(0, 1, f"Found {num_vectors} vectors to analyze.")
+            self.state.update_progress(0, 1, f"Found {num_vectors} vectors to index.")
 
             MIN_VECTORS_FOR_INDEX_CREATION = 256
             if num_vectors >= MIN_VECTORS_FOR_INDEX_CREATION:
-                self.state.update_progress(0, 1, "Optimizing index for searching...")
-
                 num_partitions = int(math.sqrt(num_vectors))
                 if num_partitions >= num_vectors:
                     num_partitions = max(1, num_vectors // 4)
                 num_partitions = min(256, max(16, num_partitions))
-
                 num_sub_vectors = 64
 
                 if num_partitions > 1:
@@ -304,19 +298,25 @@ class LanceDBSimilarityEngine(QObject):
                 self.signals.log.emit(
                     f"Too few images ({num_vectors}) to build an optimized index. Using brute-force search.", "info"
                 )
-
-            all_points_df = self.table.to_pandas()
         except Exception as e:
-            self.signals.log.emit(f"Failed to fetch points or build index: {e}", "error")
+            self.signals.log.emit(f"Failed to build index: {e}", "error")
+
+    def find_similar_groups(self, stop_event: threading.Event) -> DuplicateResults:
+        """Finds clusters using an efficient breadth-first search on the neighbor graph."""
+        self.state.update_progress(0, 1, "Fetching image index from database...")
+        try:
+            point_ids = self.table.to_lance().to_table().column("id").to_pylist()
+            if not point_ids or stop_event.is_set():
+                return {}
+        except Exception as e:
+            self.signals.log.emit(f"Failed to fetch point IDs: {e}", "error")
             return {}
 
-        if all_points_df.empty or stop_event.is_set():
-            return {}
-
-        point_ids = all_points_df["id"].tolist()
         id_to_idx = {pid: i for i, pid in enumerate(point_ids)}
         num_points, visited_indices, final_groups_indices = len(point_ids), set(), []
         self.state.update_progress(0, num_points, "Clustering groups (graph traversal)...")
+
+        BATCH_SIZE = 16
 
         for i in range(num_points):
             if stop_event.is_set():
@@ -328,41 +328,57 @@ class LanceDBSimilarityEngine(QObject):
             visited_indices.add(i)
             head = 0
             while head < len(queue):
-                current_idx = queue[head]
-                head += 1
-                current_vector = all_points_df.iloc[current_idx]["vector"]
-                if current_vector is None:
-                    continue
+                batch_indices = queue[head : head + BATCH_SIZE]
+                if not batch_indices:
+                    break
+
+                batch_ids = [point_ids[idx] for idx in batch_indices]
+                head += len(batch_indices)
+
                 try:
-                    raw_hits_df = (
-                        self.table.search(current_vector)
-                        .metric("cosine")
-                        .limit(self.CLUSTER_SEARCH_LIMIT)
-                        .nprobes(self.nprobes)
-                        .refine_factor(self.refine_factor)
-                        .to_pandas()
-                    )
-                    hits_df = raw_hits_df[raw_hits_df["_distance"] < self.distance_threshold]
-
+                    quoted_ids = ", ".join([f"'{_id}'" for _id in batch_ids])
+                    where_clause = f"id IN ({quoted_ids})"
+                    batch_df = self.table.search(None).where(where_clause).limit(len(batch_ids)).to_pandas()
+                    if batch_df.empty:
+                        continue
                 except Exception as e:
-                    self.signals.log.emit(f"LanceDB search failed for a point: {e}", "warning")
+                    self.signals.log.emit(f"Could not retrieve vector batch: {e}", "warning")
                     continue
 
-                for hit_id in hits_df["id"]:
-                    hit_idx = id_to_idx.get(hit_id)
-                    if hit_idx is not None and hit_idx not in visited_indices:
-                        visited_indices.add(hit_idx)
-                        current_cluster.add(hit_idx)
-                        queue.append(hit_idx)
+                for _, row in batch_df.iterrows():
+                    current_vector = row["vector"]
+                    if current_vector is None:
+                        continue
+
+                    try:
+                        raw_hits_df = (
+                            self.table.search(current_vector)
+                            .metric("cosine")
+                            .limit(self.CLUSTER_SEARCH_LIMIT)
+                            .nprobes(self.nprobes)
+                            .refine_factor(self.refine_factor)
+                            .to_pandas()
+                        )
+                        hits_df = raw_hits_df[raw_hits_df["_distance"] < self.distance_threshold]
+                    except Exception as e:
+                        self.signals.log.emit(f"LanceDB search failed for a point: {e}", "warning")
+                        continue
+
+                    for hit_id in hits_df["id"]:
+                        hit_idx = id_to_idx.get(hit_id)
+                        if hit_idx is not None and hit_idx not in visited_indices:
+                            visited_indices.add(hit_idx)
+                            current_cluster.add(hit_idx)
+                            queue.append(hit_idx)
 
             if len(current_cluster) > 1:
                 final_groups_indices.append(list(current_cluster))
             self.state.update_progress(len(visited_indices), num_points)
 
-        return self._build_duplicate_results(final_groups_indices, all_points_df, stop_event)
+        return self._build_duplicate_results(final_groups_indices, point_ids, stop_event)
 
     def _build_duplicate_results(
-        self, final_groups_indices: list[list[int]], all_points_df: "pd.DataFrame", stop_event: threading.Event
+        self, final_groups_indices: list[list[int]], point_ids: list[str], stop_event: threading.Event
     ) -> DuplicateResults:
         """Converts clustered indices into the final DuplicateResults structure."""
         if not final_groups_indices:
@@ -370,9 +386,8 @@ class LanceDBSimilarityEngine(QObject):
         duplicate_results: DuplicateResults = {}
         self.state.update_progress(0, len(final_groups_indices), "Finalizing results...")
 
-        all_points_df.set_index(all_points_df.index.astype(int), inplace=True)
-
         def cosine_similarity(v1, v2):
+            """Calculates cosine similarity, assuming vectors are already normalized."""
             dot_product = np.dot(v1, v2)
             return int(max(0.0, min(1.0, dot_product)) * 100)
 
@@ -381,7 +396,17 @@ class LanceDBSimilarityEngine(QObject):
                 return {}
             self.state.update_progress(i + 1, len(final_groups_indices))
 
-            points_in_group_df = all_points_df.loc[component_indices]
+            id_group = [point_ids[idx] for idx in component_indices]
+            if not id_group:
+                continue
+
+            try:
+                quoted_ids = ", ".join([f"'{_id}'" for _id in id_group])
+                where_clause = f"id IN ({quoted_ids})"
+                points_in_group_df = self.table.search(None).where(where_clause).limit(len(id_group)).to_pandas()
+            except Exception as e:
+                self.signals.log.emit(f"Failed to fetch group data: {e}", "warning")
+                continue
 
             component_fps = [self._create_fp_from_row(row) for _, row in points_in_group_df.iterrows()]
             if not component_fps:
@@ -390,7 +415,9 @@ class LanceDBSimilarityEngine(QObject):
             best_fp, dups_set = find_best_in_group(component_fps), set()
             for fp in component_fps:
                 if fp != best_fp:
-                    dups_set.add((fp, cosine_similarity(best_fp.hashes, fp.hashes)))
+                    best_hashes = np.array(best_fp.hashes)
+                    fp_hashes = np.array(fp.hashes)
+                    dups_set.add((fp, cosine_similarity(best_hashes, fp_hashes)))
             if dups_set:
                 duplicate_results[best_fp] = dups_set
         return duplicate_results

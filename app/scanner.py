@@ -154,7 +154,7 @@ class ScannerCore(QObject):
 
     def _find_files(self, stop_event: threading.Event) -> list[Path]:
         """Finds all image files to be processed."""
-        phase_count = 4 if self.config.find_exact_duplicates else 3
+        phase_count = 5 if self.config.find_exact_duplicates else 4
         self.state.set_phase(f"Phase 1/{phase_count}: Finding image files...", 0.1)
         finder = FileFinder(
             self.state, self.config.folder_path, self.config.excluded_folders, self.config.selected_extensions
@@ -170,15 +170,20 @@ class ScannerCore(QObject):
         """Identifies exact duplicates by hashing and separates unique files."""
         if not self.config.find_exact_duplicates:
             return {}, all_files
-        self.state.set_phase("Phase 2/4: Finding exact duplicates...", 0.2)
+        self.state.set_phase("Phase 2/5: Finding exact duplicates...", 0.2)
         self.state.update_progress(0, len(all_files), "Hashing files...")
         self.hash_map.clear()
         for i, file_path in enumerate(all_files):
             if stop_event.is_set():
                 return {}, []
             try:
+                # OPTIMIZATION: Use streaming hashing to handle large files without high memory usage.
+                hasher = xxhash.xxh64()
                 with open(file_path, "rb") as f:
-                    self.hash_map[xxhash.xxh64(f.read()).hexdigest()].append(file_path)
+                    # Read file in 4MB chunks to keep memory usage low.
+                    while chunk := f.read(4 * 1024 * 1024):
+                        hasher.update(chunk)
+                self.hash_map[hasher.hexdigest()].append(file_path)
             except OSError as e:
                 self.signals.log.emit(f"Could not hash {file_path.name}: {e}", "warning")
                 self.all_skipped_files.append(str(file_path))
@@ -206,7 +211,7 @@ class ScannerCore(QObject):
 
     def _generate_fingerprints(self, files: list[Path], stop_event: threading.Event) -> tuple[bool, list[str]]:
         """Runs the AI fingerprinting engine on the given files."""
-        phase_num, phase_count = (3, 4) if self.config.find_exact_duplicates else (2, 3)
+        phase_num, phase_count = (3, 5) if self.config.find_exact_duplicates else (2, 4)
         self.state.set_phase(f"Phase {phase_num}/{phase_count}: Creating AI fingerprints...", 0.6)
         fp_engine = FingerprintEngine(self.config, self.state, self.signals, self.table)
         return fp_engine.process_all(files, stop_event)

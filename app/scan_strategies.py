@@ -57,9 +57,18 @@ class FindDuplicatesStrategy(ScanStrategy):
             self.scanner_core._check_stop_or_empty(stop_event, [], "duplicates", exact_groups, start_time)
             return
 
-        # Phase 4/4: Finding similar images
-        self.state.set_phase("Phase 4/4: Finding similar images...", 0.1)
         sim_engine = LanceDBSimilarityEngine(self.state, self.signals, self.config, self.table)
+
+        # OPTIMIZATION: Create the index as a separate, visible phase for better UX.
+        # This phase occurs after fingerprinting but before the final search.
+        phase_count = 5 if self.config.find_exact_duplicates else 4
+        self.state.set_phase(f"Phase {phase_count - 1}/{phase_count}: Optimizing search index...", 0.05)
+        sim_engine.create_index(stop_event)
+        if stop_event.is_set():
+            return
+
+        # Final Phase: Finding similar images
+        self.state.set_phase(f"Phase {phase_count}/{phase_count}: Finding similar images...", 0.1)
         similar_groups = sim_engine.find_similar_groups(stop_event)
         if stop_event.is_set():
             return
@@ -83,13 +92,18 @@ class SearchStrategy(ScanStrategy):
                 self.signals.error.emit("Failed to generate fingerprints.")
             return
 
+        # OPTIMIZATION: Ensure index is created before searching in search modes too.
+        sim_engine = LanceDBSimilarityEngine(self.state, self.signals, self.config, self.table)
+        self.state.set_phase("Optimizing search index...", 0.05)
+        sim_engine.create_index(stop_event)
+        if stop_event.is_set():
+            return
+
         self.state.set_phase("Searching for similar images...", 0.1)
         query_vector = self._get_query_vector()
         if query_vector is None:
             self.signals.error.emit("Could not generate a vector for the search query.")
             return
-
-        sim_engine = LanceDBSimilarityEngine(self.state, self.signals, self.config, self.table)
 
         raw_hits_df = (
             self.table.search(query_vector)

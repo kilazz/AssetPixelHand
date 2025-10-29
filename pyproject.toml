@@ -14,8 +14,9 @@ authors = [{ name = "kilazz"}]
 dependencies = [
     # Core Application & GUI
     "PySide6",
+    # Utilities & OS Integration
     "send2trash",
-    "pywin32",
+    "pywin32; sys_platform == 'win32'", # Environment marker: install only on Windows
     # AI & Machine Learning
     "torch",
     "transformers",
@@ -24,9 +25,10 @@ dependencies = [
     #"onnxconverter-common",
     "sentencepiece",
     "huggingface_hub[hf_xet]",
-    # Data & Performance
+    # Databases
     "duckdb",
     "lancedb",
+    # Image & Data Handling
     "pandas",
     "pyarrow",
     "numpy",
@@ -35,15 +37,20 @@ dependencies = [
     # Image Processing
     "Pillow",
     #"OpenImageIO",
-    "oiio-python",
-    "types-oiio-python",
+    "oiio-python", # Modern replacement for OpenImageIO
     #"directxtex-decoder", # For DDS
 ]
 
 [project.optional-dependencies]
 cpu = ["onnxruntime"]
 gpu = ["onnxruntime-directml"]
-dev = ["ruff","snakeviz","tabulate"]
+
+dev = [
+    "ruff",
+    "snakeviz",
+    "tabulate",
+    "types-oiio-python", # Type stubs for oiio-python
+]
 
 [tool.ruff]
 exclude = [

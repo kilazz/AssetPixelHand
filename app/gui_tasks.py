@@ -1,8 +1,7 @@
 # app/gui_tasks.py
 """
 Contains QRunnable tasks for performing background operations without freezing the GUI.
-This includes tasks like downloading and converting AI models, or loading images
-for display in the UI.
+This includes tasks for model conversion, image loading, and file system operations.
 """
 
 import inspect
@@ -11,6 +10,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import send2trash
 from PySide6.QtCore import QObject, QRunnable, Signal
 
 from app.constants import DEEP_LEARNING_AVAILABLE, QuantizationMode
@@ -40,6 +40,7 @@ class ModelConverter(QRunnable):
         self.adapter = get_model_adapter(self.hf_model_name)
 
     def run(self):
+        # Import heavy libraries here to avoid loading them in the main GUI thread.
         import torch
         from PIL import Image
 
@@ -165,11 +166,7 @@ class ModelConverter(QRunnable):
 
 
 class ImageLoader(QRunnable):
-    """
-    A cancellable task to load an image in a background thread for the UI.
-    This version converts the loaded PIL image to a thread-safe QImage
-    before passing it to the main thread.
-    """
+    """A cancellable task to load an image in a background thread for the UI."""
 
     def __init__(
         self,
@@ -196,7 +193,7 @@ class ImageLoader(QRunnable):
         return self._is_cancelled
 
     def run(self):
-        # Import necessary Qt/PIL components inside the run method
+        # Import necessary Qt/PIL components inside the run method to ensure worker-safety.
         from PIL.ImageQt import ImageQt
         from PySide6.QtCore import Q_ARG, QMetaObject, Qt
         from PySide6.QtGui import QImage
@@ -216,15 +213,14 @@ class ImageLoader(QRunnable):
 
             if self.receiver and self.on_finish_slot:
                 if pil_img:
-                    # [FIX] Convert PIL.Image to QImage, which is thread-safe and known to Qt's meta-type system.
+                    # Convert PIL.Image to QImage, which is thread-safe for Qt signals.
                     q_img = ImageQt(pil_img)
-
                     QMetaObject.invokeMethod(
                         self.receiver,
                         self.on_finish_slot,
                         Qt.ConnectionType.QueuedConnection,
                         Q_ARG(str, self.path_str),
-                        Q_ARG(QImage, q_img),  # Pass the QImage object
+                        Q_ARG(QImage, q_img),
                     )
                 elif self.on_error_slot:
                     QMetaObject.invokeMethod(
@@ -248,3 +244,68 @@ class ImageLoader(QRunnable):
 
     def cancel(self):
         self._is_cancelled = True
+
+
+class FileOperationTask(QRunnable):
+    """A task to perform file operations (delete, link) in a background thread."""
+
+    class Signals(QObject):
+        finished = Signal(list, int, int)  # affected_paths, success_count, failed_count
+        log = Signal(str, str)
+
+    def __init__(self, mode: str, paths: list[Path] = None, link_map: dict[Path, Path] = None):
+        super().__init__()
+        self.mode = mode
+        self.paths = paths or []
+        self.link_map = link_map or {}
+        self.signals = self.Signals()
+
+    def run(self):
+        """Executes the file operation based on the specified mode."""
+        if self.mode == "delete":
+            self._delete_worker(self.paths)
+        elif self.mode in ["hardlink", "reflink"]:
+            self._link_worker(self.link_map, self.mode)
+        else:
+            self.signals.log.emit(f"Unknown file operation mode: {self.mode}", "error")
+
+    def _delete_worker(self, paths: list[Path]):
+        """Moves a list of files to the system's trash."""
+        moved, failed = [], 0
+        for path in paths:
+            try:
+                if path.exists():
+                    send2trash.send2trash(str(path))
+                    moved.append(path)
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+        self.signals.finished.emit(moved, len(moved), failed)
+
+    def _link_worker(self, link_map: dict[Path, Path], method: str):
+        """Replaces files with hardlinks or reflinks."""
+        replaced, failed, failed_list = 0, 0, []
+        affected = list(link_map.keys())
+        can_reflink = hasattr(os, "reflink")
+
+        for link_path, source_path in link_map.items():
+            try:
+                if not (link_path.exists() and source_path.exists()):
+                    raise FileNotFoundError(f"Source or destination not found for {link_path.name}")
+                if os.name == "nt" and link_path.drive.lower() != source_path.drive.lower():
+                    raise OSError("Cross-drive link not supported")
+
+                os.remove(link_path)
+                if method == "reflink" and can_reflink:
+                    os.reflink(source_path, link_path)
+                else:
+                    os.link(source_path, link_path)
+                replaced += 1
+            except Exception as e:
+                failed += 1
+                failed_list.append(f"{link_path.name} ({type(e).__name__})")
+
+        if failed_list:
+            self.signals.log.emit(f"Failed to link: {', '.join(failed_list)}", "error")
+        self.signals.finished.emit(affected, replaced, failed)

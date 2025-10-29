@@ -1,8 +1,7 @@
 # app/gui_panels.py
 """
 Contains the main panel widgets (QGroupBox subclasses) that form the core layout
-of the application's main window. This final, PEP 8 compliant version resolves
-all linting errors for better code quality.
+of the application's main window, organizing all user-facing controls and views.
 """
 
 import logging
@@ -59,7 +58,6 @@ app_logger = logging.getLogger("AssetPixelHand.gui.panels")
 
 
 class OptionsPanel(QGroupBox):
-    # This class is unchanged.
     """The main panel for configuring and starting a scan."""
 
     scan_requested = Signal()
@@ -287,7 +285,6 @@ class OptionsPanel(QGroupBox):
 
 
 class ScanOptionsPanel(QGroupBox):
-    # This class is unchanged.
     """Panel for secondary scan options and output settings."""
 
     def __init__(self, settings: AppSettings):
@@ -350,7 +347,6 @@ class ScanOptionsPanel(QGroupBox):
 
 
 class PerformancePanel(QGroupBox):
-    # This class is unchanged.
     """Panel for performance-related settings and AI model selection."""
 
     log_message = Signal(str, str)
@@ -428,18 +424,15 @@ class PerformancePanel(QGroupBox):
 
 
 class SystemStatusPanel(QGroupBox):
-    # This class is unchanged.
     """Displays the status of various system dependencies."""
 
     def __init__(self):
         super().__init__("System Status")
         layout = QFormLayout(self)
         layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        self.dl_status_label, self.oiio_status_label, self.dds_status_label = (
-            QLabel("..."),
-            QLabel("..."),
-            QLabel("..."),
-        )
+        self.dl_status_label = QLabel("...")
+        self.oiio_status_label = QLabel("...")
+        self.dds_status_label = QLabel("...")
         layout.addRow(self.dl_status_label)
         layout.addRow(self.oiio_status_label)
         layout.addRow(self.dds_status_label)
@@ -455,8 +448,7 @@ class SystemStatusPanel(QGroupBox):
 
 
 class LogPanel(QGroupBox):
-    # This class is unchanged.
-    """A panel to display log messages."""
+    """A panel to display log messages from the application."""
 
     def __init__(self):
         from PySide6.QtWidgets import QPlainTextEdit
@@ -481,23 +473,29 @@ class LogPanel(QGroupBox):
 
 
 class FileOperation(Enum):
+    """Enum to track the current file operation in progress."""
+
     NONE, DELETING, HARDLINKING, REFLINKING = auto(), auto(), auto(), auto()
 
 
 class ResultsPanel(QGroupBox):
     """Displays scan results in a tree view and provides actions for them."""
 
-    deletion_requested, hardlink_requested, reflink_requested = Signal(list), Signal(list), Signal(list)
+    deletion_requested = Signal(list)
+    hardlink_requested = Signal(list)
+    reflink_requested = Signal(list)
     selection_in_group_changed = Signal(Path, int, object)
 
     def __init__(self):
         super().__init__("Results")
-        self.selection_timer, self.search_timer = QTimer(self), QTimer(self)
+        self.selection_timer = QTimer(self)
         self.selection_timer.setSingleShot(True)
         self.selection_timer.setInterval(150)
+        self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
         self.search_timer.setInterval(300)
-        self.hardlink_available, self.reflink_available = False, False
+        self.hardlink_available = False
+        self.reflink_available = False
         self.current_operation = FileOperation.NONE
         self._init_ui()
         self._connect_signals()
@@ -515,11 +513,9 @@ class ResultsPanel(QGroupBox):
         layout.addWidget(self.results_view)
         self._create_action_buttons(layout)
         bottom_buttons_layout = QHBoxLayout()
-        self.hardlink_button, self.reflink_button, self.delete_button = (
-            QPushButton("Replace with Hardlink"),
-            QPushButton("Replace with Reflink"),
-            QPushButton("Move to Trash"),
-        )
+        self.hardlink_button = QPushButton("Replace with Hardlink")
+        self.reflink_button = QPushButton("Replace with Reflink")
+        self.delete_button = QPushButton("Move to Trash")
         self.hardlink_button.setObjectName("hardlink_button")
         self.hardlink_button.setToolTip("Replaces duplicates with a pointer to the best file's data.")
         self.reflink_button.setObjectName("reflink_button")
@@ -536,7 +532,8 @@ class ResultsPanel(QGroupBox):
         self.search_entry = QLineEdit()
         self.search_entry.setPlaceholderText("Filter results by name...")
         header_layout.addWidget(self.search_entry)
-        self.expand_button, self.collapse_button = QPushButton("Expand All"), QPushButton("Collapse All")
+        self.expand_button = QPushButton("Expand All")
+        self.collapse_button = QPushButton("Collapse All")
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(["By Duplicate Count", "By Size on Disk", "By Filename"])
         header_layout.addWidget(self.expand_button)
@@ -546,11 +543,10 @@ class ResultsPanel(QGroupBox):
 
     def _create_action_buttons(self, layout):
         actions_layout = QGridLayout()
-        self.select_all_button, self.deselect_all_button = QPushButton("Select All"), QPushButton("Deselect All")
-        self.select_except_best_button, self.invert_selection_button = (
-            QPushButton("Select All Except Best"),
-            QPushButton("Invert Selection"),
-        )
+        self.select_all_button = QPushButton("Select All")
+        self.deselect_all_button = QPushButton("Deselect All")
+        self.select_except_best_button = QPushButton("Select All Except Best")
+        self.invert_selection_button = QPushButton("Invert Selection")
         actions_layout.addWidget(self.select_all_button, 0, 0)
         actions_layout.addWidget(self.deselect_all_button, 0, 1)
         actions_layout.addWidget(self.select_except_best_button, 1, 0)
@@ -575,18 +571,12 @@ class ResultsPanel(QGroupBox):
 
     def set_operation_in_progress(self, operation: FileOperation):
         self.current_operation = operation
-        # ==============================================================================
-        # START OF FIX: Corrected one-liners to be PEP 8 compliant
-        # ==============================================================================
         if operation == FileOperation.DELETING:
             self.delete_button.setText("Deleting...")
         elif operation == FileOperation.HARDLINKING:
             self.hardlink_button.setText("Linking...")
         elif operation == FileOperation.REFLINKING:
             self.reflink_button.setText("Linking...")
-        # ==============================================================================
-        # END OF FIX
-        # ==============================================================================
 
     def clear_operation_in_progress(self):
         self.current_operation = FileOperation.NONE
@@ -621,7 +611,8 @@ class ResultsPanel(QGroupBox):
         self.reflink_button.setEnabled(is_enabled and has_results and is_group_mode and self.reflink_available)
 
     def clear_results(self):
-        self.hardlink_available, self.reflink_available = False, False
+        self.hardlink_available = False
+        self.reflink_available = False
         self.search_entry.clear()
         self.results_model.clear()
         self.setTitle("Results")
@@ -685,8 +676,8 @@ class ResultsPanel(QGroupBox):
             return
         msg = (
             f"This will replace {len(to_link)} duplicate files with hardlinks to the best file.\n\n"
-            "⚠️ IMPORTANT:\n• The original file data will be preserved\n• Duplicate files will become pointers to the same data\n"
-            "• If you edit any linked file, ALL linked copies will change\n• This operation cannot be undone\n\nAre you sure you want to continue?"
+            "⚠️ IMPORTANT:\n• The original file data will be preserved.\n• Duplicate files will become pointers to the same data.\n"
+            "• If you edit any linked file, ALL linked copies will change.\n• This operation cannot be undone.\n\nAre you sure you want to continue?"
         )
         if QMessageBox.question(self, "Confirm Hardlink Replacement", msg) == QMessageBox.StandardButton.Yes:
             self.set_operation_in_progress(FileOperation.HARDLINKING)
@@ -700,8 +691,8 @@ class ResultsPanel(QGroupBox):
             return
         msg = (
             f"This will replace {len(to_link)} duplicate files with reflinks (Copy-on-Write).\n\n"
-            "ℹ️ INFO:\n• Creates space-saving copies that share data blocks\n• When you edit a file, only the changed blocks are duplicated\n"
-            "• Safer than hardlinks but requires filesystem support (APFS, Btrfs, XFS, ReFS)\n• This operation cannot be undone\n\nAre you sure you want to continue?"
+            "ℹ️ INFO:\n• Creates space-saving copies that share data blocks.\n• When you edit a file, only the changed blocks are duplicated.\n"
+            "• Safer than hardlinks but requires filesystem support (APFS, Btrfs, XFS, ReFS).\n• This operation cannot be undone.\n\nAre you sure you want to continue?"
         )
         if QMessageBox.question(self, "Confirm Reflink Replacement", msg) == QMessageBox.StandardButton.Yes:
             self.set_operation_in_progress(FileOperation.REFLINKING)
@@ -861,7 +852,6 @@ class ImageViewerPanel(QGroupBox):
         parent_layout.addWidget(self.compare_stack, 1)
 
     def _connect_signals(self):
-        # UI controls
         self.preview_size_slider.sliderReleased.connect(self._update_preview_sizes)
         self.alpha_slider.valueChanged.connect(self._on_alpha_change)
         self.compare_button.clicked.connect(self._show_comparison_view)
@@ -877,7 +867,6 @@ class ImageViewerPanel(QGroupBox):
         self.compare_bg_alpha_check.toggled.connect(self._on_transparency_toggled)
         self.overlay_alpha_slider.valueChanged.connect(self._on_overlay_alpha_change)
         self.compare_bg_alpha_slider.valueChanged.connect(self._on_alpha_change)
-        # State ViewModel signals
         self.state.candidates_changed.connect(self._update_compare_button)
         self.state.image_loaded.connect(self._on_full_res_image_loaded)
         self.state.load_complete.connect(self._on_load_complete)
@@ -891,10 +880,6 @@ class ImageViewerPanel(QGroupBox):
     def _on_compare_tonemap_changed(self):
         if self.compare_container.isVisible() and len(self.state.get_candidate_paths()) == 2:
             self._show_comparison_view()
-
-    def _reset_and_reload_all_previews(self):
-        self.model.clear_cache()
-        self.update_timer.start()
 
     def load_settings(self, settings: AppSettings):
         self.preview_size_slider.setValue(settings.preview_size)
@@ -966,6 +951,8 @@ class ImageViewerPanel(QGroupBox):
     @Slot(str, QPixmap)
     def _on_full_res_image_loaded(self, path_str: str, pixmap: QPixmap):
         paths = self.state.get_candidate_paths()
+        if len(paths) < 2:
+            return
         if path_str == paths[0]:
             self.compare_view_1.setPixmap(pixmap)
         elif path_str == paths[1]:
