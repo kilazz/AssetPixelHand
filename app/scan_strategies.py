@@ -1,18 +1,26 @@
 # app/scan_strategies.py
 """
 Contains different strategies for the scanning process, following the Strategy design pattern.
+Each strategy encapsulates the full algorithm for a specific scan mode.
 """
 
 import multiprocessing
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from pathlib import Path
 
+import duckdb
 import numpy as np
+import xxhash
+from PySide6.QtCore import QThreadPool
 
-from app.data_models import ImageFingerprint, ScanConfig, ScannerSignals, ScanState
-from app.engines import LanceDBSimilarityEngine
+from app.constants import RESULTS_DB_FILE
+from app.data_models import DuplicateResults, ImageFingerprint, ScanConfig, ScannerSignals, ScanState
+from app.engines import FingerprintEngine, LanceDBSimilarityEngine
+from app.scanner_helpers import FileFinder, VisualizationTask
+from app.utils import find_best_in_group, get_image_metadata
 from app.worker import init_worker, worker_get_single_vector, worker_get_text_vector
 
 
@@ -31,30 +39,116 @@ class ScanStrategy(ABC):
         self.state = state
         self.signals = signals
         self.table = table
-        self.scanner_core = scanner_core  # To access shared methods
+        self.scanner_core = scanner_core
+        self.all_skipped_files: list[str] = []
 
     @abstractmethod
     def execute(self, stop_event: threading.Event, start_time: float):
         """Executes the specific scanning logic."""
         pass
 
+    def _find_files(self, stop_event: threading.Event, phase_count: int) -> list[Path]:
+        """Finds all image files to be processed."""
+        self.state.set_phase(f"Phase 1/{phase_count}: Finding image files...", 0.1)
+        finder = FileFinder(
+            self.state, self.config.folder_path, self.config.excluded_folders, self.config.selected_extensions
+        )
+        files = finder.find_all(stop_event)
+        if files:
+            files.sort()
+        return files
+
+    def _generate_fingerprints(
+        self, files: list[Path], stop_event: threading.Event, phase_count: int
+    ) -> tuple[bool, list[str]]:
+        """Runs the AI fingerprinting engine on the given files."""
+        phase_num = 3 if self.config.find_exact_duplicates and self.config.scan_mode == "duplicates" else 2
+        self.state.set_phase(f"Phase {phase_num}/{phase_count}: Creating AI fingerprints...", 0.6)
+        fp_engine = FingerprintEngine(self.config, self.state, self.signals, self.table)
+        success, skipped_paths_only = fp_engine.process_all(files, stop_event)
+        self.all_skipped_files.extend(skipped_paths_only)
+        return success, skipped_paths_only
+
+    def _create_dummy_fp(self, path: Path) -> ImageFingerprint | None:
+        """Creates a placeholder ImageFingerprint without an AI hash."""
+        meta = get_image_metadata(path)
+        if not meta:
+            self.all_skipped_files.append(str(path))
+            return None
+        return ImageFingerprint(path=path, hashes=np.array([]), **meta)
+
+    def _save_results_to_db(self, final_groups: DuplicateResults, search_context: str | None = None):
+        """Saves the final grouped results to a DuckDB file for the UI to display."""
+        if not duckdb:
+            return
+        RESULTS_DB_FILE.unlink(missing_ok=True)
+        try:
+            with duckdb.connect(database=str(RESULTS_DB_FILE), read_only=False) as conn:
+                conn.execute(
+                    "CREATE TABLE results (group_id INTEGER, is_best BOOLEAN, path VARCHAR, resolution_w INTEGER, resolution_h INTEGER, file_size UBIGINT, mtime DOUBLE, capture_date DOUBLE, distance INTEGER, format_str VARCHAR, format_details VARCHAR, has_alpha BOOLEAN, bit_depth INTEGER, search_context VARCHAR)"
+                )
+                data = []
+                for i, (best_fp, dups) in enumerate(final_groups.items(), 1):
+                    data.append(
+                        (
+                            i,
+                            True,
+                            str(best_fp.path),
+                            *best_fp.resolution,
+                            best_fp.file_size,
+                            best_fp.mtime,
+                            best_fp.capture_date,
+                            -1,
+                            best_fp.format_str,
+                            best_fp.format_details,
+                            best_fp.has_alpha,
+                            best_fp.bit_depth,
+                            search_context,
+                        )
+                    )
+                    for dup_fp, dist in dups:
+                        data.append(
+                            (
+                                i,
+                                False,
+                                str(dup_fp.path),
+                                *dup_fp.resolution,
+                                dup_fp.file_size,
+                                dup_fp.mtime,
+                                dup_fp.capture_date,
+                                dist,
+                                dup_fp.format_str,
+                                dup_fp.format_details,
+                                dup_fp.has_alpha,
+                                dup_fp.bit_depth,
+                                None,
+                            )
+                        )
+                conn.executemany("INSERT INTO results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", data)
+                conn.commit()
+        except duckdb.Error as e:
+            self.signals.log.emit(f"Failed to write results to DuckDB: {e}", "error")
+
 
 class FindDuplicatesStrategy(ScanStrategy):
     """Strategy for finding duplicate and similar images."""
 
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.hash_map = defaultdict(list)
+
     def execute(self, stop_event: threading.Event, start_time: float):
         phase_count = 4 if self.config.find_exact_duplicates else 3
 
-        all_files = self.scanner_core._find_files(stop_event, phase_count)
+        all_files = self._find_files(stop_event, phase_count)
         if self.scanner_core._check_stop_or_empty(stop_event, all_files, "duplicates", [], start_time):
             return
 
-        exact_groups, files_for_ai = self.scanner_core._find_exact_duplicates(all_files, stop_event, phase_count)
+        exact_groups, files_for_ai = self._find_exact_duplicates(all_files, stop_event, phase_count)
         if stop_event.is_set():
             return
 
-        success, skipped = self.scanner_core._generate_fingerprints(files_for_ai, stop_event, phase_count)
-        self.scanner_core.all_skipped_files.extend(skipped)
+        success, _ = self._generate_fingerprints(files_for_ai, stop_event, phase_count)
         if not success:
             self.scanner_core._check_stop_or_empty(stop_event, [], "duplicates", exact_groups, start_time)
             return
@@ -65,20 +159,100 @@ class FindDuplicatesStrategy(ScanStrategy):
         if stop_event.is_set():
             return
 
-        final_groups = self.scanner_core._finalize_results(exact_groups, similar_groups)
-        self.scanner_core._report_and_cleanup(final_groups, start_time)
+        final_groups = self._finalize_results(exact_groups, similar_groups)
+        self._report_and_cleanup(final_groups, start_time)
+
+    def _find_exact_duplicates(
+        self, all_files: list[Path], stop_event: threading.Event, phase_count: int
+    ) -> tuple[DuplicateResults, list[Path]]:
+        """Identifies exact duplicates by hashing and separates unique files."""
+        if not self.config.find_exact_duplicates:
+            return {}, all_files
+        self.state.set_phase(f"Phase 2/{phase_count}: Finding exact duplicates...", 0.2)
+        self.state.update_progress(0, len(all_files), "Hashing files...")
+        self.hash_map.clear()
+        for i, file_path in enumerate(all_files):
+            if stop_event.is_set():
+                return {}, []
+            try:
+                hasher = xxhash.xxh64()
+                with open(file_path, "rb") as f:
+                    while chunk := f.read(4 * 1024 * 1024):
+                        hasher.update(chunk)
+                self.hash_map[hasher.hexdigest()].append(file_path)
+            except OSError as e:
+                self.signals.log.emit(f"Could not hash {file_path.name}: {e}", "warning")
+                self.all_skipped_files.append(str(file_path))
+            self.state.update_progress(i + 1, len(all_files))
+
+        exact_groups, unique_files_for_ai = {}, []
+        for paths in self.hash_map.values():
+            if len(paths) > 1:
+                group_fps = [fp for fp in (self._create_dummy_fp(p) for p in paths) if fp]
+                if group_fps:
+                    best_fp = find_best_in_group(group_fps)
+                    exact_groups[best_fp] = {(fp, 100) for fp in group_fps if fp != best_fp}
+                    unique_files_for_ai.append(best_fp.path)
+            elif paths:
+                unique_files_for_ai.append(paths[0])
+        return exact_groups, unique_files_for_ai
+
+    def _finalize_results(self, exact_groups: DuplicateResults, similar_groups: DuplicateResults) -> DuplicateResults:
+        """Merges exact and similar duplicate groups without losing any files."""
+        self.state.set_phase("Finalizing results...", 0.0)
+        final_groups = similar_groups.copy()
+        fp_to_group_map = {}
+        for best_fp, dups_set in final_groups.items():
+            fp_to_group_map[best_fp] = best_fp
+            for fp, _ in dups_set:
+                fp_to_group_map[fp] = best_fp
+        for best_exact_fp, exact_dups_set in exact_groups.items():
+            if best_exact_fp in fp_to_group_map:
+                ai_group_best_fp = fp_to_group_map[best_exact_fp]
+                final_groups[ai_group_best_fp].update(exact_dups_set)
+            else:
+                final_groups[best_exact_fp] = exact_dups_set
+        return final_groups
+
+    def _report_and_cleanup(self, final_groups: DuplicateResults, start_time: float):
+        """Saves results, generates visualizations, and finalizes the scan."""
+        num_found = sum(len(dups) for dups in final_groups.values())
+        duration = time.time() - start_time
+
+        path_to_hash = {p.resolve().as_posix(): h for h, paths in self.hash_map.items() for p in paths}
+        successful_hashes = {
+            path_to_hash.get(best_fp.path.resolve().as_posix())
+            for best_fp in final_groups
+            if path_to_hash.get(best_fp.path.resolve().as_posix())
+        }
+        self.all_skipped_files = [
+            p
+            for p in set(self.all_skipped_files)
+            if path_to_hash.get(Path(p).resolve().as_posix()) not in successful_hashes
+        ]
+
+        if num_found > 0:
+            self._save_results_to_db(final_groups)
+            if self.config.save_visuals:
+                task = VisualizationTask(final_groups, self.config.max_visuals, self.config.folder_path)
+                task.signals.finished.connect(self.signals.save_visuals_finished.emit)
+                QThreadPool.globalInstance().start(task)
+
+        self.scanner_core._finalize_scan(
+            RESULTS_DB_FILE if num_found > 0 else [], num_found, "duplicates", duration, self.all_skipped_files
+        )
 
 
 class SearchStrategy(ScanStrategy):
     """Strategy for text or image-based similarity search."""
 
     def execute(self, stop_event: threading.Event, start_time: float):
-        all_files = self.scanner_core._find_files(stop_event, 2)
+        phase_count = 2
+        all_files = self._find_files(stop_event, phase_count)
         if self.scanner_core._check_stop_or_empty(stop_event, all_files, self.config.scan_mode, [], start_time):
             return
 
-        success, skipped = self.scanner_core._generate_fingerprints(all_files, stop_event, 2)
-        self.scanner_core.all_skipped_files.extend(skipped)
+        success, _ = self._generate_fingerprints(all_files, stop_event, phase_count)
         if not success:
             if not stop_event.is_set():
                 self.signals.error.emit("Failed to generate fingerprints.")
@@ -105,20 +279,18 @@ class SearchStrategy(ScanStrategy):
         search_results = []
         if not hits_df.empty:
             for _, row in hits_df.iterrows():
-                fp = sim_engine._create_fp_from_row(row)
+                fp = ImageFingerprint.from_db_row(row.to_dict())
                 search_results.append((fp, row["_distance"]))
 
         num_found = len(search_results)
         payload = []
         if num_found > 0:
-            from app.constants import RESULTS_DB_FILE
-
             payload = RESULTS_DB_FILE
             dups_list = [(fp, sim_engine._score_to_percentage(score)) for fp, score in search_results]
             if self.config.scan_mode == "sample_search" and self.config.sample_path:
-                best_fp = self.scanner_core._create_dummy_fp(self.config.sample_path.resolve())
+                best_fp = self._create_dummy_fp(self.config.sample_path.resolve())
                 if best_fp:
-                    self.scanner_core._save_results_to_db(
+                    self._save_results_to_db(
                         {best_fp: dups_list}, search_context=f"sample:{self.config.sample_path.name}"
                     )
             else:
@@ -134,15 +306,11 @@ class SearchStrategy(ScanStrategy):
                     has_alpha=False,
                     bit_depth=8,
                 )
-                self.scanner_core._save_results_to_db(
-                    {query_fp: dups_list}, search_context=f"query:{self.config.search_query}"
-                )
+                self._save_results_to_db({query_fp: dups_list}, search_context=f"query:{self.config.search_query}")
 
         self.signals.log.emit(f"Found {num_found} results.", "info")
         duration = time.time() - start_time
-        self.scanner_core._finalize_scan(
-            payload, num_found, self.config.scan_mode, duration, self.scanner_core.all_skipped_files
-        )
+        self.scanner_core._finalize_scan(payload, num_found, self.config.scan_mode, duration, self.all_skipped_files)
 
     def _get_query_vector(self) -> np.ndarray | None:
         """Generates the search vector from either text or a sample image."""

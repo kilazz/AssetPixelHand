@@ -390,15 +390,7 @@ class LanceDBSimilarityEngine(QObject):
         return duplicate_results
 
     def _create_fp_from_row(self, row) -> ImageFingerprint:
-        return ImageFingerprint(
-            path=Path(row["path"]),
-            hashes=np.array(row["vector"]),
-            resolution=(row["resolution_w"], row["resolution_h"]),
-            file_size=row["file_size"],
-            mtime=row["mtime"],
-            capture_date=row["capture_date"],
-            format_str=row["format_str"],
-            format_details=row["format_details"],
-            has_alpha=row["has_alpha"],
-            bit_depth=row.get("bit_depth", 8),
-        )
+        """Creates an ImageFingerprint object from a database row (Pandas Series)."""
+        # Delegate object creation to the centralized factory method.
+        # The row from iterrows() is a Pandas Series, so convert it to a dict.
+        return ImageFingerprint.from_db_row(row.to_dict())

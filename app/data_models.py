@@ -55,6 +55,26 @@ class ImageFingerprint:
             return self.path == other.path
         return NotImplemented
 
+    @classmethod
+    def from_db_row(cls, row: dict) -> "ImageFingerprint":
+        """Factory method to create an ImageFingerprint from a database row (dict)."""
+        vector_data = row.get("vector")
+        # Explicitly check for None instead of using 'or', which is unsafe for NumPy arrays.
+        hashes = np.array(vector_data) if vector_data is not None else np.array([])
+
+        return cls(
+            path=Path(row["path"]),
+            hashes=hashes,
+            resolution=(row["resolution_w"], row["resolution_h"]),
+            file_size=row["file_size"],
+            mtime=row["mtime"],
+            capture_date=row["capture_date"],
+            format_str=row["format_str"],
+            format_details=row["format_details"],
+            has_alpha=row["has_alpha"],
+            bit_depth=row.get("bit_depth", 8),
+        )
+
 
 DuplicateInfo = tuple[ImageFingerprint, int]
 DuplicateGroup = set[DuplicateInfo]
