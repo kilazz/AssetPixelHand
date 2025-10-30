@@ -64,7 +64,6 @@ def check_library_imports() -> bool:
             "sentencepiece": "sentencepiece",
             "OpenImageIO": "oiio-python",  # The package is oiio-python, but it's imported as OpenImageIO
             "scipy": "scipy",
-            "fast_hdbscan": "fast-hdbscan",
         },
         "Optional (for extended file format support and features)": {},
     }

@@ -27,7 +27,6 @@ dependencies = [
     "duckdb",
     "lancedb",
     # Image & Data Handling
-    "fast-hdbscan",
     "scipy",
     "pandas",
     "pyarrow",
