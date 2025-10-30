@@ -27,7 +27,6 @@ app_logger = logging.getLogger("AssetPixelHand.cache")
 class CacheManager:
     """Manages a DuckDB cache for file fingerprints."""
 
-    # This class remains unchanged.
     def __init__(self, scanned_folder_path: Path, model_name: str):
         self.conn = None
         if ZSTD_AVAILABLE:

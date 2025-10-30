@@ -27,7 +27,6 @@ class ModelAdapter(ABC):
 
     def get_input_size(self, processor) -> tuple[int, int]:
         """Determines the correct input image size from the processor's configuration."""
-        # The image processor can be nested or be the main processor object
         image_proc = getattr(processor, "image_processor", processor)
 
         # Models use different keys for the input size ('size' or 'crop_size')
@@ -160,5 +159,4 @@ def get_model_adapter(model_hf_name: str) -> ModelAdapter:
         return SiglipAdapter()
     if "dinov2" in name_lower or "ijepa" in name_lower:
         return DinoV2Adapter()
-    # CLIP and other similar models are the default.
     return ClipAdapter()

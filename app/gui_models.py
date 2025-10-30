@@ -651,26 +651,24 @@ class SimilarityFilterProxyModel(QSortFilterProxyModel):
         """Sets the minimum similarity threshold."""
         if self._min_similarity != value:
             self._min_similarity = value
-            self.invalidateFilter()  # Tell the view to re-apply the filter
+            self.invalidateFilter()
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
         """The core filtering logic that decides whether to show or hide a row."""
         if self._min_similarity == 0:
-            return True  # If the filter is off, show everything
+            return True
 
-        # Always show top-level group items (e.g., "Query: 'girl'")
+        # Always show top-level group items
         if not source_parent.isValid():
             return True
 
-        # Get the index for the child item in the original source model
         source_index = self.sourceModel().index(source_row, 0, source_parent)
         if not source_index.isValid():
             return False
 
-        # Access the underlying data node for the item
         node = source_index.internalPointer()
         if not node or node.get("type") == "group":
-            return True  # Should not happen for a child, but as a safeguard
+            return True
 
         similarity_score = node.get("distance", -1)
 

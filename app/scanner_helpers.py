@@ -89,7 +89,7 @@ class VisualizationTask(QRunnable):
         VISUALS_DIR.mkdir(parents=True, exist_ok=True)
 
         THUMB, PADDING, TEXT_AREA, MAX_IMGS, IMGS_PER_FILE = 300, 25, 120, 200, 50
-        MAX_COLS = self.num_columns  # Use the value passed from the UI
+        MAX_COLS = self.num_columns
 
         try:
             font, font_bold = ImageFont.truetype("verdana.ttf", 14), ImageFont.truetype("verdanab.ttf", 14)

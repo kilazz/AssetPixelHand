@@ -26,7 +26,6 @@ from app.constants import APP_DATA_DIR, CACHE_DIR, MODELS_DIR, SUPPORTED_MODELS
 
 utils_logger = logging.getLogger("AssetPixelHand.utils")
 
-# --- Library Imports and Availability Check ---
 try:
     import OpenImageIO as oiio
 
@@ -48,9 +47,6 @@ try:
     PILLOW_AVAILABLE = True
 except ImportError:
     PILLOW_AVAILABLE = False
-
-
-# --- Image Loading & Caching ---
 
 
 class SizeLimitedLRUCache:
@@ -116,13 +112,12 @@ def _load_image_core(
         else:
             rgb, alpha = float_array, None
 
-        rgb[rgb < 0] = 0  # Safety clamp for negative values
+        rgb[rgb < 0] = 0
 
         if mode == "reinhard":
             tonemapped_rgb = rgb / (1.0 + rgb)
             gamma_corrected_rgb = np.power(tonemapped_rgb, 1.0 / 2.2)
         elif mode == "drago":
-            # A simplified logarithmic curve for tonemapping
             tonemapped_rgb = np.log(1.0 + 5.0 * rgb) / np.log(6.0)
             gamma_corrected_rgb = np.power(tonemapped_rgb, 1.0 / 1.9)
         else:  # "none" or any other mode
@@ -316,9 +311,6 @@ def get_image_metadata(path: Path) -> dict[str, Any] | None:
     return None
 
 
-# --- Other Utility Functions ---
-
-
 def find_best_in_group(group: list) -> any:
     """Heuristically finds the 'best' file in a group based on resolution, format, and size."""
     if not group:
@@ -330,7 +322,7 @@ def find_best_in_group(group: list) -> any:
             return 2  # Lossless formats
         if fmt in ["JPEG", "JPG", "WEBP", "AVIF", "TGA"]:
             return 1  # Good lossy/common formats
-        return 0  # Other/unknown formats
+        return 0
 
     return max(
         group,

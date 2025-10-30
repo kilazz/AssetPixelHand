@@ -97,7 +97,6 @@ _main_supported_ext = [
 
 _all_ext = list(_main_supported_ext)
 
-# Add DDS support only if our specialized decoder is available
 if DIRECTXTEX_AVAILABLE:
     _all_ext.append(".dds")
 
@@ -153,7 +152,6 @@ def _load_models_config() -> dict:
     if MODELS_CONFIG_FILE.exists():
         try:
             with open(MODELS_CONFIG_FILE, encoding="utf-8") as f:
-                # Attempt to load the user's custom configuration
                 return json.load(f)
         except (json.JSONDecodeError, OSError) as e:
             # The file is present but corrupted or unreadable. Fall back to defaults.
@@ -172,7 +170,6 @@ def _load_models_config() -> dict:
         return default_models
 
 
-# Load the models dynamically.
 SUPPORTED_MODELS = _load_models_config()
 
 

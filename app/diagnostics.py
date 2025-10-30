@@ -66,7 +66,7 @@ def check_library_imports() -> bool:
             "scipy": "scipy",
             "fast_hdbscan": "fast-hdbscan",
         },
-        "Optional (for extended file format support and features)": {},  # directxtex-decoder removed
+        "Optional (for extended file format support and features)": {},
     }
     overall_ok = True
     for category, libs in libraries.items():

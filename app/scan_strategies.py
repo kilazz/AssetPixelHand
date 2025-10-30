@@ -151,7 +151,6 @@ class FindDuplicatesStrategy(ScanStrategy):
         success, _ = self._generate_fingerprints(files_for_ai, stop_event, phase_count)
         if not success:
             if not stop_event.is_set():
-                # Pass exact_groups to be finalized if AI part fails or is cancelled
                 self._report_and_cleanup(exact_groups, start_time)
             return
 

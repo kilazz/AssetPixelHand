@@ -391,6 +391,4 @@ class LanceDBSimilarityEngine(QObject):
 
     def _create_fp_from_row(self, row) -> ImageFingerprint:
         """Creates an ImageFingerprint object from a database row (Pandas Series)."""
-        # Delegate object creation to the centralized factory method.
-        # The row from iterrows() is a Pandas Series, so convert it to a dict.
         return ImageFingerprint.from_db_row(row.to_dict())

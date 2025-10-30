@@ -257,7 +257,7 @@ class App(QMainWindow):
         scan_opts.low_priority_check.toggled.connect(self._request_settings_save)
         scan_opts.save_visuals_check.toggled.connect(self._request_settings_save)
         scan_opts.max_visuals_entry.textChanged.connect(self._request_settings_save)
-        scan_opts.visuals_columns_spinbox.valueChanged.connect(self._request_settings_save)  # New connection
+        scan_opts.visuals_columns_spinbox.valueChanged.connect(self._request_settings_save)
 
         perf = self.performance_panel
         perf.device_combo.currentIndexChanged.connect(self._request_settings_save)
@@ -333,7 +333,7 @@ class App(QMainWindow):
                 lancedb_in_memory=scan_opts.lancedb_in_memory_check.isChecked(),
                 save_visuals=scan_opts.save_visuals_check.isChecked(),
                 max_visuals=int(scan_opts.max_visuals_entry.text()),
-                visuals_columns=scan_opts.visuals_columns_spinbox.value(),  # Pass new setting
+                visuals_columns=scan_opts.visuals_columns_spinbox.value(),
                 search_precision=perf.search_precision_combo.currentText(),
                 search_query=opts.search_entry.text() if opts.current_scan_mode == "text_search" else None,
                 sample_path=opts._sample_path,
@@ -562,7 +562,7 @@ class App(QMainWindow):
             "perf_low_priority": scan_opts.low_priority_check.isChecked(),
             "save_visuals": scan_opts.save_visuals_check.isChecked(),
             "max_visuals": scan_opts.max_visuals_entry.text(),
-            "visuals_columns": scan_opts.visuals_columns_spinbox.value(),  # Save new setting
+            "visuals_columns": scan_opts.visuals_columns_spinbox.value(),
             "perf_model_workers": perf.cpu_workers_spin.text(),
             "perf_batch_size": perf.batch_size_spin.text(),
             "search_precision": perf.search_precision_combo.currentText(),

@@ -108,7 +108,7 @@ class ScanConfig:
     device: str
     find_exact_duplicates: bool
     lancedb_in_memory: bool
-    visuals_columns: int  # Will be passed from AppSettings
+    visuals_columns: int
     model_info: dict = field(default_factory=dict)
     sample_path: Path | None = None
     search_query: str | None = None
@@ -124,7 +124,7 @@ class AppSettings:
     model_key: str = "Balanced (SigLIP Base)"
     save_visuals: bool = False
     max_visuals: str = "100"
-    visuals_columns: int = 6  # Default to 6 columns for visualizations
+    visuals_columns: int = 6
     preview_size: int = 250
     show_transparency: bool = True
     selected_extensions: list[str] = field(default_factory=list)

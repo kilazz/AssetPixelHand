@@ -213,7 +213,6 @@ def inference_worker_loop(config: dict, tensor_q: "multiprocessing.Queue", resul
                 outputs = g_inference_engine.visual_session.run(None, {"pixel_values": pixel_values})
                 if not outputs or len(outputs) == 0:
                     app_logger.error("Inference worker: model returned empty output")
-                    # Add reason for the files that were meant to be processed here
                     for fp in fps:
                         skipped_tuples.append((str(fp.path), "Inference returned empty output"))
                     results_q.put(([], skipped_tuples))

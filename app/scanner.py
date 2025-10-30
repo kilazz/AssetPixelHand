@@ -50,7 +50,7 @@ class ScannerCore(QObject):
 
         try:
             if not self._setup_lancedb():
-                return  # Abort if DB setup fails
+                return
 
             strategy_map = {
                 "duplicates": FindDuplicatesStrategy,

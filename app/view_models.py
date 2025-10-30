@@ -3,10 +3,8 @@
 Contains View-Model classes that manage UI state and logic, separating it from the view widgets.
 """
 
-# --- FIX: Import the Path class ---
 from pathlib import Path
 
-# --- END FIX ---
 from PIL import Image
 from PIL.ImageQt import fromqimage
 from PySide6.QtCore import QObject, QThreadPool, Signal, Slot
