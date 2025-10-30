@@ -50,7 +50,7 @@ from app.constants import (
 )
 from app.data_models import AppSettings
 from app.gui_dialogs import FileTypesDialog
-from app.gui_models import ImageItemDelegate, ImagePreviewModel, ResultsTreeModel
+from app.gui_models import ImageItemDelegate, ImagePreviewModel, ResultsTreeModel, SimilarityFilterProxyModel
 from app.gui_widgets import AlphaBackgroundWidget, ImageCompareWidget, ResizedListView
 from app.view_models import ImageComparerState
 
@@ -217,6 +217,16 @@ class OptionsPanel(QGroupBox):
         else:
             self.current_scan_mode = "duplicates"
             self.scan_button_text = "Scan for Duplicates"
+
+        is_duplicate_mode = self.current_scan_mode == "duplicates"
+        self.threshold_spinbox.setEnabled(is_duplicate_mode)
+        label = self.form_layout.labelForField(self.threshold_spinbox)
+        if label:
+            label.setText("Similarity:" if is_duplicate_mode else "Similarity (N/A):")
+
+        if not is_duplicate_mode:
+            self.threshold_spinbox.setValue(0)
+
         self.scan_button.setText(self.scan_button_text)
         self.clear_sample_button.setVisible(self._sample_path is not None)
         self.scan_context_changed.emit(self.current_scan_mode)
@@ -299,25 +309,36 @@ class ScanOptionsPanel(QGroupBox):
         self.exact_duplicates_check = QCheckBox("First find exact duplicates (faster)")
         self.lancedb_in_memory_check = QCheckBox("Use in-memory database (fastest)")
         self.lancedb_in_memory_check.setToolTip("Stores the vector index in RAM. Fastest, but not persistent.")
-
         self.disk_thumbnail_cache_check = QCheckBox("Enable persistent thumbnail cache")
         self.disk_thumbnail_cache_check.setToolTip(
             "Saves generated thumbnails to disk to speed up future sessions.\nCan use significant disk space over time."
         )
-
         self.low_priority_check = QCheckBox("Run scan at lower priority")
+
         visuals_layout = QHBoxLayout()
         self.save_visuals_check = QCheckBox("Save visualizations")
+
         self.max_visuals_entry = QLineEdit()
         self.max_visuals_entry.setValidator(QIntValidator(0, 9999))
-        self.max_visuals_entry.setFixedWidth(50)
+        self.max_visuals_entry.setFixedWidth(40)
+
+        self.visuals_columns_spinbox = QSpinBox()
+        self.visuals_columns_spinbox.setRange(2, 12)
+        self.visuals_columns_spinbox.setFixedWidth(40)
+
         self.open_visuals_folder_button = QPushButton("📂")
         self.open_visuals_folder_button.setToolTip("Open visualizations folder")
         self.open_visuals_folder_button.setFixedWidth(35)
+
         visuals_layout.addWidget(self.save_visuals_check)
         visuals_layout.addStretch()
+
+        visuals_layout.addWidget(QLabel("Columns:"))
+        visuals_layout.addWidget(self.visuals_columns_spinbox)
+
         visuals_layout.addWidget(QLabel("Max:"))
         visuals_layout.addWidget(self.max_visuals_entry)
+
         visuals_layout.addWidget(self.open_visuals_folder_button)
 
         layout.addWidget(self.exact_duplicates_check)
@@ -331,9 +352,10 @@ class ScanOptionsPanel(QGroupBox):
         self.open_visuals_folder_button.clicked.connect(self._open_visuals_folder)
 
     def toggle_visuals_option(self, is_checked):
-        self.max_visuals_entry.setVisible(is_checked)
-        self.open_visuals_folder_button.setVisible(is_checked)
-        self.layout().itemAt(4).layout().itemAt(2).widget().setVisible(is_checked)  # Adjusted index for new checkbox
+        for i in range(1, self.layout().itemAt(4).layout().count()):
+            widget = self.layout().itemAt(4).layout().itemAt(i).widget()
+            if widget:
+                widget.setVisible(is_checked)
 
     @Slot()
     def _open_visuals_folder(self):
@@ -352,6 +374,7 @@ class ScanOptionsPanel(QGroupBox):
         self.low_priority_check.setChecked(s.perf_low_priority)
         self.save_visuals_check.setChecked(s.save_visuals)
         self.max_visuals_entry.setText(s.max_visuals)
+        self.visuals_columns_spinbox.setValue(s.visuals_columns)
         self.toggle_visuals_option(s.save_visuals)
 
 
@@ -494,6 +517,7 @@ class ResultsPanel(QGroupBox):
     hardlink_requested = Signal(list)
     reflink_requested = Signal(list)
     selection_in_group_changed = Signal(Path, int, object)
+    visible_results_changed = Signal(list)
 
     def __init__(self):
         super().__init__("Results")
@@ -507,6 +531,7 @@ class ResultsPanel(QGroupBox):
         self.reflink_available = False
         self.current_operation = FileOperation.NONE
         self._init_ui()
+        self._setup_models()
         self._connect_signals()
         self.set_enabled_state(is_enabled=False)
 
@@ -514,11 +539,10 @@ class ResultsPanel(QGroupBox):
         layout = QVBoxLayout(self)
         self._create_header_controls(layout)
         self.results_view = QTreeView()
-        self.results_model = ResultsTreeModel(self)
-        self.results_view.setModel(self.results_model)
         self.results_view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.results_view.setAlternatingRowColors(True)
         self.results_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.results_view.setSortingEnabled(True)
         layout.addWidget(self.results_view)
         self._create_action_buttons(layout)
         bottom_buttons_layout = QHBoxLayout()
@@ -536,19 +560,40 @@ class ResultsPanel(QGroupBox):
         bottom_buttons_layout.addWidget(self.delete_button)
         layout.addLayout(bottom_buttons_layout)
 
+    def _setup_models(self):
+        self.results_model = ResultsTreeModel(self)
+        self.proxy_model = SimilarityFilterProxyModel(self)
+        self.proxy_model.setSourceModel(self.results_model)
+        self.results_view.setModel(self.proxy_model)
+
     def _create_header_controls(self, layout):
-        header_layout = QHBoxLayout()
+        top_controls_layout = QHBoxLayout()
         self.search_entry = QLineEdit()
         self.search_entry.setPlaceholderText("Filter results by name...")
-        header_layout.addWidget(self.search_entry)
+        top_controls_layout.addWidget(self.search_entry)
         self.expand_button = QPushButton("Expand All")
         self.collapse_button = QPushButton("Collapse All")
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(["By Duplicate Count", "By Size on Disk", "By Filename"])
-        header_layout.addWidget(self.expand_button)
-        header_layout.addWidget(self.collapse_button)
-        header_layout.addWidget(self.sort_combo)
-        layout.addLayout(header_layout)
+        top_controls_layout.addWidget(self.expand_button)
+        top_controls_layout.addWidget(self.collapse_button)
+        top_controls_layout.addWidget(self.sort_combo)
+        layout.addLayout(top_controls_layout)
+
+        filter_controls_layout = QHBoxLayout()
+        self.similarity_filter_label = QLabel("Min Similarity:")
+        self.similarity_filter_slider = QSlider(Qt.Orientation.Horizontal)
+        self.similarity_filter_slider.setRange(0, 100)
+        self.similarity_filter_slider.setValue(0)
+        self.similarity_filter_value_label = QLabel("0%")
+        self.similarity_filter_value_label.setFixedWidth(40)
+        filter_controls_layout.addWidget(self.similarity_filter_label)
+        filter_controls_layout.addWidget(self.similarity_filter_slider)
+        filter_controls_layout.addWidget(self.similarity_filter_value_label)
+        self.filter_widget = QWidget()
+        self.filter_widget.setLayout(filter_controls_layout)
+        self.filter_widget.setVisible(False)
+        layout.addWidget(self.filter_widget)
 
     def _create_action_buttons(self, layout):
         actions_layout = QGridLayout()
@@ -577,6 +622,40 @@ class ResultsPanel(QGroupBox):
         self.collapse_button.clicked.connect(self.results_view.collapseAll)
         self.search_entry.textChanged.connect(self.search_timer.start)
         self.search_timer.timeout.connect(self._on_search_triggered)
+        self.similarity_filter_slider.valueChanged.connect(self._on_similarity_filter_changed)
+        self.similarity_filter_slider.sliderReleased.connect(self._emit_visible_results)
+        self.results_model.fetch_completed.connect(self._on_fetch_completed)
+
+    @Slot(QModelIndex)
+    def _on_fetch_completed(self, parent_index: QModelIndex):
+        if self.results_model.mode in ["text_search", "sample_search"]:
+            self._emit_visible_results()
+
+    def _emit_visible_results(self):
+        if self.results_model.mode not in ["text_search", "sample_search"]:
+            return
+        visible_items = []
+        if self.proxy_model.rowCount() > 0:
+            group_proxy_index = self.proxy_model.index(0, 0)
+            for row in range(self.proxy_model.rowCount(group_proxy_index)):
+                child_proxy_index = self.proxy_model.index(row, 0, group_proxy_index)
+                source_index = self.proxy_model.mapToSource(child_proxy_index)
+                if source_index.isValid() and (node := source_index.internalPointer()):
+                    visible_items.append(node)
+        self.visible_results_changed.emit(visible_items)
+
+    @Slot(int)
+    def _on_similarity_filter_changed(self, value: int):
+        self.similarity_filter_value_label.setText(f"{value}%")
+        self.proxy_model.set_similarity_filter(value)
+        if self.proxy_model.rowCount() > 0:
+            group_index = self.proxy_model.index(0, 0)
+            visible_count = (
+                self.proxy_model.rowCount(group_index) if group_index.isValid() else self.proxy_model.rowCount()
+            )
+            self.setTitle(f"Results ({visible_count} items shown)")
+        else:
+            self.setTitle("Results")
 
     def set_operation_in_progress(self, operation: FileOperation):
         self.current_operation = operation
@@ -599,25 +678,31 @@ class ResultsPanel(QGroupBox):
         self.results_model.filter(self.search_entry.text())
         self.setTitle(f"Results {self.results_model.get_summary_text()}")
         self._restore_expanded_group_ids(expanded_ids)
+        self._emit_visible_results()
 
     def set_enabled_state(self, is_enabled: bool):
         has_results = self.results_model.rowCount() > 0
-        is_group_mode = self.results_model.hasChildren(QModelIndex())
+        is_duplicate_mode = self.results_model.mode == "duplicates"
+
+        enable_general = is_enabled and has_results
+        for w in [self.results_view, self.search_entry, self.expand_button, self.collapse_button]:
+            w.setEnabled(enable_general)
+
+        self.sort_combo.setEnabled(enable_general and is_duplicate_mode)
+        self.filter_widget.setEnabled(enable_general and not is_duplicate_mode)
+
+        enable_duplicate_controls = enable_general and is_duplicate_mode
         for w in [
-            self.results_view,
             self.select_all_button,
             self.deselect_all_button,
             self.select_except_best_button,
             self.invert_selection_button,
-            self.sort_combo,
-            self.expand_button,
-            self.collapse_button,
             self.delete_button,
-            self.search_entry,
         ]:
-            w.setEnabled(is_enabled and has_results and is_group_mode)
-        self.hardlink_button.setEnabled(is_enabled and has_results and is_group_mode and self.hardlink_available)
-        self.reflink_button.setEnabled(is_enabled and has_results and is_group_mode and self.reflink_available)
+            w.setEnabled(enable_duplicate_controls)
+
+        self.hardlink_button.setEnabled(enable_duplicate_controls and self.hardlink_available)
+        self.reflink_button.setEnabled(enable_duplicate_controls and self.reflink_available)
 
     def clear_results(self):
         self.hardlink_available = False
@@ -630,11 +715,12 @@ class ResultsPanel(QGroupBox):
     def display_results(self, payload, num_found, mode):
         self.search_entry.clear()
         self.results_model.load_data(payload, mode)
+        is_search_mode = mode in ["text_search", "sample_search"]
+        self.filter_widget.setVisible(is_search_mode)
+        self.similarity_filter_slider.setValue(0)
         self.setTitle(f"Results {self.results_model.get_summary_text()}")
-        is_group_mode = self.results_model.hasChildren(QModelIndex())
+        is_duplicate_mode = self.results_model.mode == "duplicates"
         for widget in [
-            self.expand_button,
-            self.collapse_button,
             self.sort_combo,
             self.select_all_button,
             self.deselect_all_button,
@@ -643,28 +729,44 @@ class ResultsPanel(QGroupBox):
             self.hardlink_button,
             self.reflink_button,
             self.delete_button,
-            self.search_entry,
         ]:
-            widget.setVisible(is_group_mode)
+            widget.setVisible(is_duplicate_mode)
         if num_found > 0:
-            if is_group_mode:
+            if is_duplicate_mode:
                 self.results_model.sort_results(self.sort_combo.currentText())
-            for i in range(self.results_model.columnCount()):
-                self.results_view.resizeColumnToContents(i)
+
+            def resize_cols():
+                for i in range(self.proxy_model.columnCount()):
+                    self.results_view.resizeColumnToContents(i)
+                self.results_view.header().setStretchLastSection(True)
+
+            QTimer.singleShot(50, resize_cols)
         self.set_enabled_state(num_found > 0)
+        if is_search_mode and self.proxy_model.rowCount() > 0:
+            self.results_view.expandAll()
+            QTimer.singleShot(100, lambda: self.results_view.sortByColumn(1, Qt.SortOrder.DescendingOrder))
+        else:
+            self.visible_results_changed.emit([])
 
     @Slot()
     def _process_selection(self):
-        indexes = self.results_view.selectionModel().selectedRows()
-        if not (indexes and self.results_model.db_path):
+        proxy_indexes = self.results_view.selectionModel().selectedRows()
+        if not (proxy_indexes and self.results_model.db_path):
             return
-        node = indexes[0].internalPointer()
+
+        source_index = self.proxy_model.mapToSource(proxy_indexes[0])
+        if not source_index.isValid():
+            return
+
+        node = source_index.internalPointer()
         if not node:
             return
-        group_id = node.get("group_id", -1) if node.get("type") == "group" else node.get("group_id")
-        scroll_to_path = Path(node["path"]) if node.get("type") != "group" else None
-        if group_id != -1:
-            self.selection_in_group_changed.emit(self.results_model.db_path, group_id, scroll_to_path)
+
+        if self.results_model.mode == "duplicates":
+            group_id = node.get("group_id", -1)
+            scroll_to_path = Path(node["path"]) if node.get("type") != "group" else None
+            if group_id != -1:
+                self.selection_in_group_changed.emit(self.results_model.db_path, group_id, scroll_to_path)
 
     def _request_deletion(self):
         to_move = self.results_model.get_checked_paths()
@@ -714,19 +816,25 @@ class ResultsPanel(QGroupBox):
         self._restore_expanded_group_ids(expanded)
         if self.results_model.rowCount() == 0:
             self.set_enabled_state(is_enabled=False)
+        self._emit_visible_results()
 
     def _get_expanded_group_ids(self) -> set[int]:
-        return {
-            self.results_model.index(i, 0).internalPointer()["group_id"]
-            for i in range(self.results_model.rowCount())
-            if self.results_view.isExpanded(self.results_model.index(i, 0))
-        }
+        expanded_ids = set()
+        for i in range(self.proxy_model.rowCount()):
+            proxy_index = self.proxy_model.index(i, 0)
+            if self.results_view.isExpanded(proxy_index):
+                source_index = self.proxy_model.mapToSource(proxy_index)
+                node = source_index.internalPointer()
+                if node and "group_id" in node:
+                    expanded_ids.add(node["group_id"])
+        return expanded_ids
 
     def _restore_expanded_group_ids(self, gids: set[int]):
-        for i in range(self.results_model.rowCount()):
-            idx = self.results_model.index(i, 0)
-            if idx.isValid() and idx.internalPointer().get("group_id") in gids:
-                self.results_view.expand(idx)
+        for i in range(self.proxy_model.rowCount()):
+            proxy_index = self.proxy_model.index(i, 0)
+            source_index = self.proxy_model.mapToSource(proxy_index)
+            if source_index.isValid() and source_index.internalPointer().get("group_id") in gids:
+                self.results_view.expand(proxy_index)
 
     @Slot(str)
     def _on_sort_changed(self, sort_key: str):
@@ -881,6 +989,13 @@ class ImageViewerPanel(QGroupBox):
         self.state.load_complete.connect(self._on_load_complete)
         self.state.load_error.connect(self.log_message.emit)
 
+    @Slot(list)
+    def display_results(self, items: list):
+        """Receives a list of result items and displays them."""
+        self.model.set_items_from_list(items)
+        self._back_to_list_view()
+        QTimer.singleShot(50, self.update_timer.start)
+
     @Slot(bool)
     def _on_thumbnail_tonemap_toggled(self, checked: bool):
         self.model.set_tonemap_mode("reinhard" if checked else "none")
@@ -898,8 +1013,11 @@ class ImageViewerPanel(QGroupBox):
         self._on_transparency_toggled(settings.show_transparency)
 
     def clear_viewer(self):
+        """Clears the viewer and resets it to the default list view state."""
         self.update_timer.stop()
-        self.show_image_group(Path(), -1, None)
+        self.model.set_items_from_list([])
+        self.current_group_id = None
+        self._back_to_list_view()
 
     @Slot(Path, int, object)
     def show_image_group(self, db_path: Path, group_id: int, scroll_to_path: Path | None):
@@ -1131,3 +1249,5 @@ class ImageViewerPanel(QGroupBox):
         a_diff = ImageChops.difference(a1, a2) if self.channel_states["A"] else Image.new("L", img1.size, 255)
         diff_img = Image.merge("RGBA", (r_diff, g_diff, b_diff, a_diff))
         return QPixmap.fromImage(ImageQt(diff_img))
+
+    pass

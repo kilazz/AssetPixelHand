@@ -23,9 +23,10 @@ IS_DEBUG_MODE = "--debug" in sys.argv
 
 
 def log_global_crash(exc_type, exc_value, exc_traceback):
+    """A global exception hook to catch and log any unhandled exceptions."""
     tb_info = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
     error_message = f"--- CRITICAL UNHANDLED ERROR ---\n{tb_info}"
-    app_logger.critical(error_message)
+    logging.getLogger("AssetPixelHand.main").critical(error_message)
     try:
         from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -58,6 +59,7 @@ def run_application():
         log_signal = Signal(str, str)
 
     sys.excepthook = log_global_crash
+    app_logger = logging.getLogger("AssetPixelHand.main")
     app_logger.info("Starting AssetPixelHand application...")
     app = QApplication(sys.argv)
     log_emitter = LogSignalEmitter()
@@ -70,14 +72,16 @@ def run_application():
 
 
 if __name__ == "__main__":
+    # Correct initialization order to prevent fatal Windows errors
+    multiprocessing.freeze_support()
+
+    if multiprocessing.get_start_method(allow_none=True) != "spawn":
+        multiprocessing.set_start_method("spawn", force=True)
+
     if sys.platform == "win32":
         import pythoncom
 
         pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
-
-    multiprocessing.freeze_support()
-    if multiprocessing.get_start_method(allow_none=True) != "spawn":
-        multiprocessing.set_start_method("spawn", force=True)
 
     faulthandler.enable()
     setup_logging(force_debug=IS_DEBUG_MODE)

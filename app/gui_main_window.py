@@ -219,7 +219,10 @@ class App(QMainWindow):
         self.options_panel.scan_context_changed.connect(self.performance_panel.update_precision_presets)
         self.performance_panel.log_message.connect(self.log_panel.log_message)
         self.performance_panel.device_changed.connect(self._update_low_priority_option)
+
         self.results_panel.selection_in_group_changed.connect(self.viewer_panel.show_image_group)
+        self.results_panel.visible_results_changed.connect(self.viewer_panel.display_results)
+
         self.results_panel.deletion_requested.connect(self._handle_deletion_request)
         self.results_panel.hardlink_requested.connect(self._handle_hardlink_request)
         self.results_panel.reflink_requested.connect(self._handle_reflink_request)
@@ -254,6 +257,7 @@ class App(QMainWindow):
         scan_opts.low_priority_check.toggled.connect(self._request_settings_save)
         scan_opts.save_visuals_check.toggled.connect(self._request_settings_save)
         scan_opts.max_visuals_entry.textChanged.connect(self._request_settings_save)
+        scan_opts.visuals_columns_spinbox.valueChanged.connect(self._request_settings_save)  # New connection
 
         perf = self.performance_panel
         perf.device_combo.currentIndexChanged.connect(self._request_settings_save)
@@ -274,7 +278,6 @@ class App(QMainWindow):
 
     @Slot()
     def _on_thumbnail_cache_toggled(self):
-        """Applies the thumbnail cache setting change immediately."""
         self.settings.disk_thumbnail_cache_enabled = self.scan_options_panel.disk_thumbnail_cache_check.isChecked()
         setup_thumbnail_cache(self.settings)
         self._request_settings_save()
@@ -330,6 +333,7 @@ class App(QMainWindow):
                 lancedb_in_memory=scan_opts.lancedb_in_memory_check.isChecked(),
                 save_visuals=scan_opts.save_visuals_check.isChecked(),
                 max_visuals=int(scan_opts.max_visuals_entry.text()),
+                visuals_columns=scan_opts.visuals_columns_spinbox.value(),  # Pass new setting
                 search_precision=perf.search_precision_combo.currentText(),
                 search_query=opts.search_entry.text() if opts.current_scan_mode == "text_search" else None,
                 sample_path=opts._sample_path,
@@ -558,6 +562,7 @@ class App(QMainWindow):
             "perf_low_priority": scan_opts.low_priority_check.isChecked(),
             "save_visuals": scan_opts.save_visuals_check.isChecked(),
             "max_visuals": scan_opts.max_visuals_entry.text(),
+            "visuals_columns": scan_opts.visuals_columns_spinbox.value(),  # Save new setting
             "perf_model_workers": perf.cpu_workers_spin.text(),
             "perf_batch_size": perf.batch_size_spin.text(),
             "search_precision": perf.search_precision_combo.currentText(),

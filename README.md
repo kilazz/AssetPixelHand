@@ -1,7 +1,7 @@
 # AssetPixelHand
 **An AI-powered tool for finding and managing duplicate and visually similar images.**
 
-> **Note: This is a  Prototype**
+> **Note: This is a Prototype**
 
 ## Key Features
 *   **🧠 AI-Powered Search**: The core is a vector search engine powered by image embeddings. You can choose from several leading AI models (ViT, CLIP, SigLIP, DINOv2), each optimized for different tasks: speed, overall quality, or high structural accuracy.

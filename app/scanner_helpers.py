@@ -75,16 +75,22 @@ class VisualizationTask(QRunnable):
     class Signals(QObject):
         finished = Signal()
 
-    def __init__(self, groups: DuplicateResults, max_visuals: int, config_folder_path: Path):
+    def __init__(self, groups: DuplicateResults, max_visuals: int, config_folder_path: Path, num_columns: int):
         super().__init__()
-        self.groups, self.max_visuals, self.folder_path = groups, max_visuals, config_folder_path
+        self.groups = groups
+        self.max_visuals = max_visuals
+        self.folder_path = config_folder_path
+        self.num_columns = num_columns
         self.signals = self.Signals()
 
     def run(self):
         if VISUALS_DIR.exists():
             shutil.rmtree(VISUALS_DIR)
         VISUALS_DIR.mkdir(parents=True, exist_ok=True)
-        THUMB, PADDING, TEXT_AREA, MAX_COLS, MAX_IMGS, IMGS_PER_FILE = 300, 25, 120, 4, 200, 50
+
+        THUMB, PADDING, TEXT_AREA, MAX_IMGS, IMGS_PER_FILE = 300, 25, 120, 200, 50
+        MAX_COLS = self.num_columns  # Use the value passed from the UI
+
         try:
             font, font_bold = ImageFont.truetype("verdana.ttf", 14), ImageFont.truetype("verdanab.ttf", 14)
         except OSError:

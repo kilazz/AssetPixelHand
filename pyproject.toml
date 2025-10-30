@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "AssetPixelHand"
-description = "AssetPixelHand"
+description = "An AI-powered tool for finding and managing duplicate and visually similar images."
 version = "1.0.0"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -21,8 +21,6 @@ dependencies = [
     "torch",
     "transformers",
     "onnx",
-    #"onnxscript",
-    #"onnxconverter-common",
     "sentencepiece",
     "huggingface_hub[hf_xet]",
     # Databases

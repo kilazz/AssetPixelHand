@@ -8,7 +8,17 @@ import logging
 from collections import OrderedDict, defaultdict
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractItemModel, QAbstractListModel, QModelIndex, QSize, Qt, QThreadPool, Slot
+from PySide6.QtCore import (
+    QAbstractItemModel,
+    QAbstractListModel,
+    QModelIndex,
+    QSize,
+    QSortFilterProxyModel,
+    Qt,
+    QThreadPool,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QImage, QPen, QPixmap
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate
 
@@ -25,6 +35,8 @@ app_logger = logging.getLogger("AssetPixelHand.gui.models")
 
 class ResultsTreeModel(QAbstractItemModel):
     """Data model for the results tree view, with asynchronous data fetching."""
+
+    fetch_completed = Signal(QModelIndex)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -118,7 +130,7 @@ class ResultsTreeModel(QAbstractItemModel):
         return len(node.get("children", [])) if node and node.get("type") == "group" else 0
 
     def columnCount(self, parent: QModelIndex | None = None) -> int:
-        return 3
+        return 4
 
     def parent(self, index):
         if not index.isValid():
@@ -195,6 +207,8 @@ class ResultsTreeModel(QAbstractItemModel):
 
         del self.running_tasks[group_id]
 
+        self.fetch_completed.emit(parent_index)
+
     @Slot(str)
     def _on_fetch_error(self, error_message: str):
         app_logger.error(f"Background fetch error: {error_message}")
@@ -207,6 +221,13 @@ class ResultsTreeModel(QAbstractItemModel):
         if not index.isValid():
             return None
         node = index.internalPointer()
+
+        if role == Qt.ItemDataRole.DisplayRole:
+            value = self._get_display_data(index, node)
+            if index.column() == 1 and isinstance(value, int):
+                return f"{value}%"
+            return value
+
         if (
             role == Qt.ItemDataRole.CheckStateRole
             and index.column() == 0
@@ -214,8 +235,7 @@ class ResultsTreeModel(QAbstractItemModel):
             and node.get("type") != "group"
         ):
             return self.check_states.get(node["path"], Qt.CheckState.Unchecked)
-        if role == Qt.ItemDataRole.DisplayRole:
-            return self._get_display_data(index, node)
+
         if (
             role == Qt.ItemDataRole.FontRole
             and index.column() == 0
@@ -224,31 +244,37 @@ class ResultsTreeModel(QAbstractItemModel):
             font = QFont()
             font.setBold(True)
             return font
+
         if role == Qt.ItemDataRole.BackgroundRole and node.get("is_best"):
             return QBrush(QColor(UIConfig.Colors.BEST_FILE_BG))
+
         return None
 
     def _get_display_data(self, index, node):
         if node.get("type") == "group":
-            if index.column() != 0:
-                return ""
             name, count = node["name"], node["count"]
-            return (
+            display_text = (
                 f"{name} ({count} results)"
                 if self.mode in ["text_search", "sample_search"]
                 else f"Group: {name} ({count} duplicates)"
             )
+            return display_text if index.column() == 0 else ""
+
         path = Path(node["path"])
-        if index.column() == 0:
+        col = index.column()
+
+        if col == 0:
             return path.name
-        if index.column() == 1:
-            return str(path.parent)
-        if index.column() == 2:
+        elif col == 1:
             dist = node.get("distance", -1)
-            dist_text = " (Exact)" if dist == 100 else f" (Similarity: {dist}%)" if dist >= 0 else ""
+            return dist if dist >= 0 else None
+        elif col == 2:
+            return str(path.parent)
+        elif col == 3:
             res = f"{node.get('resolution_w', 0)}x{node.get('resolution_h', 0)}"
             size_mb = node.get("file_size", 0) / (1024**2)
-            return f"{res} | {node.get('bit_depth', 8)}-bit | {size_mb:.2f} MB | {node.get('format_details', '')}{dist_text}"
+            return f"{res} | {node.get('bit_depth', 8)}-bit | {size_mb:.2f} MB | {node.get('format_details', '')}"
+
         return ""
 
     def setData(self, index, value, role):
@@ -277,7 +303,7 @@ class ResultsTreeModel(QAbstractItemModel):
 
     def headerData(self, section, orientation, role):
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return ["File", "Path", "Metadata"][section]
+            return ["File", "Score", "Path", "Metadata"][section]
         return None
 
     def sort_results(self, sort_key: str):
@@ -406,7 +432,18 @@ class ImagePreviewModel(QAbstractListModel):
         self.loading_paths.clear()
         self.endResetModel()
 
+    def set_items_from_list(self, items: list[dict]):
+        """Directly sets the model's items from a provided list, bypassing DB queries."""
+        self.beginResetModel()
+        self.db_path = None
+        self.group_id = -1
+        self.items = items
+        self.pixmap_cache.clear()
+        self.loading_paths.clear()
+        self.endResetModel()
+
     def set_group(self, db_path: Path, group_id: int):
+        """Loads a group from the database (used for 'duplicates' mode)."""
         self.beginResetModel()
         self.db_path = db_path
         self.group_id = group_id
@@ -601,3 +638,41 @@ class ImageItemDelegate(QStyledItemDelegate):
         painter.drawText(x, y, self.regular_font_metrics.elidedText(meta_text, Qt.ElideRight, text_rect.width()))
         y += line_height
         painter.drawText(x, y, self.regular_font_metrics.elidedText(str(path.parent), Qt.ElideRight, text_rect.width()))
+
+
+class SimilarityFilterProxyModel(QSortFilterProxyModel):
+    """A proxy model to filter results based on a similarity score."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._min_similarity = 0
+
+    def set_similarity_filter(self, value: int):
+        """Sets the minimum similarity threshold."""
+        if self._min_similarity != value:
+            self._min_similarity = value
+            self.invalidateFilter()  # Tell the view to re-apply the filter
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
+        """The core filtering logic that decides whether to show or hide a row."""
+        if self._min_similarity == 0:
+            return True  # If the filter is off, show everything
+
+        # Always show top-level group items (e.g., "Query: 'girl'")
+        if not source_parent.isValid():
+            return True
+
+        # Get the index for the child item in the original source model
+        source_index = self.sourceModel().index(source_row, 0, source_parent)
+        if not source_index.isValid():
+            return False
+
+        # Access the underlying data node for the item
+        node = source_index.internalPointer()
+        if not node or node.get("type") == "group":
+            return True  # Should not happen for a child, but as a safeguard
+
+        similarity_score = node.get("distance", -1)
+
+        # Show the row only if its similarity score is at or above the threshold
+        return similarity_score >= self._min_similarity

@@ -150,7 +150,9 @@ class FindDuplicatesStrategy(ScanStrategy):
 
         success, _ = self._generate_fingerprints(files_for_ai, stop_event, phase_count)
         if not success:
-            self.scanner_core._check_stop_or_empty(stop_event, [], "duplicates", exact_groups, start_time)
+            if not stop_event.is_set():
+                # Pass exact_groups to be finalized if AI part fails or is cancelled
+                self._report_and_cleanup(exact_groups, start_time)
             return
 
         self.state.set_phase(f"Phase {phase_count}/{phase_count}: Finding similar images...", 0.15)
@@ -234,7 +236,9 @@ class FindDuplicatesStrategy(ScanStrategy):
         if num_found > 0:
             self._save_results_to_db(final_groups)
             if self.config.save_visuals:
-                task = VisualizationTask(final_groups, self.config.max_visuals, self.config.folder_path)
+                task = VisualizationTask(
+                    final_groups, self.config.max_visuals, self.config.folder_path, self.config.visuals_columns
+                )
                 task.signals.finished.connect(self.signals.save_visuals_finished.emit)
                 QThreadPool.globalInstance().start(task)
 

@@ -59,7 +59,6 @@ class ImageFingerprint:
     def from_db_row(cls, row: dict) -> "ImageFingerprint":
         """Factory method to create an ImageFingerprint from a database row (dict)."""
         vector_data = row.get("vector")
-        # Explicitly check for None instead of using 'or', which is unsafe for NumPy arrays.
         hashes = np.array(vector_data) if vector_data is not None else np.array([])
 
         return cls(
@@ -109,6 +108,7 @@ class ScanConfig:
     device: str
     find_exact_duplicates: bool
     lancedb_in_memory: bool
+    visuals_columns: int  # Will be passed from AppSettings
     model_info: dict = field(default_factory=dict)
     sample_path: Path | None = None
     search_query: str | None = None
@@ -124,6 +124,7 @@ class AppSettings:
     model_key: str = "Balanced (SigLIP Base)"
     save_visuals: bool = False
     max_visuals: str = "100"
+    visuals_columns: int = 6  # Default to 6 columns for visualizations
     preview_size: int = 250
     show_transparency: bool = True
     selected_extensions: list[str] = field(default_factory=list)
