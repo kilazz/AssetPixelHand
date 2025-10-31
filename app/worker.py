@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import onnxruntime as ort
+
 from app.constants import APP_DATA_DIR, DEEP_LEARNING_AVAILABLE, MODELS_DIR, WIN32_AVAILABLE
 from app.data_models import ImageFingerprint
 from app.utils import _load_image_static_cached, get_image_metadata
@@ -243,7 +244,7 @@ def inference_worker_loop(
                 shared_array = np.ndarray(shape, dtype=dtype, buffer=existing_shm.buf)
                 pixel_values = np.copy(shared_array)
                 existing_shm.close()
-                
+
                 # <<< FIX: Return the buffer to the queue immediately after use to prevent deadlock.
                 free_buffers_q.put(shm_name)
 
