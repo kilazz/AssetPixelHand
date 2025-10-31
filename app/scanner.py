@@ -8,6 +8,7 @@ import hashlib
 import logging
 import os
 import shutil
+import sys
 import threading
 import time
 
@@ -23,6 +24,7 @@ if LANCEDB_AVAILABLE:
 if DUCKDB_AVAILABLE:
     pass
 if WIN32_AVAILABLE:
+    import pythoncom
     import win32api
     import win32con
     import win32process
@@ -43,6 +45,9 @@ class ScannerCore(QObject):
 
     def run(self, stop_event: threading.Event):
         """Main entry point for the scanner logic, executed in a separate thread."""
+        if sys.platform == "win32":
+            pythoncom.CoInitializeEx(0)  # 0 = COINIT_MULTITHREADED
+
         self.scan_has_finished = False
         start_time = time.time()
         self.all_skipped_files.clear()

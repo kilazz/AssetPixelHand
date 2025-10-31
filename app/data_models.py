@@ -14,7 +14,14 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
-from app.constants import ALL_SUPPORTED_EXTENSIONS, CONFIG_FILE, SCRIPT_DIR, SUPPORTED_MODELS, QuantizationMode
+from app.constants import (
+    ALL_SUPPORTED_EXTENSIONS,
+    CONFIG_FILE,
+    DEFAULT_SEARCH_PRECISION,
+    SCRIPT_DIR,
+    SUPPORTED_MODELS,
+    QuantizationMode,
+)
 
 if TYPE_CHECKING:
     pass
@@ -86,6 +93,7 @@ class PerformanceConfig:
     """Stores performance-related settings for a scan."""
 
     model_workers: int = 1
+    gpu_preproc_workers: int = 4  # Number of CPU workers for GPU preprocessing
     run_at_low_priority: bool = True
     batch_size: int = 256
 
@@ -132,11 +140,12 @@ class AppSettings:
     find_exact_duplicates: bool = True
     find_perceptual_duplicates: bool = True
     perf_model_workers: str = "1"
+    perf_gpu_preproc_workers: str = "4"
     perf_low_priority: bool = True
     perf_batch_size: str = "256"
     lancedb_in_memory: bool = True
     disk_thumbnail_cache_enabled: bool = True
-    search_precision: str = "Balanced (Default)"
+    search_precision: str = DEFAULT_SEARCH_PRECISION
     device: str = "CPU"
     quantization_mode: str = QuantizationMode.FP16.value
     theme: str = "Dark"

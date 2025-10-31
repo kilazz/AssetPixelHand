@@ -192,6 +192,17 @@ class UIConfig:
         PREVIEW_MAX_SIZE = 500
 
 
+# --- Search Configuration ---
+# Single source of truth for search precision presets
+SEARCH_PRECISION_PRESETS = {
+    "Fast": {"nprobes": 10, "refine_factor": 1},
+    "Balanced (Default)": {"nprobes": 20, "refine_factor": 2},
+    "Thorough": {"nprobes": 40, "refine_factor": 5},
+    "Exhaustive (Slow)": {"nprobes": 256, "refine_factor": 10},
+}
+DEFAULT_SEARCH_PRECISION = "Balanced (Default)"
+
+
 class CompareMode(Enum):
     SIDE_BY_SIDE = "Side-by-Side"
     WIPE = "Wipe"

@@ -15,11 +15,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-
-# --- MODIFICATION START: Import onnxruntime for I/O Binding ---
 import onnxruntime as ort
 
-# --- MODIFICATION END ---
 from app.constants import APP_DATA_DIR, DEEP_LEARNING_AVAILABLE, MODELS_DIR, WIN32_AVAILABLE
 from app.data_models import ImageFingerprint
 from app.utils import _load_image_static_cached, get_image_metadata
@@ -64,14 +61,11 @@ class InferenceEngine:
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        # --- MODIFICATION START: Correct provider list for DirectML/CPU ---
         providers = ["CPUExecutionProvider"]
         if device == "gpu":
             providers.insert(0, "DmlExecutionProvider")
-            # This option is specific to DirectML for FP16 performance
             if self.is_fp16 and hasattr(opts, "enable_float16_for_dml"):
                 opts.enable_float16_for_dml = True
-        # --- MODIFICATION END ---
 
         self.visual_session = ort.InferenceSession(str(model_dir / "visual.onnx"), opts, providers=providers)
         if (text_model_path := model_dir / "text.onnx").exists():
@@ -160,7 +154,6 @@ def _process_batch_from_paths(
 
 
 def worker_wrapper_from_paths(paths: list[Path]) -> tuple[list[ImageFingerprint], list[tuple[str, str]]]:
-    # This is for the CPU-only pipeline, I/O Binding can be used here too for minor gains
     if g_inference_engine is None:
         return [], [(str(p), "Worker process not initialized") for p in paths]
     try:
@@ -170,7 +163,6 @@ def worker_wrapper_from_paths(paths: list[Path]) -> tuple[list[ImageFingerprint]
             inputs = g_inference_engine.processor(images=image_list_for_processor, return_tensors="np")
             pixel_values = inputs.pixel_values.astype(np.float16 if g_inference_engine.is_fp16 else np.float32)
 
-            # Use I/O Binding for CPU path as well
             io_binding = g_inference_engine.visual_session.io_binding()
             io_binding.bind_cpu_input("pixel_values", pixel_values)
             io_binding.bind_output("image_embeds")
@@ -231,9 +223,7 @@ def inference_worker_loop(
         results_q.put(None)
         return
 
-    # Create the I/O Binding object once, outside the loop
     io_binding = g_inference_engine.visual_session.io_binding()
-    shm_name = None
 
     try:
         while True:
@@ -244,7 +234,6 @@ def inference_worker_loop(
 
             meta_message, fps, skipped_tuples = item
             pixel_values = None
-            shm_name = None  # Reset shm_name for each iteration
 
             if meta_message:
                 shm_name = meta_message["shm_name"]
@@ -256,23 +245,14 @@ def inference_worker_loop(
                 pixel_values = np.copy(shared_array)
                 existing_shm.close()
 
+                # <<< FIX: Return the buffer to the queue immediately after use to prevent deadlock.
+                free_buffers_q.put(shm_name)
+
             if pixel_values is not None and pixel_values.size > 0:
-                # --- I/O BINDING IMPLEMENTATION for DirectML/CPU ---
-                # 1. Bind the input NumPy array from CPU RAM. ORT will handle copying it to the GPU.
                 io_binding.bind_cpu_input("pixel_values", pixel_values)
-
-                # 2. Bind the output. We tell ORT to manage memory for the output on the active device (GPU or CPU).
                 io_binding.bind_output("image_embeds")
-
-                # 3. Run inference with the bindings.
                 g_inference_engine.visual_session.run_with_iobinding(io_binding)
-
-                # 4. Get the results as an OrtValue.
-                outputs = io_binding.get_outputs()
-
-                # 5. Copy the result to a NumPy array in CPU RAM for further processing.
-                embeddings = outputs[0].numpy()
-                # --- END OF I/O BINDING IMPLEMENTATION ---
+                embeddings = io_binding.get_outputs()[0].numpy()
 
                 if embeddings is None or embeddings.size == 0:
                     app_logger.error("Inference worker: model returned empty output via I/O Binding")
@@ -290,10 +270,6 @@ def inference_worker_loop(
     except Exception as e:
         _log_worker_crash(e, "inference_worker_loop")
         results_q.put(None)
-    finally:
-        # Important: always return the buffer to the pool
-        if shm_name:
-            free_buffers_q.put(shm_name)
 
 
 def _log_worker_crash(e: Exception, context: str):

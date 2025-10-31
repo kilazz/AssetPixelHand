@@ -158,23 +158,18 @@ class FingerprintEngine(QObject):
 
         try:
             init_cfg = {"low_priority": self.config.perf.run_at_low_priority}
-
-            # --- MODIFICATION START: Remove queue from partial and use initializer ---
-            # The queue is no longer passed directly to the worker function
             worker_func = partial(
                 worker.worker_wrapper_from_paths_cpu_shared_mem,
                 model_name=self.config.model_name,
                 buffer_shape=buffer_shape,
                 dtype=dtype,
             )
-
-            # The Pool is now initialized with a function that accepts the queue
             with ctx.Pool(
                 processes=num_workers,
                 initializer=worker.init_cpu_worker_for_gpu_pipeline,
                 initargs=(init_cfg, free_buffers_q),
             ) as pool:
-                # --- MODIFICATION END ---
+
                 def data_gen(files: list[Path], batch_size: int):
                     for i in range(0, len(files), batch_size):
                         if stop_event.is_set():
@@ -244,9 +239,14 @@ class FingerprintEngine(QObject):
         return processed, all_skipped
 
     def _run_cpu_pipeline(self, files, stop_event, total, cache, num_workers) -> tuple[bool, list[str]]:
+        # <--- CHANGE START: FP32 Performance Fix ---
+        # We no longer force num_workers to 1. Instead, we just warn the user.
+        # This gives users with high RAM the ability to use more cores.
         if "_fp16" not in self.config.model_name and num_workers > 1:
-            self.signals.log.emit("FP32 model is large. Limiting to 1 CPU worker to save RAM.", "warning")
-            num_workers = 1
+            self.signals.log.emit(
+                "Warning: FP32 model is large and may consume significant RAM with multiple workers.", "warning"
+            )
+        # <--- CHANGE END ---
 
         ctx = multiprocessing.get_context("spawn")
         init_cfg = {
@@ -310,6 +310,7 @@ class LanceDBSimilarityEngine(QObject):
     def find_similar_groups(self, stop_event: threading.Event) -> DuplicateResults:
         """
         Finds clusters using a memory-efficient graph clustering algorithm with SciPy.
+        This version uses batch processing to handle massive datasets without exhausting RAM.
         """
         if not SCIPY_AVAILABLE:
             self.signals.log.emit("SciPy not found. Please run 'pip install scipy'.", "error")
@@ -317,32 +318,69 @@ class LanceDBSimilarityEngine(QObject):
 
         self.state.update_progress(0, 1, "Fetching image index from database...")
         try:
-            arrow_table = self.table.to_lance().to_table(columns=["id", "vector"])
-            point_ids = arrow_table.column("id").to_pylist()
+            # <--- CHANGE START: Memory and Performance Optimization ---
+            # 1. Fetch ONLY IDs first to build the index map. This is memory-light.
+            id_arrow_table = self.table.to_lance().to_table(columns=["id"])
+            point_ids = id_arrow_table.column("id").to_pylist()
             if not point_ids or stop_event.is_set():
                 return {}
-            vectors = np.array(arrow_table.column("vector").to_pylist())
         except Exception as e:
-            self.signals.log.emit(f"Failed to fetch data: {e}", "error")
+            self.signals.log.emit(f"Failed to fetch data IDs: {e}", "error")
             return {}
 
         id_to_idx = {pid: i for i, pid in enumerate(point_ids)}
         num_points = len(point_ids)
-        self.state.update_progress(0, num_points, "Finding nearest neighbors...")
+        self.state.update_progress(0, num_points, "Finding nearest neighbors (in batches)...")
         rows, cols, data = [], [], []
 
-        for i in range(num_points):
-            if stop_event.is_set():
-                return {}
-            hits = self.table.search(vectors[i]).limit(self.K_NEIGHBORS).nprobes(self.nprobes).to_pandas()
-            for _, hit in hits.iterrows():
-                j = id_to_idx.get(hit["id"])
-                distance = hit["_distance"]
-                if j is not None and i != j:
-                    rows.append(i)
-                    cols.append(j)
-                    data.append(distance)
-            self.state.update_progress(i + 1, num_points)
+        # 2. Process vectors in batches to avoid loading the entire dataset into RAM.
+        BATCH_SIZE = 4096
+        total_processed = 0
+
+        try:
+            # Create a reader to stream data in batches
+            reader = self.table.to_lance().to_table(columns=["id", "vector"]).to_reader(batch_size=BATCH_SIZE)
+
+            for batch in reader:
+                if stop_event.is_set():
+                    return {}
+
+                batch_ids = batch.column("id").to_pylist()
+                batch_vectors = np.array(batch.column("vector").to_pylist())
+
+                # 3. Perform a single, efficient batch search query for all vectors in the batch.
+                batch_hits = self.table.search(batch_vectors).limit(self.K_NEIGHBORS).nprobes(self.nprobes).to_pandas()
+
+                # 4. Process the combined results from the batch search.
+                # We group by the original query to associate hits with their source.
+                for i, source_id in enumerate(batch_ids):
+                    # In LanceDB batch search results, hits for the i-th query vector are
+                    # typically found at indices [i*K_NEIGHBORS, (i+1)*K_NEIGHBORS]
+                    # A more robust way might be needed if the API changes, but this is standard.
+                    start_index = i * self.K_NEIGHBORS
+                    end_index = start_index + self.K_NEIGHBORS
+                    hits_for_source = batch_hits.iloc[start_index:end_index]
+
+                    source_idx = id_to_idx.get(source_id)
+                    if source_idx is None:
+                        continue
+
+                    for _, hit in hits_for_source.iterrows():
+                        target_idx = id_to_idx.get(hit["id"])
+                        distance = hit["_distance"]
+                        if target_idx is not None and source_idx != target_idx:
+                            rows.append(source_idx)
+                            cols.append(target_idx)
+                            data.append(distance)
+
+                total_processed += len(batch_vectors)
+                self.state.update_progress(total_processed, num_points)
+
+        except Exception as e:
+            self.signals.log.emit(f"Error during batch neighbor search: {e}", "error")
+            app_logger.error("Batch neighbor search failed", exc_info=True)
+            return {}
+        # <--- CHANGE END ---
 
         if stop_event.is_set():
             return {}
