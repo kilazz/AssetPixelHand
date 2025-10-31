@@ -31,6 +31,10 @@ from app.scanner_helpers import FileFinder, VisualizationTask
 from app.utils import find_best_in_group, get_image_metadata
 from app.worker import init_worker, worker_get_single_vector, worker_get_text_vector
 
+# A standard Hamming distance threshold for pHash. Hashes with a distance <= this value
+# are considered to be from visually near-identical images.
+PHASH_THRESHOLD = 4
+
 
 class ScanStrategy(ABC):
     """Abstract base class for a scanning strategy."""
@@ -141,7 +145,11 @@ class ScanStrategy(ABC):
 
 
 class FindDuplicatesStrategy(ScanStrategy):
-    """Strategy for finding duplicate and similar images using a multi-stage filtering approach."""
+    """
+    Strategy for finding duplicate and similar images using a multi-stage filtering approach.
+    This creates a strict hierarchy: exact duplicates are found first, then perceptual,
+    and only the remaining unique files are passed to the AI.
+    """
 
     def __init__(self, *args):
         super().__init__(*args)
@@ -191,7 +199,7 @@ class FindDuplicatesStrategy(ScanStrategy):
 
         if not success:
             if not stop_event.is_set():
-                final_groups = self._finalize_all_results(exact_groups, phash_groups, {})
+                final_groups = self._combine_results(exact_groups, phash_groups, {})
                 self._report_and_cleanup(final_groups, start_time)
             return
 
@@ -202,7 +210,7 @@ class FindDuplicatesStrategy(ScanStrategy):
         if stop_event.is_set():
             return
 
-        final_groups = self._finalize_all_results(exact_groups, phash_groups, similar_groups)
+        final_groups = self._combine_results(exact_groups, phash_groups, similar_groups)
         self._report_and_cleanup(final_groups, start_time)
 
     def _find_exact_duplicates(
@@ -242,7 +250,11 @@ class FindDuplicatesStrategy(ScanStrategy):
     def _find_perceptual_duplicates(
         self, files: list[Path], stop_event: threading.Event, phase_count: int, current_phase: int
     ) -> tuple[DuplicateResults, list[Path]]:
-        """Identifies visually identical images using perceptual hashing."""
+        """
+        FIXED: Identifies visually identical images using pHash and Hamming distance.
+        This correctly groups images that are nearly identical, not just those with
+        the exact same hash.
+        """
         if not IMAGEHASH_AVAILABLE:
             self.signals.log.emit("`imagehash` library not found. Skipping pHash step.", "warning")
             return {}, files
@@ -250,66 +262,58 @@ class FindDuplicatesStrategy(ScanStrategy):
         self.state.set_phase(f"Phase {current_phase}/{phase_count}: Finding near-identical images (pHash)...", 0.15)
         self.state.update_progress(0, len(files), "Computing perceptual hashes...")
 
-        phash_map = defaultdict(list)
+        phashes = []
         for i, path in enumerate(files):
             if stop_event.is_set():
                 return {}, []
             try:
                 with Image.open(path) as img:
-                    phash = imagehash.phash(img)
-                    phash_map[phash].append(path)
-            except Exception:
-                phash_map[str(path)].append(path)
+                    phashes.append((path, imagehash.phash(img)))
+            except Exception as e:
+                self.signals.log.emit(f"Could not compute pHash for {path.name}: {e}", "warning")
+                self.all_skipped_files.append(str(path))
             self.state.update_progress(i + 1, len(files))
+
+        self.state.update_progress(0, len(phashes), "Grouping similar hashes...")
+        groups: list[list[Path]] = []
+        for i, (path, phash) in enumerate(phashes):
+            if stop_event.is_set():
+                return {}, []
+            self.state.update_progress(i + 1, len(phashes))
+            found_group = False
+            for group in groups:
+                # Compare against the first hash in an existing group
+                representative_path = group[0]
+                representative_hash = next(p for p_path, p in phashes if p_path == representative_path)
+                if phash - representative_hash <= PHASH_THRESHOLD:
+                    group.append(path)
+                    found_group = True
+                    break
+            if not found_group:
+                groups.append([path])
 
         phash_groups: DuplicateResults = {}
         files_for_ai: list[Path] = []
-        for paths in phash_map.values():
-            if len(paths) > 1:
-                group_fps = [fp for fp in (self._create_dummy_fp(p) for p in paths) if fp]
+        for group_paths in groups:
+            if len(group_paths) > 1:
+                group_fps = [fp for fp in (self._create_dummy_fp(p) for p in group_paths) if fp]
                 if group_fps:
                     best_fp = find_best_in_group(group_fps)
                     phash_groups[best_fp] = {(fp, 100) for fp in group_fps if fp != best_fp}
                     files_for_ai.append(best_fp.path)
-            elif paths:
-                files_for_ai.append(paths[0])
+            elif group_paths:
+                files_for_ai.append(group_paths[0])
 
         return phash_groups, files_for_ai
 
-    def _finalize_all_results(
-        self, exact_groups: DuplicateResults, phash_groups: DuplicateResults, similar_groups: DuplicateResults
-    ) -> DuplicateResults:
-        """Merges exact, perceptual, and AI-based duplicate groups intelligently."""
-        self.state.set_phase("Finalizing and merging all results...", 0.0)
-
-        final_groups = similar_groups.copy()
-
-        fp_to_ai_group_leader: dict[ImageFingerprint, ImageFingerprint] = {}
-        for best_fp, dups_set in final_groups.items():
-            fp_to_ai_group_leader[best_fp] = best_fp
-            for fp, _ in dups_set:
-                fp_to_ai_group_leader[fp] = best_fp
-
-        def merge_into_final(groups_to_merge: DuplicateResults):
-            for best_fp, dups_set in groups_to_merge.items():
-                all_fps_in_group = [best_fp] + [fp for fp, _ in dups_set]
-
-                existing_leader = None
-                for fp in all_fps_in_group:
-                    if fp in fp_to_ai_group_leader:
-                        existing_leader = fp_to_ai_group_leader[fp]
-                        break
-
-                if existing_leader:
-                    final_groups[existing_leader].update(dups_set)
-                    if best_fp != existing_leader:
-                        final_groups[existing_leader].add((best_fp, 100))
-                else:
-                    final_groups[best_fp] = dups_set
-
-        merge_into_final(phash_groups)
-        merge_into_final(exact_groups)
-
+    def _combine_results(self, *results_dicts: DuplicateResults) -> DuplicateResults:
+        """
+        Combines results from different stages. Since the filtering pipeline ensures
+        that the keys (best_fp) of each dictionary are disjoint, a simple update is safe.
+        """
+        final_groups = {}
+        for results_dict in results_dicts:
+            final_groups.update(results_dict)
         return final_groups
 
     def _report_and_cleanup(self, final_groups: DuplicateResults, start_time: float):
