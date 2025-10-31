@@ -239,14 +239,12 @@ class FingerprintEngine(QObject):
         return processed, all_skipped
 
     def _run_cpu_pipeline(self, files, stop_event, total, cache, num_workers) -> tuple[bool, list[str]]:
-        # <--- CHANGE START: FP32 Performance Fix ---
         # We no longer force num_workers to 1. Instead, we just warn the user.
         # This gives users with high RAM the ability to use more cores.
         if "_fp16" not in self.config.model_name and num_workers > 1:
             self.signals.log.emit(
                 "Warning: FP32 model is large and may consume significant RAM with multiple workers.", "warning"
             )
-        # <--- CHANGE END ---
 
         ctx = multiprocessing.get_context("spawn")
         init_cfg = {
@@ -318,7 +316,6 @@ class LanceDBSimilarityEngine(QObject):
 
         self.state.update_progress(0, 1, "Fetching image index from database...")
         try:
-            # <--- CHANGE START: Memory and Performance Optimization ---
             # 1. Fetch ONLY IDs first to build the index map. This is memory-light.
             id_arrow_table = self.table.to_lance().to_table(columns=["id"])
             point_ids = id_arrow_table.column("id").to_pylist()
@@ -380,7 +377,6 @@ class LanceDBSimilarityEngine(QObject):
             self.signals.log.emit(f"Error during batch neighbor search: {e}", "error")
             app_logger.error("Batch neighbor search failed", exc_info=True)
             return {}
-        # <--- CHANGE END ---
 
         if stop_event.is_set():
             return {}
