@@ -11,12 +11,12 @@ set "PYTHON_EXE=python"
 
 :: --- Argument Parsing ---
 :: [MODIFIED] We now use a flag that will be passed directly to the Python script.
-set "DEBUG_FLAG="
+set "DEBUG_FLAG=0"
 set "REINSTALL_MODE=0"
 set "DIAG_MODE=0"
 set "PROFILE_MODE=0"
 
-if /i "%1"=="debug" ( set "DEBUG_FLAG=--debug" && echo ** DEBUG MODE ACTIVATED ** && echo. )
+if /i "%1"=="debug" ( set "DEBUG_FLAG=1" && echo ** DEBUG MODE ACTIVATED ** && echo. )
 if /i "%1"=="reinstall" ( set "REINSTALL_MODE=1" && echo ** REINSTALL MODE ACTIVATED ** && echo. )
 if /i "%1"=="diag" ( set "DIAG_MODE=1" && echo ** DIAGNOSTIC MODE ACTIVATED ** && echo. )
 if /i "%1"=="profile" ( set "PROFILE_MODE=1" && echo ** PROFILING MODE ACTIVATED ** && echo. )

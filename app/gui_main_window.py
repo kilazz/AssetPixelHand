@@ -252,6 +252,7 @@ class App(QMainWindow):
 
         scan_opts = self.scan_options_panel
         scan_opts.exact_duplicates_check.toggled.connect(self._request_settings_save)
+        scan_opts.perceptual_duplicates_check.toggled.connect(self._request_settings_save)
         scan_opts.lancedb_in_memory_check.toggled.connect(self._request_settings_save)
         scan_opts.disk_thumbnail_cache_check.toggled.connect(self._on_thumbnail_cache_toggled)
         scan_opts.low_priority_check.toggled.connect(self._request_settings_save)
@@ -330,6 +331,7 @@ class App(QMainWindow):
                 scan_mode=opts.current_scan_mode,
                 device=perf.device_combo.currentData(),
                 find_exact_duplicates=scan_opts.exact_duplicates_check.isChecked(),
+                find_perceptual_duplicates=scan_opts.perceptual_duplicates_check.isChecked(),
                 lancedb_in_memory=scan_opts.lancedb_in_memory_check.isChecked(),
                 save_visuals=scan_opts.save_visuals_check.isChecked(),
                 max_visuals=int(scan_opts.max_visuals_entry.text()),
@@ -557,6 +559,7 @@ class App(QMainWindow):
             "show_transparency": viewer.bg_alpha_check.isChecked(),
             "selected_extensions": opts.selected_extensions,
             "find_exact_duplicates": scan_opts.exact_duplicates_check.isChecked(),
+            "find_perceptual_duplicates": scan_opts.perceptual_duplicates_check.isChecked(),
             "lancedb_in_memory": scan_opts.lancedb_in_memory_check.isChecked(),
             "disk_thumbnail_cache_enabled": scan_opts.disk_thumbnail_cache_check.isChecked(),
             "perf_low_priority": scan_opts.low_priority_check.isChecked(),

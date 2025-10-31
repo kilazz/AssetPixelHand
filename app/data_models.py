@@ -107,6 +107,7 @@ class ScanConfig:
     scan_mode: str
     device: str
     find_exact_duplicates: bool
+    find_perceptual_duplicates: bool
     lancedb_in_memory: bool
     visuals_columns: int
     model_info: dict = field(default_factory=dict)
@@ -129,6 +130,7 @@ class AppSettings:
     show_transparency: bool = True
     selected_extensions: list[str] = field(default_factory=list)
     find_exact_duplicates: bool = True
+    find_perceptual_duplicates: bool = True
     perf_model_workers: str = "1"
     perf_low_priority: bool = True
     perf_batch_size: str = "256"

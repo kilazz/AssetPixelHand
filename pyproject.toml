@@ -7,48 +7,48 @@ name = "AssetPixelHand"
 description = "An AI-powered tool for finding and managing duplicate and visually similar images."
 version = "1.0.0"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 license = "MIT"
 authors = [{ name = "kilazz"}]
 
 dependencies = [
     # Core Application & GUI
-    "PySide6",
-    # Utilities & OS Integration
-    "send2trash",
-    "pywin32; sys_platform == 'win32'", # Environment marker: install only on Windows
+    "PySide6>=6.10.0",
+    "send2trash>=1.8.3",
+    "pywin32>=311",
     # AI & Machine Learning
-    "torch",
-    "transformers",
-    "onnx",
-    "sentencepiece",
-    "huggingface_hub[hf_xet]",
+    "torch>=2.9.0",
+    "transformers>=4.57.1",
+    "onnx>=1.19.1",
+    "sentencepiece>=0.2.1",
+    "huggingface_hub[hf_xet]>=0.36.0", #transformers
     # Databases
-    "duckdb",
-    "lancedb",
+    "duckdb>=1.4.1",
+    "lancedb>=0.25.2",
     # Image & Data Handling
-    "scipy",
-    "pandas",
-    "pyarrow",
-    "numpy",
-    "xxhash",
-    "zstandard",
+    "scipy>=1.16.3",
+    "pandas>=2.3.3",
+    "pyarrow>=22.0.0",
+    "numpy>=2.2.6", #oiio-python
+    "xxhash>=3.6.0",
+    "ImageHash>=4.3.2",
+    "zstandard>=0.25.0",
     # Image Processing
-    "Pillow",
-    #"OpenImageIO",
-    "oiio-python", # Modern replacement for OpenImageIO
-    #"directxtex-decoder", # For DDS
+    "Pillow>=12.0.0",
+    #"OpenImageIO>=3.0.11.0",
+    "oiio-python>=3.0.10.0.1", #replacement OpenImageIO
+    #"directxtex-decoder", #For DDS
 ]
 
 [project.optional-dependencies]
-cpu = ["onnxruntime"]
-gpu = ["onnxruntime-directml"]
+cpu = ["onnxruntime>=1.23.2"]
+gpu = ["onnxruntime-directml>=1.23.0"]
 
 dev = [
-    "ruff",
-    "snakeviz",
-    "tabulate",
-    "types-oiio-python", # Type stubs for oiio-python
+    "ruff>=0.14.3",
+    "snakeviz>=2.2.2",
+    "tabulate2>=1.10.2",
+    "types-oiio-python>=3.0.10.0.1",
 ]
 
 [tool.ruff]
@@ -61,7 +61,7 @@ exclude = [
 ]
 
 line-length = 120
-target-version = "py312"
+target-version = "py313"
 
 [tool.ruff.lint]
 select = [

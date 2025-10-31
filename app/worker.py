@@ -10,11 +10,16 @@ import multiprocessing
 import os
 import time
 import traceback
+from multiprocessing import shared_memory
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 
+# --- MODIFICATION START: Import onnxruntime for I/O Binding ---
+import onnxruntime as ort
+
+# --- MODIFICATION END ---
 from app.constants import APP_DATA_DIR, DEEP_LEARNING_AVAILABLE, MODELS_DIR, WIN32_AVAILABLE
 from app.data_models import ImageFingerprint
 from app.utils import _load_image_static_cached, get_image_metadata
@@ -29,6 +34,7 @@ if TYPE_CHECKING:
 
 app_logger = logging.getLogger("AssetPixelHand.worker")
 g_inference_engine = None
+g_free_buffers_q = None
 
 
 def normalize_vectors_numpy(embeddings: np.ndarray) -> np.ndarray:
@@ -55,36 +61,24 @@ class InferenceEngine:
         self._load_onnx_model(model_dir, device)
 
     def _load_onnx_model(self, model_dir: Path, device: str):
-        import onnxruntime as ort
-
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        # --- MODIFICATION START: Correct provider list for DirectML/CPU ---
         providers = ["CPUExecutionProvider"]
         if device == "gpu":
             providers.insert(0, "DmlExecutionProvider")
+            # This option is specific to DirectML for FP16 performance
             if self.is_fp16 and hasattr(opts, "enable_float16_for_dml"):
                 opts.enable_float16_for_dml = True
+        # --- MODIFICATION END ---
+
         self.visual_session = ort.InferenceSession(str(model_dir / "visual.onnx"), opts, providers=providers)
         if (text_model_path := model_dir / "text.onnx").exists():
             self.text_session = ort.InferenceSession(str(text_model_path), opts, providers=providers)
             self.text_input_names = {i.name for i in self.text_session.get_inputs()}
+
         app_logger.info(f"Worker PID {os.getpid()}: ONNX models loaded on '{self.visual_session.get_providers()[0]}'")
-
-    def get_image_features(self, images: list) -> np.ndarray:
-        image_list_for_processor = [np.array(img.convert("RGB")) for img in images]
-        if not image_list_for_processor:
-            return np.array([])
-        inputs = self.processor(images=image_list_for_processor, return_tensors="np")
-        pixel_values = inputs.pixel_values.astype(np.float16 if self.is_fp16 else np.float32)
-
-        outputs = self.visual_session.run(None, {"pixel_values": pixel_values})
-        if not outputs or len(outputs) == 0:
-            app_logger.error("ONNX visual model returned empty output")
-            return np.array([])
-
-        app_logger.debug(f"Visual model outputs: {len(outputs)} tensors, shapes: {[o.shape for o in outputs]}")
-        embeddings = outputs[0]
-        return normalize_vectors_numpy(embeddings)
 
     def get_text_features(self, text: str) -> np.ndarray:
         if not self.text_session:
@@ -106,7 +100,6 @@ class InferenceEngine:
             app_logger.error("ONNX text model returned empty output")
             return np.array([])
 
-        app_logger.debug(f"Text model outputs: {len(outputs)} tensors, shapes: {[o.shape for o in outputs]}")
         embedding = outputs[0]
         return normalize_vectors_numpy(embedding).flatten()
 
@@ -124,6 +117,12 @@ def _init_worker_process(config: dict):
 
 def init_cpu_worker(config: dict):
     _init_worker_process(config)
+
+
+def init_cpu_worker_for_gpu_pipeline(config: dict, queue: "multiprocessing.Queue"):
+    global g_free_buffers_q
+    _init_worker_process(config)
+    g_free_buffers_q = queue
 
 
 def init_worker(config: dict):
@@ -161,13 +160,25 @@ def _process_batch_from_paths(
 
 
 def worker_wrapper_from_paths(paths: list[Path]) -> tuple[list[ImageFingerprint], list[tuple[str, str]]]:
+    # This is for the CPU-only pipeline, I/O Binding can be used here too for minor gains
     if g_inference_engine is None:
         return [], [(str(p), "Worker process not initialized") for p in paths]
     try:
         images, fps, skipped_tuples = _process_batch_from_paths(paths, g_inference_engine.input_size)
         if images:
-            embeddings = g_inference_engine.get_image_features(images)
+            image_list_for_processor = [np.array(img.convert("RGB")) for img in images]
+            inputs = g_inference_engine.processor(images=image_list_for_processor, return_tensors="np")
+            pixel_values = inputs.pixel_values.astype(np.float16 if g_inference_engine.is_fp16 else np.float32)
+
+            # Use I/O Binding for CPU path as well
+            io_binding = g_inference_engine.visual_session.io_binding()
+            io_binding.bind_cpu_input("pixel_values", pixel_values)
+            io_binding.bind_output("image_embeds")
+            g_inference_engine.visual_session.run_with_iobinding(io_binding)
+            embeddings = io_binding.get_outputs()[0].numpy()
+
             if embeddings.size > 0:
+                embeddings = normalize_vectors_numpy(embeddings)
                 for i, fp in enumerate(fps):
                     fp.hashes = embeddings[i].flatten()
         return fps, skipped_tuples
@@ -177,58 +188,112 @@ def worker_wrapper_from_paths(paths: list[Path]) -> tuple[list[ImageFingerprint]
         return [], [(str(p), error_message) for p in paths]
 
 
-def worker_wrapper_from_paths_cpu(paths: list[Path], model_name: str) -> tuple:
+def worker_wrapper_from_paths_cpu_shared_mem(paths: list[Path], model_name: str, buffer_shape, dtype) -> tuple:
+    global g_free_buffers_q
+    if g_free_buffers_q is None:
+        raise RuntimeError("Worker queue not initialized. The initializer function was likely not called.")
     try:
         from transformers import AutoProcessor
 
         proc = AutoProcessor.from_pretrained(MODELS_DIR / model_name)
-        image_proc = getattr(proc, "image_processor", proc)
-        size_cfg = getattr(image_proc, "size", {}) or getattr(image_proc, "crop_size", {})
-        input_size = (size_cfg["height"], size_cfg["width"]) if "height" in size_cfg else (224, 224)
+        input_size = (buffer_shape[2], buffer_shape[3])
         images, fps, skipped_tuples = _process_batch_from_paths(paths, input_size)
         if not images:
             return None, [], skipped_tuples
         np_images = [np.array(img.convert("RGB")) for img in images]
         pixel_values = proc(images=np_images, return_tensors="np").pixel_values
-        return pixel_values.astype(np.float16 if "_fp16" in model_name.lower() else np.float32), fps, skipped_tuples
+        shm_name = g_free_buffers_q.get()
+        existing_shm = shared_memory.SharedMemory(name=shm_name)
+        shared_array = np.ndarray(buffer_shape, dtype=dtype, buffer=existing_shm.buf)
+        current_batch_size = pixel_values.shape[0]
+        shared_array[:current_batch_size] = pixel_values.astype(dtype)
+        meta_message = {
+            "shm_name": shm_name,
+            "shape": (current_batch_size, *buffer_shape[1:]),
+            "dtype": dtype,
+        }
+        existing_shm.close()
+        return meta_message, fps, skipped_tuples
     except Exception as e:
-        _log_worker_crash(e, "worker_wrapper_from_paths_cpu")
+        _log_worker_crash(e, "worker_wrapper_from_paths_cpu_shared_mem")
         error_message = f"Batch failed in worker: {type(e).__name__}"
         return None, [], [(str(p), error_message) for p in paths]
 
 
-def inference_worker_loop(config: dict, tensor_q: "multiprocessing.Queue", results_q: "multiprocessing.Queue"):
+def inference_worker_loop(
+    config: dict,
+    tensor_q: "multiprocessing.Queue",
+    results_q: "multiprocessing.Queue",
+    free_buffers_q: "multiprocessing.Queue",
+):
     init_worker(config)
     if g_inference_engine is None:
         results_q.put(None)
         return
-    while True:
-        try:
+
+    # Create the I/O Binding object once, outside the loop
+    io_binding = g_inference_engine.visual_session.io_binding()
+    shm_name = None
+
+    try:
+        while True:
             item = tensor_q.get()
             if item is None:
                 results_q.put(None)
                 break
-            pixel_values, fps, skipped_tuples = item
+
+            meta_message, fps, skipped_tuples = item
+            pixel_values = None
+            shm_name = None  # Reset shm_name for each iteration
+
+            if meta_message:
+                shm_name = meta_message["shm_name"]
+                shape = meta_message["shape"]
+                dtype = meta_message["dtype"]
+
+                existing_shm = shared_memory.SharedMemory(name=shm_name)
+                shared_array = np.ndarray(shape, dtype=dtype, buffer=existing_shm.buf)
+                pixel_values = np.copy(shared_array)
+                existing_shm.close()
+
             if pixel_values is not None and pixel_values.size > 0:
-                outputs = g_inference_engine.visual_session.run(None, {"pixel_values": pixel_values})
-                if not outputs or len(outputs) == 0:
-                    app_logger.error("Inference worker: model returned empty output")
+                # --- I/O BINDING IMPLEMENTATION for DirectML/CPU ---
+                # 1. Bind the input NumPy array from CPU RAM. ORT will handle copying it to the GPU.
+                io_binding.bind_cpu_input("pixel_values", pixel_values)
+
+                # 2. Bind the output. We tell ORT to manage memory for the output on the active device (GPU or CPU).
+                io_binding.bind_output("image_embeds")
+
+                # 3. Run inference with the bindings.
+                g_inference_engine.visual_session.run_with_iobinding(io_binding)
+
+                # 4. Get the results as an OrtValue.
+                outputs = io_binding.get_outputs()
+
+                # 5. Copy the result to a NumPy array in CPU RAM for further processing.
+                embeddings = outputs[0].numpy()
+                # --- END OF I/O BINDING IMPLEMENTATION ---
+
+                if embeddings is None or embeddings.size == 0:
+                    app_logger.error("Inference worker: model returned empty output via I/O Binding")
                     for fp in fps:
                         skipped_tuples.append((str(fp.path), "Inference returned empty output"))
                     results_q.put(([], skipped_tuples))
                     continue
 
-                embeddings = outputs[0]
                 embeddings = normalize_vectors_numpy(embeddings)
                 for i, data in enumerate(fps):
                     data.hashes = embeddings[i].flatten()
                 results_q.put((fps, skipped_tuples))
             elif fps or skipped_tuples:
                 results_q.put(([], skipped_tuples))
-        except Exception as e:
-            _log_worker_crash(e, "inference_worker_loop")
-            results_q.put(None)
-            break
+    except Exception as e:
+        _log_worker_crash(e, "inference_worker_loop")
+        results_q.put(None)
+    finally:
+        # Important: always return the buffer to the pool
+        if shm_name:
+            free_buffers_q.put(shm_name)
 
 
 def _log_worker_crash(e: Exception, context: str):
@@ -249,7 +314,18 @@ def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
             app_logger.warning(f"Failed to process single vector for {image_path}: {skipped_tuples[0][1]}")
             return None
         if images:
-            return g_inference_engine.get_image_features(images).flatten()
+            io_binding = g_inference_engine.visual_session.io_binding()
+            image_list = [np.array(img.convert("RGB")) for img in images]
+            pixel_values = g_inference_engine.processor(images=image_list, return_tensors="np").pixel_values
+
+            io_binding.bind_cpu_input(
+                "pixel_values", pixel_values.astype(np.float16 if g_inference_engine.is_fp16 else np.float32)
+            )
+            io_binding.bind_output("image_embeds")
+            g_inference_engine.visual_session.run_with_iobinding(io_binding)
+            embedding = io_binding.get_outputs()[0].numpy()
+            return normalize_vectors_numpy(embedding).flatten()
+
     except Exception as e:
         _log_worker_crash(e, "worker_get_single_vector")
     return None

@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMenu,
@@ -306,7 +307,12 @@ class ScanOptionsPanel(QGroupBox):
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
-        self.exact_duplicates_check = QCheckBox("First find exact duplicates (faster)")
+        self.exact_duplicates_check = QCheckBox("First find exact duplicates (xxHash)")
+        self.perceptual_duplicates_check = QCheckBox("Also find near-identical images (pHash)")
+        self.perceptual_duplicates_check.setToolTip(
+            "Finds images that look the same but have different formats, sizes, or compression levels.\n"
+            "Slightly slower, but significantly reduces the number of files for AI processing."
+        )
         self.lancedb_in_memory_check = QCheckBox("Use in-memory database (fastest)")
         self.lancedb_in_memory_check.setToolTip("Stores the vector index in RAM. Fastest, but not persistent.")
         self.disk_thumbnail_cache_check = QCheckBox("Enable persistent thumbnail cache")
@@ -316,25 +322,27 @@ class ScanOptionsPanel(QGroupBox):
         self.low_priority_check = QCheckBox("Run scan at lower priority")
 
         visuals_layout = QHBoxLayout()
-        self.save_visuals_check = QCheckBox("Save visualizations")
+        self.save_visuals_check = QCheckBox("Save visuals")
 
         self.max_visuals_entry = QLineEdit()
         self.max_visuals_entry.setValidator(QIntValidator(0, 9999))
-        self.max_visuals_entry.setFixedWidth(40)
+        self.max_visuals_entry.setFixedWidth(50)  # Slightly increased width
 
         self.visuals_columns_spinbox = QSpinBox()
         self.visuals_columns_spinbox.setRange(2, 12)
-        self.visuals_columns_spinbox.setFixedWidth(40)
+        self.visuals_columns_spinbox.setFixedWidth(45)  # Slightly increased width
 
         self.open_visuals_folder_button = QPushButton("📂")
         self.open_visuals_folder_button.setToolTip("Open visualizations folder")
         self.open_visuals_folder_button.setFixedWidth(35)
 
         visuals_layout.addWidget(self.save_visuals_check)
-        visuals_layout.addStretch()
+        visuals_layout.addStretch()  # Pushes all options to the right
 
-        visuals_layout.addWidget(QLabel("Columns:"))
+        visuals_layout.addWidget(QLabel("Cols:"))  # Shortened label
         visuals_layout.addWidget(self.visuals_columns_spinbox)
+
+        visuals_layout.addSpacing(10)  # Add a small fixed space
 
         visuals_layout.addWidget(QLabel("Max:"))
         visuals_layout.addWidget(self.max_visuals_entry)
@@ -342,18 +350,32 @@ class ScanOptionsPanel(QGroupBox):
         visuals_layout.addWidget(self.open_visuals_folder_button)
 
         layout.addWidget(self.exact_duplicates_check)
+        layout.addWidget(self.perceptual_duplicates_check)
         layout.addWidget(self.lancedb_in_memory_check)
         layout.addWidget(self.disk_thumbnail_cache_check)
         layout.addWidget(self.low_priority_check)
         layout.addLayout(visuals_layout)
 
+        self.exact_duplicates_check.toggled.connect(self._update_phash_state)
+        self._update_phash_state(self.exact_duplicates_check.isChecked())
+
     def _connect_signals(self):
         self.save_visuals_check.toggled.connect(self.toggle_visuals_option)
         self.open_visuals_folder_button.clicked.connect(self._open_visuals_folder)
 
+    @Slot(bool)
+    def _update_phash_state(self, is_exact_checked: bool):
+        """pHash should only be enabled if xxHash is also enabled."""
+        self.perceptual_duplicates_check.setEnabled(is_exact_checked)
+        if not is_exact_checked:
+            self.perceptual_duplicates_check.setChecked(False)
+
     def toggle_visuals_option(self, is_checked):
-        for i in range(1, self.layout().itemAt(4).layout().count()):
-            widget = self.layout().itemAt(4).layout().itemAt(i).widget()
+        visuals_layout_item = self.layout().itemAt(6)
+        if visuals_layout_item is None:
+            return
+        for i in range(1, visuals_layout_item.layout().count()):
+            widget = visuals_layout_item.layout().itemAt(i).widget()
             if widget:
                 widget.setVisible(is_checked)
 
@@ -369,6 +391,8 @@ class ScanOptionsPanel(QGroupBox):
 
     def load_settings(self, s: AppSettings):
         self.exact_duplicates_check.setChecked(s.find_exact_duplicates)
+        self.perceptual_duplicates_check.setChecked(s.find_perceptual_duplicates)
+        self._update_phash_state(s.find_exact_duplicates)
         self.lancedb_in_memory_check.setChecked(s.lancedb_in_memory)
         self.disk_thumbnail_cache_check.setChecked(s.disk_thumbnail_cache_enabled)
         self.low_priority_check.setChecked(s.perf_low_priority)
@@ -736,9 +760,11 @@ class ResultsPanel(QGroupBox):
                 self.results_model.sort_results(self.sort_combo.currentText())
 
             def resize_cols():
-                for i in range(self.proxy_model.columnCount()):
-                    self.results_view.resizeColumnToContents(i)
-                self.results_view.header().setStretchLastSection(True)
+                header = self.results_view.header()
+                header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+                header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+                header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+                header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
 
             QTimer.singleShot(50, resize_cols)
         self.set_enabled_state(num_found > 0)

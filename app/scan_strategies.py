@@ -14,7 +14,15 @@ from pathlib import Path
 import duckdb
 import numpy as np
 import xxhash
+from PIL import Image
 from PySide6.QtCore import QThreadPool
+
+try:
+    import imagehash
+
+    IMAGEHASH_AVAILABLE = True
+except ImportError:
+    IMAGEHASH_AVAILABLE = False
 
 from app.constants import RESULTS_DB_FILE
 from app.data_models import DuplicateResults, ImageFingerprint, ScanConfig, ScannerSignals, ScanState
@@ -59,11 +67,13 @@ class ScanStrategy(ABC):
         return files
 
     def _generate_fingerprints(
-        self, files: list[Path], stop_event: threading.Event, phase_count: int
+        self, files: list[Path], stop_event: threading.Event, phase_count: int, current_phase: int, weight: float
     ) -> tuple[bool, list[str]]:
         """Runs the AI fingerprinting engine on the given files."""
-        phase_num = 3 if self.config.find_exact_duplicates and self.config.scan_mode == "duplicates" else 2
-        self.state.set_phase(f"Phase {phase_num}/{phase_count}: Creating AI fingerprints...", 0.6)
+        self.state.set_phase(f"Phase {current_phase}/{phase_count}: Creating AI fingerprints...", weight)
+        if not files:
+            self.signals.log.emit("No new unique images found for AI processing.", "info")
+            return True, []
         fp_engine = FingerprintEngine(self.config, self.state, self.signals, self.table)
         success, skipped_paths_only = fp_engine.process_all(files, stop_event)
         self.all_skipped_files.extend(skipped_paths_only)
@@ -131,48 +141,78 @@ class ScanStrategy(ABC):
 
 
 class FindDuplicatesStrategy(ScanStrategy):
-    """Strategy for finding duplicate and similar images."""
+    """Strategy for finding duplicate and similar images using a multi-stage filtering approach."""
 
     def __init__(self, *args):
         super().__init__(*args)
         self.hash_map = defaultdict(list)
 
     def execute(self, stop_event: threading.Event, start_time: float):
-        phase_count = 4 if self.config.find_exact_duplicates else 3
+        phase_count = 1
+        weights = [0.1]
+        if self.config.find_exact_duplicates:
+            phase_count += 1
+            weights.append(0.1)
+        if self.config.find_perceptual_duplicates:
+            phase_count += 1
+            weights.append(0.15)
+        phase_count += 2
+        weights.extend([0.5, 0.15])
+
+        current_phase = 1
 
         all_files = self._find_files(stop_event, phase_count)
         if self.scanner_core._check_stop_or_empty(stop_event, all_files, "duplicates", [], start_time):
             return
 
-        exact_groups, files_for_ai = self._find_exact_duplicates(all_files, stop_event, phase_count)
-        if stop_event.is_set():
-            return
+        files_for_next_step = all_files
+        exact_groups: DuplicateResults = {}
+        phash_groups: DuplicateResults = {}
 
-        success, _ = self._generate_fingerprints(files_for_ai, stop_event, phase_count)
+        if self.config.find_exact_duplicates:
+            current_phase += 1
+            exact_groups, files_for_next_step = self._find_exact_duplicates(
+                files_for_next_step, stop_event, phase_count, current_phase
+            )
+            if stop_event.is_set():
+                return
+
+        if self.config.find_perceptual_duplicates:
+            current_phase += 1
+            phash_groups, files_for_next_step = self._find_perceptual_duplicates(
+                files_for_next_step, stop_event, phase_count, current_phase
+            )
+            if stop_event.is_set():
+                return
+
+        current_phase += 1
+        ai_weight = 1.0 - sum(weights) if len(weights) == phase_count else 0.5
+        success, _ = self._generate_fingerprints(files_for_next_step, stop_event, phase_count, current_phase, ai_weight)
+
         if not success:
             if not stop_event.is_set():
-                self._report_and_cleanup(exact_groups, start_time)
+                final_groups = self._finalize_all_results(exact_groups, phash_groups, {})
+                self._report_and_cleanup(final_groups, start_time)
             return
 
-        self.state.set_phase(f"Phase {phase_count}/{phase_count}: Finding similar images...", 0.15)
+        current_phase += 1
+        self.state.set_phase(f"Phase {current_phase}/{phase_count}: Finding similar images (AI)...", weights[-1])
         sim_engine = LanceDBSimilarityEngine(self.state, self.signals, self.config, self.table)
         similar_groups = sim_engine.find_similar_groups(stop_event)
         if stop_event.is_set():
             return
 
-        final_groups = self._finalize_results(exact_groups, similar_groups)
+        final_groups = self._finalize_all_results(exact_groups, phash_groups, similar_groups)
         self._report_and_cleanup(final_groups, start_time)
 
     def _find_exact_duplicates(
-        self, all_files: list[Path], stop_event: threading.Event, phase_count: int
+        self, files: list[Path], stop_event: threading.Event, phase_count: int, current_phase: int
     ) -> tuple[DuplicateResults, list[Path]]:
-        """Identifies exact duplicates by hashing and separates unique files."""
-        if not self.config.find_exact_duplicates:
-            return {}, all_files
-        self.state.set_phase(f"Phase 2/{phase_count}: Finding exact duplicates...", 0.2)
-        self.state.update_progress(0, len(all_files), "Hashing files...")
+        """Identifies exact duplicates by hashing and returns the remaining unique files."""
+        self.state.set_phase(f"Phase {current_phase}/{phase_count}: Finding exact duplicates (xxHash)...", 0.1)
+        self.state.update_progress(0, len(files), "Hashing files...")
         self.hash_map.clear()
-        for i, file_path in enumerate(all_files):
+        for i, file_path in enumerate(files):
             if stop_event.is_set():
                 return {}, []
             try:
@@ -184,53 +224,98 @@ class FindDuplicatesStrategy(ScanStrategy):
             except OSError as e:
                 self.signals.log.emit(f"Could not hash {file_path.name}: {e}", "warning")
                 self.all_skipped_files.append(str(file_path))
-            self.state.update_progress(i + 1, len(all_files))
+            self.state.update_progress(i + 1, len(files))
 
-        exact_groups, unique_files_for_ai = {}, []
+        exact_groups: DuplicateResults = {}
+        unique_files: list[Path] = []
         for paths in self.hash_map.values():
             if len(paths) > 1:
                 group_fps = [fp for fp in (self._create_dummy_fp(p) for p in paths) if fp]
                 if group_fps:
                     best_fp = find_best_in_group(group_fps)
                     exact_groups[best_fp] = {(fp, 100) for fp in group_fps if fp != best_fp}
-                    unique_files_for_ai.append(best_fp.path)
+                    unique_files.append(best_fp.path)
             elif paths:
-                unique_files_for_ai.append(paths[0])
-        return exact_groups, unique_files_for_ai
+                unique_files.append(paths[0])
+        return exact_groups, unique_files
 
-    def _finalize_results(self, exact_groups: DuplicateResults, similar_groups: DuplicateResults) -> DuplicateResults:
-        """Merges exact and similar duplicate groups without losing any files."""
-        self.state.set_phase("Finalizing results...", 0.0)
+    def _find_perceptual_duplicates(
+        self, files: list[Path], stop_event: threading.Event, phase_count: int, current_phase: int
+    ) -> tuple[DuplicateResults, list[Path]]:
+        """Identifies visually identical images using perceptual hashing."""
+        if not IMAGEHASH_AVAILABLE:
+            self.signals.log.emit("`imagehash` library not found. Skipping pHash step.", "warning")
+            return {}, files
+
+        self.state.set_phase(f"Phase {current_phase}/{phase_count}: Finding near-identical images (pHash)...", 0.15)
+        self.state.update_progress(0, len(files), "Computing perceptual hashes...")
+
+        phash_map = defaultdict(list)
+        for i, path in enumerate(files):
+            if stop_event.is_set():
+                return {}, []
+            try:
+                with Image.open(path) as img:
+                    phash = imagehash.phash(img)
+                    phash_map[phash].append(path)
+            except Exception:
+                phash_map[str(path)].append(path)
+            self.state.update_progress(i + 1, len(files))
+
+        phash_groups: DuplicateResults = {}
+        files_for_ai: list[Path] = []
+        for paths in phash_map.values():
+            if len(paths) > 1:
+                group_fps = [fp for fp in (self._create_dummy_fp(p) for p in paths) if fp]
+                if group_fps:
+                    best_fp = find_best_in_group(group_fps)
+                    phash_groups[best_fp] = {(fp, 100) for fp in group_fps if fp != best_fp}
+                    files_for_ai.append(best_fp.path)
+            elif paths:
+                files_for_ai.append(paths[0])
+
+        return phash_groups, files_for_ai
+
+    def _finalize_all_results(
+        self, exact_groups: DuplicateResults, phash_groups: DuplicateResults, similar_groups: DuplicateResults
+    ) -> DuplicateResults:
+        """Merges exact, perceptual, and AI-based duplicate groups intelligently."""
+        self.state.set_phase("Finalizing and merging all results...", 0.0)
+
         final_groups = similar_groups.copy()
-        fp_to_group_map = {}
+
+        fp_to_ai_group_leader: dict[ImageFingerprint, ImageFingerprint] = {}
         for best_fp, dups_set in final_groups.items():
-            fp_to_group_map[best_fp] = best_fp
+            fp_to_ai_group_leader[best_fp] = best_fp
             for fp, _ in dups_set:
-                fp_to_group_map[fp] = best_fp
-        for best_exact_fp, exact_dups_set in exact_groups.items():
-            if best_exact_fp in fp_to_group_map:
-                ai_group_best_fp = fp_to_group_map[best_exact_fp]
-                final_groups[ai_group_best_fp].update(exact_dups_set)
-            else:
-                final_groups[best_exact_fp] = exact_dups_set
+                fp_to_ai_group_leader[fp] = best_fp
+
+        def merge_into_final(groups_to_merge: DuplicateResults):
+            for best_fp, dups_set in groups_to_merge.items():
+                all_fps_in_group = [best_fp] + [fp for fp, _ in dups_set]
+
+                existing_leader = None
+                for fp in all_fps_in_group:
+                    if fp in fp_to_ai_group_leader:
+                        existing_leader = fp_to_ai_group_leader[fp]
+                        break
+
+                if existing_leader:
+                    final_groups[existing_leader].update(dups_set)
+                    if best_fp != existing_leader:
+                        final_groups[existing_leader].add((best_fp, 100))
+                else:
+                    final_groups[best_fp] = dups_set
+
+        merge_into_final(phash_groups)
+        merge_into_final(exact_groups)
+
         return final_groups
 
     def _report_and_cleanup(self, final_groups: DuplicateResults, start_time: float):
         """Saves results, generates visualizations, and finalizes the scan."""
         num_found = sum(len(dups) for dups in final_groups.values())
         duration = time.time() - start_time
-
-        path_to_hash = {p.resolve().as_posix(): h for h, paths in self.hash_map.items() for p in paths}
-        successful_hashes = {
-            path_to_hash.get(best_fp.path.resolve().as_posix())
-            for best_fp in final_groups
-            if path_to_hash.get(best_fp.path.resolve().as_posix())
-        }
-        self.all_skipped_files = [
-            p
-            for p in set(self.all_skipped_files)
-            if path_to_hash.get(Path(p).resolve().as_posix()) not in successful_hashes
-        ]
 
         if num_found > 0:
             self._save_results_to_db(final_groups)
@@ -255,7 +340,7 @@ class SearchStrategy(ScanStrategy):
         if self.scanner_core._check_stop_or_empty(stop_event, all_files, self.config.scan_mode, [], start_time):
             return
 
-        success, _ = self._generate_fingerprints(all_files, stop_event, phase_count)
+        success, _ = self._generate_fingerprints(all_files, stop_event, 2, 2, 0.8)
         if not success:
             if not stop_event.is_set():
                 self.signals.error.emit("Failed to generate fingerprints.")
