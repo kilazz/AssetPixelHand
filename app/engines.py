@@ -169,7 +169,6 @@ class FingerprintEngine(QObject):
                 initializer=worker.init_cpu_worker_for_gpu_pipeline,
                 initargs=(init_cfg, free_buffers_q),
             ) as pool:
-
                 def data_gen(files: list[Path], batch_size: int):
                     for i in range(0, len(files), batch_size):
                         if stop_event.is_set():
@@ -349,7 +348,12 @@ class LanceDBSimilarityEngine(QObject):
                 batch_vectors = np.array(batch.column("vector").to_pylist())
 
                 # 3. Perform a single, efficient batch search query for all vectors in the batch.
-                batch_hits = self.table.search(batch_vectors).limit(self.K_NEIGHBORS).nprobes(self.nprobes).to_pandas()
+                batch_hits = (
+                    self.table.search(batch_vectors)
+                    .limit(self.K_NEIGHBORS)
+                    .nprobes(self.nprobes)
+                    .to_pandas()
+                )
 
                 # 4. Process the combined results from the batch search.
                 # We group by the original query to associate hits with their source.
@@ -372,7 +376,7 @@ class LanceDBSimilarityEngine(QObject):
                             rows.append(source_idx)
                             cols.append(target_idx)
                             data.append(distance)
-
+                
                 total_processed += len(batch_vectors)
                 self.state.update_progress(total_processed, num_points)
 

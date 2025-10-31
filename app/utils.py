@@ -91,8 +91,6 @@ class SizeLimitedLRUCache:
         return wrapper
 
 
-# This cache is intended ONLY for single-process use, like the GUI thumbnail loaders.
-# DO NOT use it in multiprocessing workers.
 image_loader_cache = SizeLimitedLRUCache(max_size_mb=1024)
 
 
@@ -202,14 +200,11 @@ def _load_image_core(
     return None
 
 
-# CRITICAL FIX: The @image_loader_cache decorator was removed.
-# This function is called by multiprocessing workers. The cache is NOT process-safe
-# and was causing a massive memory leak, as each worker process maintained its own
-# separate, large cache in RAM, leading to system memory exhaustion.
+@image_loader_cache
 def _load_image_static_cached(
     path_or_buffer: str | Path | io.BytesIO, target_size: tuple[int, int] | None = None, tonemap_mode: str = "none"
 ) -> Image.Image | None:
-    """Wrapper for the core image loading function, used by worker processes."""
+    """Cached wrapper for the core image loading function."""
     return _load_image_core(path_or_buffer, target_size, tonemap_mode)
 
 
