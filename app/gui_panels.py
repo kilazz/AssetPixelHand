@@ -40,9 +40,11 @@ from PySide6.QtWidgets import (
 from app.constants import (
     ALL_SUPPORTED_EXTENSIONS,
     DEEP_LEARNING_AVAILABLE,
+    DEFAULT_SEARCH_PRECISION,
     DIRECTXTEX_AVAILABLE,
     OIIO_AVAILABLE,
     SCRIPT_DIR,
+    SEARCH_PRECISION_PRESETS,
     SUPPORTED_MODELS,
     VISUALS_DIR,
     CompareMode,
@@ -326,23 +328,23 @@ class ScanOptionsPanel(QGroupBox):
 
         self.max_visuals_entry = QLineEdit()
         self.max_visuals_entry.setValidator(QIntValidator(0, 9999))
-        self.max_visuals_entry.setFixedWidth(50)  # Slightly increased width
+        self.max_visuals_entry.setFixedWidth(50)
 
         self.visuals_columns_spinbox = QSpinBox()
         self.visuals_columns_spinbox.setRange(2, 12)
-        self.visuals_columns_spinbox.setFixedWidth(45)  # Slightly increased width
+        self.visuals_columns_spinbox.setFixedWidth(45)
 
         self.open_visuals_folder_button = QPushButton("📂")
         self.open_visuals_folder_button.setToolTip("Open visualizations folder")
         self.open_visuals_folder_button.setFixedWidth(35)
 
         visuals_layout.addWidget(self.save_visuals_check)
-        visuals_layout.addStretch()  # Pushes all options to the right
+        visuals_layout.addStretch()
 
-        visuals_layout.addWidget(QLabel("Cols:"))  # Shortened label
+        visuals_layout.addWidget(QLabel("Cols:"))
         visuals_layout.addWidget(self.visuals_columns_spinbox)
 
-        visuals_layout.addSpacing(10)  # Add a small fixed space
+        visuals_layout.addSpacing(10)
 
         visuals_layout.addWidget(QLabel("Max:"))
         visuals_layout.addWidget(self.max_visuals_entry)
@@ -365,7 +367,6 @@ class ScanOptionsPanel(QGroupBox):
 
     @Slot(bool)
     def _update_phash_state(self, is_exact_checked: bool):
-        """pHash should only be enabled if xxHash is also enabled."""
         self.perceptual_duplicates_check.setEnabled(is_exact_checked)
         if not is_exact_checked:
             self.perceptual_duplicates_check.setChecked(False)
@@ -430,9 +431,14 @@ class PerformancePanel(QGroupBox):
         layout.addRow("Batch Size:", self.batch_size_spin)
         self.search_precision_combo = QComboBox()
         layout.addRow("Search Precision:", self.search_precision_combo)
+
         self.cpu_workers_spin = QSpinBox()
         self.cpu_workers_spin.setRange(1, (multiprocessing.cpu_count() or 1) * 2)
         layout.addRow("CPU Model Workers:", self.cpu_workers_spin)
+
+        self.gpu_preproc_workers_spin = QSpinBox()
+        self.gpu_preproc_workers_spin.setRange(1, (multiprocessing.cpu_count() or 1) * 2)
+        layout.addRow("CPU Preprocessing Workers:", self.gpu_preproc_workers_spin)
 
     def _detect_and_setup_devices(self):
         self.device_combo.addItem("CPU", "cpu")
@@ -450,23 +456,30 @@ class PerformancePanel(QGroupBox):
     @Slot(str)
     def _on_device_change(self, device_key: str):
         is_cpu = device_key == "cpu"
+
         self.cpu_workers_spin.setVisible(is_cpu)
         self.layout().labelForField(self.cpu_workers_spin).setVisible(is_cpu)
+
+        self.gpu_preproc_workers_spin.setVisible(not is_cpu)
+        self.layout().labelForField(self.gpu_preproc_workers_spin).setVisible(not is_cpu)
+
         self.device_changed.emit(is_cpu)
 
     @Slot(str)
     def update_precision_presets(self, scan_mode: str):
         self.search_precision_combo.blockSignals(True)
         self.search_precision_combo.clear()
-        presets = (
-            ["Fast", "Balanced (Default)", "Thorough"]
-            if scan_mode == "duplicates"
-            else ["Fast", "Balanced (Default)", "Exhaustive (Slow)"]
-        )
+
+        all_presets = list(SEARCH_PRECISION_PRESETS.keys())
+        presets = [p for p in all_presets if "Exhaustive" not in p] if scan_mode == "duplicates" else all_presets
         self.search_precision_combo.addItems(presets)
-        self.search_precision_combo.setCurrentText(
-            self.settings.search_precision if self.settings.search_precision in presets else "Balanced (Default)"
-        )
+
+        current_setting = self.settings.search_precision
+        if current_setting in presets:
+            self.search_precision_combo.setCurrentText(current_setting)
+        else:
+            self.search_precision_combo.setCurrentText(DEFAULT_SEARCH_PRECISION)
+
         self.search_precision_combo.blockSignals(False)
 
     def get_selected_quantization(self) -> QuantizationMode:
@@ -477,6 +490,7 @@ class PerformancePanel(QGroupBox):
         self.batch_size_spin.setValue(int(s.perf_batch_size))
         self.search_precision_combo.setCurrentText(s.search_precision)
         self.cpu_workers_spin.setValue(int(s.perf_model_workers))
+        self.gpu_preproc_workers_spin.setValue(int(getattr(s, "perf_gpu_preproc_workers", 4)))
 
 
 class SystemStatusPanel(QGroupBox):
@@ -1017,7 +1031,6 @@ class ImageViewerPanel(QGroupBox):
 
     @Slot(list)
     def display_results(self, items: list):
-        """Receives a list of result items and displays them."""
         self.model.set_items_from_list(items)
         self._back_to_list_view()
         QTimer.singleShot(50, self.update_timer.start)
@@ -1039,7 +1052,6 @@ class ImageViewerPanel(QGroupBox):
         self._on_transparency_toggled(settings.show_transparency)
 
     def clear_viewer(self):
-        """Clears the viewer and resets it to the default list view state."""
         self.update_timer.stop()
         self.model.set_items_from_list([])
         self.current_group_id = None

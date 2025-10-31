@@ -265,6 +265,7 @@ class App(QMainWindow):
         perf.quant_combo.currentIndexChanged.connect(self._request_settings_save)
         perf.search_precision_combo.currentIndexChanged.connect(self._request_settings_save)
         perf.cpu_workers_spin.valueChanged.connect(self._request_settings_save)
+        perf.gpu_preproc_workers_spin.valueChanged.connect(self._request_settings_save)
         perf.batch_size_spin.valueChanged.connect(self._request_settings_save)
 
         viewer = self.viewer_panel
@@ -341,6 +342,7 @@ class App(QMainWindow):
                 sample_path=opts._sample_path,
                 perf=PerformanceConfig(
                     model_workers=perf.cpu_workers_spin.value(),
+                    gpu_preproc_workers=perf.gpu_preproc_workers_spin.value(),
                     run_at_low_priority=scan_opts.low_priority_check.isChecked(),
                     batch_size=perf.batch_size_spin.value(),
                 ),
@@ -567,6 +569,7 @@ class App(QMainWindow):
             "max_visuals": scan_opts.max_visuals_entry.text(),
             "visuals_columns": scan_opts.visuals_columns_spinbox.value(),
             "perf_model_workers": perf.cpu_workers_spin.text(),
+            "perf_gpu_preproc_workers": perf.gpu_preproc_workers_spin.text(),
             "perf_batch_size": perf.batch_size_spin.text(),
             "search_precision": perf.search_precision_combo.currentText(),
             "device": perf.device_combo.currentText(),

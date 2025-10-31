@@ -56,8 +56,7 @@ DB_WRITE_BATCH_SIZE = 8192
 CACHE_VERSION = "v4"
 
 # --- Supported File Formats ---
-# This list is based on the libraries confirmed to be bundled with the oiio-python package
-# and other core dependencies. It ensures maximum out-of-the-box compatibility.
+# This list is based on the libraries confirmed to be bundled with core dependencies.
 _main_supported_ext = [
     # Standard Web & Raster Formats
     ".avif",
@@ -90,7 +89,7 @@ _main_supported_ext = [
 
 # Note: The following formats require system-level libraries NOT bundled with dependencies
 # and are therefore EXCLUDED by default to ensure stability.
-# To enable them, the user must manually install the required libraries (e.g., LibRaw, librsvg).
+# To enable them, the user must manually install the required libraries.
 # ".svg"     # Requires 'librsvg'
 # ".cr2", ".nef", ".arw", ".dng" # Requires 'libraw'
 # ".mov", ".mp4" # Requires 'ffmpeg'
@@ -154,19 +153,15 @@ def _load_models_config() -> dict:
             with open(MODELS_CONFIG_FILE, encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError) as e:
-            # The file is present but corrupted or unreadable. Fall back to defaults.
             print(f"Warning: Could not load 'models.json': {e}. Falling back to default models.")
             return default_models
     else:
-        # The file does not exist. Create it with default values.
         try:
             with open(MODELS_CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(default_models, f, indent=4)
         except OSError as e:
-            # Could not create the file (e.g., permissions issue). Use defaults for this session.
             print(f"Warning: Could not create 'models.json': {e}. Using default models for this session.")
 
-        # Return the default models for the first run
         return default_models
 
 
@@ -190,6 +185,16 @@ class UIConfig:
         ALPHA_LABEL_WIDTH = 30
         PREVIEW_MIN_SIZE = 100
         PREVIEW_MAX_SIZE = 500
+
+
+# --- Search Configuration ---
+SEARCH_PRECISION_PRESETS = {
+    "Fast": {"nprobes": 10, "refine_factor": 1},
+    "Balanced (Default)": {"nprobes": 20, "refine_factor": 2},
+    "Thorough": {"nprobes": 40, "refine_factor": 5},
+    "Exhaustive (Slow)": {"nprobes": 256, "refine_factor": 10},
+}
+DEFAULT_SEARCH_PRECISION = "Balanced (Default)"
 
 
 class CompareMode(Enum):

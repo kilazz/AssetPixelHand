@@ -12,10 +12,12 @@ import time
 import traceback
 from multiprocessing import shared_memory
 from pathlib import Path
-from typing import TYPE_CHECKING
+from queue import Empty
+from typing import TYPE_CHECKING, Union
 
 import numpy as np
 import onnxruntime as ort
+import xxhash
 
 from app.constants import APP_DATA_DIR, DEEP_LEARNING_AVAILABLE, MODELS_DIR, WIN32_AVAILABLE
 from app.data_models import ImageFingerprint
@@ -27,10 +29,11 @@ if WIN32_AVAILABLE:
     import win32process
 
 if TYPE_CHECKING:
-    pass
+    import imagehash
 
 app_logger = logging.getLogger("AssetPixelHand.worker")
 g_inference_engine = None
+g_preprocessor = None  # Global for the lightweight preprocessor
 g_free_buffers_q = None
 
 
@@ -43,6 +46,8 @@ def normalize_vectors_numpy(embeddings: np.ndarray) -> np.ndarray:
 
 
 class InferenceEngine:
+    """A heavyweight class that loads ONNX models for actual inference."""
+
     def __init__(self, model_name: str, device: str = "cpu"):
         if not DEEP_LEARNING_AVAILABLE:
             raise ImportError("Required deep learning libraries not found.")
@@ -109,23 +114,29 @@ def _init_worker_process(config: dict):
             pass
 
 
-def init_cpu_worker(config: dict):
-    _init_worker_process(config)
-
-
-def init_cpu_worker_for_gpu_pipeline(config: dict, queue: "multiprocessing.Queue"):
-    global g_free_buffers_q
-    _init_worker_process(config)
-    g_free_buffers_q = queue
-
-
 def init_worker(config: dict):
+    """Initializes a full worker (CPU or GPU inference), creating the global inference engine."""
     global g_inference_engine
     _init_worker_process(config)
     try:
         g_inference_engine = InferenceEngine(config["model_name"], device=config.get("device", "cpu"))
     except Exception as e:
         _log_worker_crash(e, "init_worker")
+
+
+def init_preprocessor_worker(config: dict, queue: "multiprocessing.Queue"):
+    """Initializes a CPU-only preprocessing worker. Does NOT load ONNX models."""
+    global g_preprocessor, g_free_buffers_q
+    _init_worker_process(config)
+    g_free_buffers_q = queue
+    try:
+        from transformers import AutoProcessor
+
+        model_dir = MODELS_DIR / config["model_name"]
+        g_preprocessor = AutoProcessor.from_pretrained(model_dir)
+        app_logger.debug(f"Preprocessor worker PID {os.getpid()} initialized.")
+    except Exception as e:
+        _log_worker_crash(e, "init_preprocessor_worker")
 
 
 def _process_batch_from_paths(
@@ -138,9 +149,7 @@ def _process_batch_from_paths(
             if not metadata or metadata["resolution"][0] == 0:
                 skipped_tuples.append((str(path), "Metadata extraction failed"))
                 continue
-
             img_obj = _load_image_static_cached(path, target_size=input_size, tonemap_mode="none")
-
             if img_obj is not None:
                 images.append(img_obj)
                 fingerprints.append(ImageFingerprint(path=path, hashes=np.array([]), **metadata))
@@ -162,13 +171,11 @@ def worker_wrapper_from_paths(paths: list[Path]) -> tuple[list[ImageFingerprint]
             image_list_for_processor = [np.array(img.convert("RGB")) for img in images]
             inputs = g_inference_engine.processor(images=image_list_for_processor, return_tensors="np")
             pixel_values = inputs.pixel_values.astype(np.float16 if g_inference_engine.is_fp16 else np.float32)
-
             io_binding = g_inference_engine.visual_session.io_binding()
             io_binding.bind_cpu_input("pixel_values", pixel_values)
             io_binding.bind_output("image_embeds")
             g_inference_engine.visual_session.run_with_iobinding(io_binding)
             embeddings = io_binding.get_outputs()[0].numpy()
-
             if embeddings.size > 0:
                 embeddings = normalize_vectors_numpy(embeddings)
                 for i, fp in enumerate(fps):
@@ -180,15 +187,14 @@ def worker_wrapper_from_paths(paths: list[Path]) -> tuple[list[ImageFingerprint]
         return [], [(str(p), error_message) for p in paths]
 
 
-def worker_wrapper_from_paths_cpu_shared_mem(paths: list[Path], model_name: str, buffer_shape, dtype) -> tuple:
-    global g_free_buffers_q
-    if g_free_buffers_q is None:
-        raise RuntimeError("Worker queue not initialized. The initializer function was likely not called.")
+def worker_wrapper_from_paths_cpu_shared_mem(
+    paths: list[Path], input_size: tuple[int, int], buffer_shape, dtype
+) -> tuple:
+    global g_free_buffers_q, g_preprocessor
+    if g_free_buffers_q is None or g_preprocessor is None:
+        raise RuntimeError("Preprocessor worker not initialized correctly.")
     try:
-        from transformers import AutoProcessor
-
-        proc = AutoProcessor.from_pretrained(MODELS_DIR / model_name)
-        input_size = (buffer_shape[2], buffer_shape[3])
+        proc = g_preprocessor
         images, fps, skipped_tuples = _process_batch_from_paths(paths, input_size)
         if not images:
             return None, [], skipped_tuples
@@ -222,45 +228,39 @@ def inference_worker_loop(
     if g_inference_engine is None:
         results_q.put(None)
         return
-
     io_binding = g_inference_engine.visual_session.io_binding()
-
     try:
         while True:
-            item = tensor_q.get()
+            try:
+                item = tensor_q.get(timeout=1.0)
+            except Empty:
+                continue
             if item is None:
                 results_q.put(None)
                 break
-
             meta_message, fps, skipped_tuples = item
             pixel_values = None
-
             if meta_message:
                 shm_name = meta_message["shm_name"]
                 shape = meta_message["shape"]
                 dtype = meta_message["dtype"]
-
                 existing_shm = shared_memory.SharedMemory(name=shm_name)
                 shared_array = np.ndarray(shape, dtype=dtype, buffer=existing_shm.buf)
                 pixel_values = np.copy(shared_array)
                 existing_shm.close()
-
-                # <<< FIX: Return the buffer to the queue immediately after use to prevent deadlock.
+                # FIX: Return the buffer to the queue immediately after use to prevent deadlock.
                 free_buffers_q.put(shm_name)
-
             if pixel_values is not None and pixel_values.size > 0:
                 io_binding.bind_cpu_input("pixel_values", pixel_values)
                 io_binding.bind_output("image_embeds")
                 g_inference_engine.visual_session.run_with_iobinding(io_binding)
                 embeddings = io_binding.get_outputs()[0].numpy()
-
                 if embeddings is None or embeddings.size == 0:
                     app_logger.error("Inference worker: model returned empty output via I/O Binding")
                     for fp in fps:
                         skipped_tuples.append((str(fp.path), "Inference returned empty output"))
                     results_q.put(([], skipped_tuples))
                     continue
-
                 embeddings = normalize_vectors_numpy(embeddings)
                 for i, data in enumerate(fps):
                     data.hashes = embeddings[i].flatten()
@@ -293,7 +293,6 @@ def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
             io_binding = g_inference_engine.visual_session.io_binding()
             image_list = [np.array(img.convert("RGB")) for img in images]
             pixel_values = g_inference_engine.processor(images=image_list, return_tensors="np").pixel_values
-
             io_binding.bind_cpu_input(
                 "pixel_values", pixel_values.astype(np.float16 if g_inference_engine.is_fp16 else np.float32)
             )
@@ -301,7 +300,6 @@ def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
             g_inference_engine.visual_session.run_with_iobinding(io_binding)
             embedding = io_binding.get_outputs()[0].numpy()
             return normalize_vectors_numpy(embedding).flatten()
-
     except Exception as e:
         _log_worker_crash(e, "worker_get_single_vector")
     return None
@@ -315,3 +313,26 @@ def worker_get_text_vector(text: str) -> np.ndarray | None:
     except Exception as e:
         _log_worker_crash(e, "worker_get_text_vector")
     return None
+
+
+def worker_get_xxhash(path: Path) -> tuple[str | None, Path]:
+    try:
+        hasher = xxhash.xxh64()
+        with open(path, "rb") as f:
+            while chunk := f.read(4 * 1024 * 1024):
+                hasher.update(chunk)
+        return hasher.hexdigest(), path
+    except OSError:
+        return None, path
+
+
+def worker_get_phash(path: Path) -> tuple[Union["imagehash.ImageHash", None], Path]:
+    try:
+        import imagehash
+        from PIL import Image
+
+        with Image.open(path) as img:
+            phash = imagehash.phash(img)
+        return phash, path
+    except Exception:
+        return None, path

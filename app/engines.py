@@ -16,11 +16,18 @@ from pathlib import Path
 from queue import Empty
 
 import numpy as np
+import pyarrow as pa
 from PySide6.QtCore import QObject
 
 import app.worker as worker
 from app.cache import CacheManager
-from app.constants import DB_WRITE_BATCH_SIZE, LANCEDB_AVAILABLE
+from app.constants import (
+    DB_WRITE_BATCH_SIZE,
+    DEFAULT_SEARCH_PRECISION,
+    LANCEDB_AVAILABLE,
+    MODELS_DIR,
+    SEARCH_PRECISION_PRESETS,
+)
 from app.data_models import DuplicateResults, ImageFingerprint, ScanConfig, ScannerSignals, ScanState
 from app.utils import find_best_in_group
 
@@ -61,28 +68,24 @@ class FingerprintEngine(QObject):
         self.db_executor.shutdown(wait=True)
 
     def process_all(self, files_to_process: list[Path], stop_event: threading.Event) -> tuple[bool, list[str]]:
-        """
-        Orchestrates a parallel processing pipeline for CPU or GPU.
-        Returns a tuple of (success_status, list_of_skipped_files).
-        """
         if not files_to_process:
             return True, []
 
-        num_cpu_workers = (
-            self.config.perf.model_workers
-            if self.config.device == "cpu"
-            else max(1, (multiprocessing.cpu_count() or 2) - 1)
-        )
+        if self.config.device == "cpu":
+            num_workers = self.config.perf.model_workers
+        else:  # gpu
+            num_workers = self.config.perf.gpu_preproc_workers
+
         cache = CacheManager(self.config.folder_path, self.config.model_name)
         success, all_skipped = False, []
         try:
             if self.config.device == "cpu":
                 success, all_skipped = self._run_cpu_pipeline(
-                    files_to_process, stop_event, len(files_to_process), cache, num_cpu_workers
+                    files_to_process, stop_event, len(files_to_process), cache, num_workers
                 )
             else:
                 success, all_skipped = self._run_gpu_pipeline(
-                    files_to_process, stop_event, len(files_to_process), cache, num_cpu_workers
+                    files_to_process, stop_event, len(files_to_process), cache, num_workers
                 )
         finally:
             cache.close()
@@ -106,13 +109,17 @@ class FingerprintEngine(QObject):
                 fps_to_cache.clear()
 
     def _add_to_lancedb(self, fingerprints: list[ImageFingerprint]):
+        """
+        Safely adds fingerprints to LanceDB by explicitly creating a PyArrow Table.
+        This prevents data corruption issues caused by race conditions in multiprocessing.
+        """
         if not fingerprints or not LANCEDB_AVAILABLE:
             return
 
-        data_to_add = [
+        data_to_convert = [
             {
                 "id": str(uuid.uuid5(uuid.NAMESPACE_URL, str(fp.path.resolve()))),
-                "vector": fp.hashes.tolist(),
+                "vector": fp.hashes,  # Keep as NumPy array for PyArrow
                 "path": str(fp.path.resolve()),
                 "resolution_w": fp.resolution[0],
                 "resolution_h": fp.resolution[1],
@@ -126,14 +133,32 @@ class FingerprintEngine(QObject):
             }
             for fp in fingerprints
         ]
-        self.db_executor.submit(self.lancedb_table.add, data=data_to_add)
+
+        try:
+            arrow_table = pa.Table.from_pylist(data_to_convert)
+            self.db_executor.submit(self.lancedb_table.add, data=arrow_table)
+        except Exception as e:
+            app_logger.error(f"Failed to create PyArrow table for LanceDB: {e}", exc_info=True)
+            self.signals.log.emit(f"Critical error preparing data for database: {e}", "error")
 
     def _run_gpu_pipeline(self, files, stop_event, total, cache, num_workers) -> tuple[bool, list[str]]:
         ctx = multiprocessing.get_context("spawn")
+        app_logger.info(f"Using {num_workers} CPU workers for GPU preprocessing pipeline.")
+
+        from transformers import AutoProcessor
+
+        try:
+            proc = AutoProcessor.from_pretrained(MODELS_DIR / self.config.model_name)
+            image_proc = getattr(proc, "image_processor", proc)
+            size_cfg = getattr(image_proc, "size", {}) or getattr(image_proc, "crop_size", {})
+            input_size = (size_cfg["height"], size_cfg["width"]) if "height" in size_cfg else (224, 224)
+            app_logger.info(f"Determined model input size: {input_size}")
+        except Exception as e:
+            input_size = (224, 224)
+            app_logger.warning(f"Could not determine model input size, defaulting to {input_size}. Error: {e}")
 
         is_fp16 = "_fp16" in self.config.model_name.lower()
         dtype = np.float16 if is_fp16 else np.float32
-        input_size = (224, 224)
         buffer_shape = (self.config.perf.batch_size, 3, *input_size)
         buffer_size = int(np.prod(buffer_shape) * np.dtype(dtype).itemsize)
 
@@ -144,7 +169,6 @@ class FingerprintEngine(QObject):
             free_buffers_q.put(mem.name)
 
         tensor_q, results_q = ctx.Queue(maxsize=num_buffers), ctx.Queue(maxsize=total + 1)
-
         infer_cfg = {
             "model_name": self.config.model_name,
             "low_priority": self.config.perf.run_at_low_priority,
@@ -155,19 +179,22 @@ class FingerprintEngine(QObject):
         )
         infer_proc.start()
         all_skipped = []
-
         try:
-            init_cfg = {"low_priority": self.config.perf.run_at_low_priority}
+            preproc_init_cfg = {
+                "model_name": self.config.model_name,
+                "low_priority": self.config.perf.run_at_low_priority,
+            }
             worker_func = partial(
                 worker.worker_wrapper_from_paths_cpu_shared_mem,
-                model_name=self.config.model_name,
+                input_size=input_size,
                 buffer_shape=buffer_shape,
                 dtype=dtype,
             )
             with ctx.Pool(
                 processes=num_workers,
-                initializer=worker.init_cpu_worker_for_gpu_pipeline,
-                initargs=(init_cfg, free_buffers_q),
+                initializer=worker.init_preprocessor_worker,
+                initargs=(preproc_init_cfg, free_buffers_q),
+                maxtasksperchild=1,
             ) as pool:
 
                 def data_gen(files: list[Path], batch_size: int):
@@ -201,7 +228,6 @@ class FingerprintEngine(QObject):
             if not infer_proc.is_alive():
                 app_logger.error("Inference process died unexpectedly.")
                 return None, all_skipped
-
             if not feeding_done:
                 try:
                     preproc = next(preproc_results)
@@ -221,7 +247,6 @@ class FingerprintEngine(QObject):
                 self.state.update_progress(processed, total)
             except Empty:
                 pass
-
         while True:
             try:
                 gpu_result = results_q.get(timeout=1.0)
@@ -243,7 +268,6 @@ class FingerprintEngine(QObject):
             self.signals.log.emit(
                 "Warning: FP32 model is large and may consume significant RAM with multiple workers.", "warning"
             )
-
         ctx = multiprocessing.get_context("spawn")
         init_cfg = {
             "model_name": self.config.model_name,
@@ -251,8 +275,12 @@ class FingerprintEngine(QObject):
             "device": self.config.device,
         }
         processed, fps_to_cache, all_skipped = 0, [], []
-
-        with ctx.Pool(processes=num_workers, initializer=worker.init_worker, initargs=(init_cfg,)) as pool:
+        with ctx.Pool(
+            processes=num_workers,
+            initializer=worker.init_worker,
+            initargs=(init_cfg,),
+            maxtasksperchild=10,
+        ) as pool:
 
             def data_gen(files: list[Path], batch_size: int):
                 for i in range(0, len(files), batch_size):
@@ -289,13 +317,16 @@ class LanceDBSimilarityEngine(QObject):
         lancedb_table: "lancedb.table.Table",
     ):
         super().__init__()
-        self.state, self.signals, self.config = state, signals, config
+        self.state = state
+        self.signals = signals
+        self.config = config
         self.table = lancedb_table
         self.distance_threshold = 1.0 - (self.config.similarity_threshold / 100.0)
-        nprobes_map = {"Fast": 10, "Balanced (Default)": 20, "Thorough": 40, "Exhaustive (Slow)": 256}
-        self.nprobes = nprobes_map.get(self.config.search_precision, 20)
-        refine_map = {"Fast": 1, "Balanced (Default)": 2, "Thorough": 5, "Exhaustive (Slow)": 10}
-        self.refine_factor = refine_map.get(self.config.search_precision, 2)
+        preset_settings = SEARCH_PRECISION_PRESETS.get(
+            self.config.search_precision, SEARCH_PRECISION_PRESETS[DEFAULT_SEARCH_PRECISION]
+        )
+        self.nprobes = preset_settings["nprobes"]
+        self.refine_factor = preset_settings["refine_factor"]
         log_msg = f"Graph clustering with precision '{config.search_precision}' (k={self.K_NEIGHBORS}, nprobes={self.nprobes})"
         self.signals.log.emit(log_msg, "info")
 
@@ -305,8 +336,8 @@ class LanceDBSimilarityEngine(QObject):
 
     def find_similar_groups(self, stop_event: threading.Event) -> DuplicateResults:
         """
-        Finds clusters using a memory-efficient graph clustering algorithm with SciPy.
-        This version processes data in batches but performs individual searches for stability.
+        FIXED: Finds clusters by processing data in batches but performing individual, reliable
+        searches for each image to prevent incorrect result mapping.
         """
         if not SCIPY_AVAILABLE:
             self.signals.log.emit("SciPy not found. Please run 'pip install scipy'.", "error")
@@ -338,8 +369,10 @@ class LanceDBSimilarityEngine(QObject):
                     return {}
 
                 batch_ids = batch.column("id").to_pylist()
-                batch_vectors = np.array(batch.column("vector").to_pylist())
+                flat_vectors = batch.column("vector").values.to_numpy(zero_copy_only=False)
+                batch_vectors = flat_vectors.reshape(len(batch_ids), self.config.model_dim)
 
+                # FIX: Iterate and perform individual searches to prevent incorrect result mapping.
                 for i, source_vector in enumerate(batch_vectors):
                     if stop_event.is_set():
                         return {}
@@ -349,6 +382,7 @@ class LanceDBSimilarityEngine(QObject):
                     if source_idx is None:
                         continue
 
+                    # Perform a reliable search for each vector individually.
                     hits = self.table.search(source_vector).limit(self.K_NEIGHBORS).nprobes(self.nprobes).to_pandas()
 
                     for _, hit in hits.iterrows():
