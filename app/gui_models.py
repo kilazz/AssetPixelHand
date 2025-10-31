@@ -171,7 +171,6 @@ class ResultsTreeModel(QAbstractItemModel):
         return not node.get("fetched") and node.get("group_id") not in self.running_tasks
 
     def fetchMore(self, parent):
-        """Starts an asynchronous task to fetch child items for a group."""
         if not self.canFetchMore(parent):
             return
 
@@ -187,7 +186,6 @@ class ResultsTreeModel(QAbstractItemModel):
 
     @Slot(list, int, QModelIndex)
     def _on_fetch_finished(self, children: list, group_id: int, parent_index: QModelIndex):
-        """Safely inserts fetched data into the model from the main thread."""
         if group_id not in self.running_tasks or group_id not in self.groups_data:
             return
 
@@ -223,10 +221,7 @@ class ResultsTreeModel(QAbstractItemModel):
         node = index.internalPointer()
 
         if role == Qt.ItemDataRole.DisplayRole:
-            value = self._get_display_data(index, node)
-            if index.column() == 1 and isinstance(value, int):
-                return f"{value}%"
-            return value
+            return self._get_display_data(index, node)
 
         if (
             role == Qt.ItemDataRole.CheckStateRole
@@ -266,8 +261,13 @@ class ResultsTreeModel(QAbstractItemModel):
         if col == 0:
             return path.name
         elif col == 1:
+            method = node.get("found_by")
+            if method == "xxHash":
+                return "Exact Match"
+            if method == "pHash":
+                return "Near-Identical"
             dist = node.get("distance", -1)
-            return dist if dist >= 0 else None
+            return f"{dist}%" if dist >= 0 else ""
         elif col == 2:
             return str(path.parent)
         elif col == 3:
@@ -399,10 +399,7 @@ class ResultsTreeModel(QAbstractItemModel):
 
 
 class ImagePreviewModel(QAbstractListModel):
-    """
-    Data model for the image preview list. It manages the loading process
-    itself, following a robust "fetch-on-demand" pattern using a background thread pool.
-    """
+    """Data model for the image preview list."""
 
     def __init__(self, thread_pool: QThreadPool, parent=None):
         super().__init__(parent)
@@ -433,7 +430,6 @@ class ImagePreviewModel(QAbstractListModel):
         self.endResetModel()
 
     def set_items_from_list(self, items: list[dict]):
-        """Directly sets the model's items from a provided list, bypassing DB queries."""
         self.beginResetModel()
         self.db_path = None
         self.group_id = -1
@@ -443,7 +439,6 @@ class ImagePreviewModel(QAbstractListModel):
         self.endResetModel()
 
     def set_group(self, db_path: Path, group_id: int):
-        """Loads a group from the database (used for 'duplicates' mode)."""
         self.beginResetModel()
         self.db_path = db_path
         self.group_id = group_id
@@ -460,6 +455,7 @@ class ImagePreviewModel(QAbstractListModel):
                     if is_search:
                         query += " AND is_best = FALSE"
                     query += " ORDER BY is_best DESC, distance DESC"
+                    # FIX: Correctly extract column names from the description tuples.
                     cols = [desc[0] for desc in conn.execute(query, [self.group_id]).description]
                     for row_tuple in conn.execute(query, [self.group_id]).fetchall():
                         row_dict = dict(zip(cols, row_tuple, strict=False))
@@ -523,7 +519,6 @@ class ImagePreviewModel(QAbstractListModel):
                 break
 
     def _emit_data_changed_for_path(self, path_str: str):
-        """Finds the row for a given path and emits dataChanged for it."""
         for i, item in enumerate(self.items):
             if item["path"] == path_str:
                 index = self.index(i, 0)
@@ -632,8 +627,17 @@ class ImageItemDelegate(QStyledItemDelegate):
         y += line_height
         painter.setFont(QFont())
         painter.setPen(secondary_color)
+
+        method = item_data.get("found_by")
         dist = item_data.get("distance", -1)
-        dist_text = "Exact | " if dist == 100 else f"Score: {dist}% | " if dist >= 0 else ""
+        dist_text = ""
+        if method == "xxHash":
+            dist_text = "Exact Match | "
+        elif method == "pHash":
+            dist_text = "Near-Identical | "
+        elif dist >= 0:
+            dist_text = f"Score: {dist}% | "
+
         meta_text = f"{dist_text}{item_data.get('resolution_w', 0)}x{item_data.get('resolution_h', 0)} | {item_data.get('format_details', '')}"
         painter.drawText(x, y, self.regular_font_metrics.elidedText(meta_text, Qt.ElideRight, text_rect.width()))
         y += line_height
@@ -648,17 +652,14 @@ class SimilarityFilterProxyModel(QSortFilterProxyModel):
         self._min_similarity = 0
 
     def set_similarity_filter(self, value: int):
-        """Sets the minimum similarity threshold."""
         if self._min_similarity != value:
             self._min_similarity = value
             self.invalidateFilter()
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
-        """The core filtering logic that decides whether to show or hide a row."""
         if self._min_similarity == 0:
             return True
 
-        # Always show top-level group items
         if not source_parent.isValid():
             return True
 
@@ -670,7 +671,10 @@ class SimilarityFilterProxyModel(QSortFilterProxyModel):
         if not node or node.get("type") == "group":
             return True
 
-        similarity_score = node.get("distance", -1)
+        # Always show non-AI matches regardless of the similarity slider
+        method = node.get("found_by")
+        if method in ["xxHash", "pHash"]:
+            return True
 
-        # Show the row only if its similarity score is at or above the threshold
+        similarity_score = node.get("distance", -1)
         return similarity_score >= self._min_similarity

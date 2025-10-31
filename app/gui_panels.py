@@ -438,7 +438,7 @@ class PerformancePanel(QGroupBox):
 
         self.gpu_preproc_workers_spin = QSpinBox()
         self.gpu_preproc_workers_spin.setRange(1, (multiprocessing.cpu_count() or 1) * 2)
-        layout.addRow("CPU Preprocessing Workers:", self.gpu_preproc_workers_spin)
+        layout.addRow("CPU Prep Workers:", self.gpu_preproc_workers_spin)
 
     def _detect_and_setup_devices(self):
         self.device_combo.addItem("CPU", "cpu")
@@ -773,14 +773,12 @@ class ResultsPanel(QGroupBox):
             if is_duplicate_mode:
                 self.results_model.sort_results(self.sort_combo.currentText())
 
-            def resize_cols():
-                header = self.results_view.header()
-                header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-                header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-                header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-                header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+            header = self.results_view.header()
+            header.setSectionsMovable(True)
+            for i in range(header.count()):
+                header.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
 
-            QTimer.singleShot(50, resize_cols)
         self.set_enabled_state(num_found > 0)
         if is_search_mode and self.proxy_model.rowCount() > 0:
             self.results_view.expandAll()
@@ -1287,5 +1285,3 @@ class ImageViewerPanel(QGroupBox):
         a_diff = ImageChops.difference(a1, a2) if self.channel_states["A"] else Image.new("L", img1.size, 255)
         diff_img = Image.merge("RGBA", (r_diff, g_diff, b_diff, a_diff))
         return QPixmap.fromImage(ImageQt(diff_img))
-
-    pass

@@ -64,7 +64,6 @@ class FingerprintEngine(QObject):
         self.db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LanceDBAdd")
 
     def shutdown(self):
-        """Shuts down the database executor thread pool safely."""
         self.db_executor.shutdown(wait=True)
 
     def process_all(self, files_to_process: list[Path], stop_event: threading.Event) -> tuple[bool, list[str]]:
@@ -109,17 +108,13 @@ class FingerprintEngine(QObject):
                 fps_to_cache.clear()
 
     def _add_to_lancedb(self, fingerprints: list[ImageFingerprint]):
-        """
-        Safely adds fingerprints to LanceDB by explicitly creating a PyArrow Table.
-        This prevents data corruption issues caused by race conditions in multiprocessing.
-        """
         if not fingerprints or not LANCEDB_AVAILABLE:
             return
 
         data_to_convert = [
             {
                 "id": str(uuid.uuid5(uuid.NAMESPACE_URL, str(fp.path.resolve()))),
-                "vector": fp.hashes,  # Keep as NumPy array for PyArrow
+                "vector": fp.hashes,
                 "path": str(fp.path.resolve()),
                 "resolution_w": fp.resolution[0],
                 "resolution_h": fp.resolution[1],
@@ -152,7 +147,6 @@ class FingerprintEngine(QObject):
             image_proc = getattr(proc, "image_processor", proc)
             size_cfg = getattr(image_proc, "size", {}) or getattr(image_proc, "crop_size", {})
             input_size = (size_cfg["height"], size_cfg["width"]) if "height" in size_cfg else (224, 224)
-            app_logger.info(f"Determined model input size: {input_size}")
         except Exception as e:
             input_size = (224, 224)
             app_logger.warning(f"Could not determine model input size, defaulting to {input_size}. Error: {e}")
@@ -215,7 +209,6 @@ class FingerprintEngine(QObject):
             for mem in shared_mem_buffers:
                 mem.close()
                 mem.unlink()
-            app_logger.info("Shared memory buffers cleaned up successfully.")
 
     def _gpu_pipeline_loop(
         self, preproc_results, tensor_q, results_q, stop_event, infer_proc, total, cache
@@ -335,10 +328,6 @@ class LanceDBSimilarityEngine(QObject):
         return int(max(0.0, min(1.0, similarity)) * 100)
 
     def find_similar_groups(self, stop_event: threading.Event) -> DuplicateResults:
-        """
-        FIXED: Finds clusters by processing data in batches but performing individual, reliable
-        searches for each image to prevent incorrect result mapping.
-        """
         if not SCIPY_AVAILABLE:
             self.signals.log.emit("SciPy not found. Please run 'pip install scipy'.", "error")
             return {}
@@ -372,7 +361,6 @@ class LanceDBSimilarityEngine(QObject):
                 flat_vectors = batch.column("vector").values.to_numpy(zero_copy_only=False)
                 batch_vectors = flat_vectors.reshape(len(batch_ids), self.config.model_dim)
 
-                # FIX: Iterate and perform individual searches to prevent incorrect result mapping.
                 for i, source_vector in enumerate(batch_vectors):
                     if stop_event.is_set():
                         return {}
@@ -382,7 +370,6 @@ class LanceDBSimilarityEngine(QObject):
                     if source_idx is None:
                         continue
 
-                    # Perform a reliable search for each vector individually.
                     hits = self.table.search(source_vector).limit(self.K_NEIGHBORS).nprobes(self.nprobes).to_pandas()
 
                     for _, hit in hits.iterrows():
@@ -454,7 +441,8 @@ class LanceDBSimilarityEngine(QObject):
                 if fp != best_fp:
                     sim = cosine_similarity(np.array(best_fp.hashes), np.array(fp.hashes))
                     if sim >= self.config.similarity_threshold:
-                        dups_set.add((fp, sim))
+                        # Add the method used to find the duplicate for UI clarity
+                        dups_set.add((fp, sim, "AI"))
             if dups_set:
                 duplicate_results[best_fp] = dups_set
         return duplicate_results
