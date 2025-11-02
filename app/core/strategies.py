@@ -35,6 +35,7 @@ from app.data_models import (
     DuplicateResults,
     ImageFingerprint,
     ScanConfig,
+    ScanMode,
     ScannerSignals,
     ScanState,
 )
@@ -234,7 +235,7 @@ class FindDuplicatesStrategy(ScanStrategy):
         self.state.set_phase("Phase 1/6: Reading image metadata...", 0.10)
 
         ctx = multiprocessing.get_context("spawn")
-        num_workers = self.config.perf.model_workers
+        num_workers = self.config.perf.num_workers
 
         self.all_image_fps = {}
         with ctx.Pool(processes=num_workers) as pool:
@@ -299,7 +300,7 @@ class FindDuplicatesStrategy(ScanStrategy):
     def _run_hashing_stages(self, all_files: list[Path], stop_event: threading.Event) -> list[Path]:
         """Performs hashing in stages, filtering files for the next stage and gathering evidence."""
         ctx = multiprocessing.get_context("spawn")
-        num_workers = self.config.perf.model_workers
+        num_workers = self.config.perf.num_workers
 
         # --- Stage 2/6: xxHash ---
         self.state.set_phase("Phase 2/6: Finding exact duplicates (xxHash)...", 0.10)
@@ -445,7 +446,7 @@ class FindDuplicatesStrategy(ScanStrategy):
 
         scan_payload = {"db_path": db_path_payload, "groups_data": final_groups if self.config.save_visuals else None}
 
-        self.scanner_core._finalize_scan(scan_payload, num_found, "duplicates", duration, self.all_skipped_files)
+        self.scanner_core._finalize_scan(scan_payload, num_found, ScanMode.DUPLICATES, duration, self.all_skipped_files)
 
 
 class SearchStrategy(ScanStrategy):
@@ -490,13 +491,14 @@ class SearchStrategy(ScanStrategy):
         if num_found > 0:
             db_path_payload = RESULTS_DB_FILE
             dups_list = [(fp, sim_engine._score_to_percentage(score), "AI") for fp, score in search_results]
-            if self.config.scan_mode == "sample_search" and self.config.sample_path:
-                best_fp = self._create_dummy_fp(self.config.sample_path.resolve())
+
+            if self.config.scan_mode == ScanMode.SAMPLE_SEARCH and self.config.sample_path:
+                best_fp = self._create_dummy_fp(self.config.sample_path)  # Removed .resolve() for safety
                 if best_fp:
                     self._save_results_to_db(
                         {best_fp: dups_list}, search_context=f"sample:{self.config.sample_path.name}"
                     )
-            else:
+            else:  # Text search
                 query_fp = ImageFingerprint(
                     path=Path(f"Query: '{self.config.search_query}'"),
                     hashes=np.array([]),
@@ -524,12 +526,12 @@ class SearchStrategy(ScanStrategy):
         ctx = multiprocessing.get_context("spawn")
         query_vector = None
         with ctx.Pool(processes=1, initializer=init_worker, initargs=(worker_config,)) as pool:
-            if self.config.scan_mode == "text_search" and self.config.search_query:
+            if self.config.scan_mode == ScanMode.TEXT_SEARCH and self.config.search_query:
                 self.signals.log.emit(f"Generating vector for query: '{self.config.search_query}'", "info")
                 results = pool.map(worker_get_text_vector, [self.config.search_query])
                 if results:
                     query_vector = results[0]
-            elif self.config.scan_mode == "sample_search" and self.config.sample_path:
+            elif self.config.scan_mode == ScanMode.SAMPLE_SEARCH and self.config.sample_path:
                 self.signals.log.emit(f"Generating vector for sample: {self.config.sample_path.name}", "info")
                 results = pool.map(worker_get_single_vector, [self.config.sample_path])
                 if results:

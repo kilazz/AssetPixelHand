@@ -15,7 +15,7 @@ from PySide6.QtCore import QObject, QThread, Slot
 
 from app.constants import CACHE_DIR, DUCKDB_AVAILABLE, LANCEDB_AVAILABLE, WIN32_AVAILABLE
 from app.core.strategies import FindDuplicatesStrategy, SearchStrategy
-from app.data_models import ScanConfig, ScannerSignals, ScanState
+from app.data_models import ScanConfig, ScanMode, ScannerSignals, ScanState
 
 if LANCEDB_AVAILABLE:
     import lancedb
@@ -57,9 +57,9 @@ class ScannerCore(QObject):
                 return
 
             strategy_map = {
-                "duplicates": FindDuplicatesStrategy,
-                "text_search": SearchStrategy,
-                "sample_search": SearchStrategy,
+                ScanMode.DUPLICATES: FindDuplicatesStrategy,
+                ScanMode.TEXT_SEARCH: SearchStrategy,
+                ScanMode.SAMPLE_SEARCH: SearchStrategy,
             }
             strategy_class = strategy_map.get(self.config.scan_mode)
 
@@ -68,7 +68,7 @@ class ScannerCore(QObject):
                 strategy.execute(stop_event, start_time)
             else:
                 self.signals.log.emit(f"Unknown scan mode: {self.config.scan_mode}", "error")
-                self._finalize_scan([], 0, self.config.scan_mode, 0, [])
+                self._finalize_scan(None, 0, None, 0, [])
 
         except Exception as e:
             if not stop_event.is_set():
@@ -81,7 +81,7 @@ class ScannerCore(QObject):
             total_duration = time.time() - start_time
             app_logger.info("Scan process finished.")
             if stop_event.is_set() and not self.scan_has_finished:
-                self._finalize_scan([], 0, "", total_duration, self.all_skipped_files)
+                self._finalize_scan(None, 0, None, total_duration, self.all_skipped_files)
 
     def _set_process_priority(self):
         """Lowers the process priority to improve UI responsiveness, if enabled."""
@@ -150,7 +150,7 @@ class ScannerCore(QObject):
         self,
         stop_event: threading.Event,
         collection: list,
-        mode: str,
+        mode: ScanMode,
         payload: any,
         start_time: float,
     ) -> bool:
@@ -158,7 +158,7 @@ class ScannerCore(QObject):
         duration = time.time() - start_time
         if stop_event.is_set():
             self.state.set_phase("Scan cancelled.", 0.0)
-            self._finalize_scan([], 0, "", duration, self.all_skipped_files)
+            self._finalize_scan(None, 0, None, duration, self.all_skipped_files)
             return True
         if not collection:
             self.state.set_phase("Finished! No new images to process.", 0.0)

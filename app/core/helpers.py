@@ -38,8 +38,6 @@ class FileFinder:
         self.state = state
         self.folder_path = folder_path
 
-        # This line is simplified to avoid any call to .resolve(), which was
-        # the true source of the deadlock on complex file systems.
         self.excluded_paths = {str(folder_path.joinpath(p.strip())) for p in excluded if p.strip()}
 
         self.extensions = set(extensions)
@@ -113,8 +111,9 @@ class VisualizationTask(QRunnable):
 
     def __init__(self, groups: DuplicateResults, config: ScanConfig):
         super().__init__()
+        self.setAutoDelete(True)
         self.groups = groups
-        self.config = config  # Store the whole config object
+        self.config = config
         self.signals = self.Signals()
 
     def run(self):
@@ -187,7 +186,7 @@ class VisualizationTask(QRunnable):
                                 else f"Similarity: {score}%"
                             )
 
-                        path_str = self._wrap_path(str(fp.path.resolve()), THUMB, font)
+                        path_str = self._wrap_path(str(fp.path), THUMB, font)
                         meta_str = f"{fp.resolution[0]}x{fp.resolution[1]} | {dist_str}"
 
                         text_y = y + THUMB + 8
@@ -221,11 +220,13 @@ class VisualizationTask(QRunnable):
 
     def _wrap_path(self, path_str: str, width: int, font: ImageFont.FreeTypeFont) -> str:
         """Wraps a long file path string to fit within a given pixel width."""
+        # This function is now safer because we removed the .resolve() call before passing the path here
         if font.getlength(path_str) <= width:
             return path_str
 
         lines = []
         current_line = ""
+        # Generic separator handling for cross-platform safety
         parts = path_str.replace("\\", "/").split("/")
 
         for i, part in enumerate(parts):

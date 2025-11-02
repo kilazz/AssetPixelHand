@@ -32,7 +32,7 @@ from app.constants import (
 )
 from app.core.helpers import VisualizationTask
 from app.core.scanner import ScannerController
-from app.data_models import AppSettings, ScanConfig
+from app.data_models import AppSettings, ScanConfig, ScanMode
 from app.logging_config import setup_logging
 from app.services.config_builder import ScanConfigBuilder
 from app.services.file_operation_manager import FileOperationManager
@@ -279,8 +279,7 @@ class App(QMainWindow):
         perf.device_combo.currentIndexChanged.connect(self._request_settings_save)
         perf.quant_combo.currentIndexChanged.connect(self._request_settings_save)
         perf.search_precision_combo.currentIndexChanged.connect(self._request_settings_save)
-        perf.cpu_workers_spin.valueChanged.connect(self._request_settings_save)
-        perf.gpu_preproc_workers_spin.valueChanged.connect(self._request_settings_save)
+        perf.num_workers_spin.valueChanged.connect(self._request_settings_save)
         perf.batch_size_spin.valueChanged.connect(self._request_settings_save)
 
         viewer = self.viewer_panel
@@ -348,7 +347,7 @@ class App(QMainWindow):
         self.options_panel.set_scan_button_state(is_scanning)
         QApplication.processEvents()
 
-    @Slot(object, int, str, float, list)
+    @Slot(object, int, object, float, list)
     def on_scan_complete(self, payload, num_found, mode, duration, skipped):
         if not mode:
             app_logger.warning("Scan was cancelled by the user.")
@@ -360,13 +359,13 @@ class App(QMainWindow):
         db_path = payload.get("db_path")
         groups_data = payload.get("groups_data")
 
-        log_msg = f"Finished! Found {num_found} {'similar items' if mode == 'duplicates' else 'results'} in {time_str}."
+        log_msg = f"Finished! Found {num_found} {'similar items' if mode == ScanMode.DUPLICATES else 'results'} in {time_str}."
         app_logger.info(log_msg)
         self.log_panel.log_message(log_msg, "success")
 
         self.results_panel.display_results(db_path, num_found, mode)
 
-        if num_found > 0 and mode == "duplicates":
+        if num_found > 0 and mode == ScanMode.DUPLICATES and self.controller.config:
             link_support = check_link_support(self.controller.config.folder_path)
             self.results_panel.hardlink_available = link_support.get("hardlink", False)
             self.results_panel.reflink_available = link_support.get("reflink", False)
@@ -403,10 +402,10 @@ class App(QMainWindow):
     def on_scan_end(self):
         """Finalizes any scan-related state, closes dialogs, and re-enables the UI."""
         if self.stats_dialog:
-            self.stats_dialog.close()
+            if not self.stats_dialog.close():
+                self.stats_dialog.deleteLater()
             self.stats_dialog = None
-        if self.controller.is_running():
-            self.controller.stop_and_cleanup_thread()
+
         self.set_ui_scan_state(is_scanning=False)
         self.results_panel.set_enabled_state(self.results_panel.results_model.rowCount() > 0)
 
@@ -530,6 +529,7 @@ class App(QMainWindow):
                 QMessageBox.critical(self, "Error", "Failed to clear all app data.")
 
     def _show_results_context_menu(self, pos):
+        """Shows the context menu for an item in the results view."""
         proxy_idx = self.results_panel.results_view.indexAt(pos)
         if not proxy_idx.isValid():
             return

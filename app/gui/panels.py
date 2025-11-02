@@ -51,7 +51,7 @@ from app.constants import (
     QuantizationMode,
     UIConfig,
 )
-from app.data_models import AppSettings
+from app.data_models import AppSettings, ScanMode
 from app.view_models import ImageComparerState
 
 from .dialogs import FileTypesDialog
@@ -80,7 +80,7 @@ class OptionsPanel(QGroupBox):
         super().__init__("Scan Configuration")
         self.settings = settings
         self.selected_extensions = list(settings.selected_extensions)
-        self.current_scan_mode = "duplicates"
+        self.current_scan_mode = ScanMode.DUPLICATES
         self._sample_path: Path | None = None
         self._init_ui()
         self._connect_signals()
@@ -210,24 +210,27 @@ class OptionsPanel(QGroupBox):
         model_info = self.get_selected_model_info()
         supports_text = model_info.get("supports_text_search", True)
         supports_image = model_info.get("supports_image_search", True)
+
         self.search_entry.setDisabled(not supports_text or bool(self._sample_path))
         self.search_entry.setPlaceholderText(
             "Text search not supported by this model" if not supports_text else "Enter text to search..."
         )
         self.browse_sample_button.setEnabled(supports_image)
+
         if not supports_image:
             self._clear_sample()
+
         if self._sample_path and supports_image:
-            self.current_scan_mode = "sample_search"
+            self.current_scan_mode = ScanMode.SAMPLE_SEARCH
             self.scan_button_text = "Search by Sample"
         elif self.search_entry.text().strip() and supports_text:
-            self.current_scan_mode = "text_search"
+            self.current_scan_mode = ScanMode.TEXT_SEARCH
             self.scan_button_text = "Search by Text"
         else:
-            self.current_scan_mode = "duplicates"
+            self.current_scan_mode = ScanMode.DUPLICATES
             self.scan_button_text = "Scan for Duplicates"
 
-        is_duplicate_mode = self.current_scan_mode == "duplicates"
+        is_duplicate_mode = self.current_scan_mode == ScanMode.DUPLICATES
         self.threshold_spinbox.setEnabled(is_duplicate_mode)
         label = self.form_layout.labelForField(self.threshold_spinbox)
         if label:
@@ -238,7 +241,7 @@ class OptionsPanel(QGroupBox):
 
         self.scan_button.setText(self.scan_button_text)
         self.clear_sample_button.setVisible(self._sample_path is not None)
-        self.scan_context_changed.emit(self.current_scan_mode)
+        self.scan_context_changed.emit(self.current_scan_mode.name)
 
     @Slot()
     def _on_model_changed(self):
@@ -343,15 +346,15 @@ class ScanOptionsPanel(QGroupBox):
 
         self.max_visuals_entry = QLineEdit()
         self.max_visuals_entry.setValidator(QIntValidator(0, 9999))
-        self.max_visuals_entry.setFixedWidth(45)
+        self.max_visuals_entry.setFixedWidth(UIConfig.Sizes.MAX_VISUALS_ENTRY_WIDTH)
 
         self.visuals_columns_spinbox = QSpinBox()
         self.visuals_columns_spinbox.setRange(2, 12)
-        self.visuals_columns_spinbox.setFixedWidth(40)
+        self.visuals_columns_spinbox.setFixedWidth(UIConfig.Sizes.VISUALS_COLUMNS_SPINBOX_WIDTH)
 
         self.open_visuals_folder_button = QPushButton("📂")
         self.open_visuals_folder_button.setToolTip("Open visualizations folder")
-        self.open_visuals_folder_button.setFixedWidth(35)
+        self.open_visuals_folder_button.setFixedWidth(UIConfig.Sizes.BROWSE_BUTTON_WIDTH)
 
         visuals_layout.addWidget(self.save_visuals_check)
         visuals_layout.addWidget(self.visuals_tonemap_check)
@@ -455,13 +458,10 @@ class PerformancePanel(QGroupBox):
         self.search_precision_combo = QComboBox()
         layout.addRow("Search Precision:", self.search_precision_combo)
 
-        self.cpu_workers_spin = QSpinBox()
-        self.cpu_workers_spin.setRange(1, (multiprocessing.cpu_count() or 1) * 2)
-        layout.addRow("CPU Workers:", self.cpu_workers_spin)
-
-        self.gpu_preproc_workers_spin = QSpinBox()
-        self.gpu_preproc_workers_spin.setRange(1, (multiprocessing.cpu_count() or 1) * 2)
-        layout.addRow("CPU Preproc Workers:", self.gpu_preproc_workers_spin)
+        self.num_workers_label = QLabel()
+        self.num_workers_spin = QSpinBox()
+        self.num_workers_spin.setRange(1, (multiprocessing.cpu_count() or 1) * 2)
+        layout.addRow(self.num_workers_label, self.num_workers_spin)
 
     def _detect_and_setup_devices(self):
         self.device_combo.addItem("CPU", "cpu")
@@ -474,27 +474,28 @@ class PerformancePanel(QGroupBox):
                     self.log_message.emit("DirectML GPU detected.", "success")
             except ImportError:
                 self.log_message.emit("ONNX Runtime not found, GPU support disabled.", "warning")
+
         self._on_device_change(self.device_combo.currentData())
 
     @Slot(str)
     def _on_device_change(self, device_key: str):
         is_cpu = device_key == "cpu"
 
-        self.cpu_workers_spin.setVisible(is_cpu)
-        self.layout().labelForField(self.cpu_workers_spin).setVisible(is_cpu)
-
-        self.gpu_preproc_workers_spin.setVisible(not is_cpu)
-        self.layout().labelForField(self.gpu_preproc_workers_spin).setVisible(not is_cpu)
+        if is_cpu:
+            self.num_workers_label.setText("CPU Workers:")
+        else:
+            self.num_workers_label.setText("CPU Preproc Workers:")
 
         self.device_changed.emit(is_cpu)
 
     @Slot(str)
-    def update_precision_presets(self, scan_mode: str):
+    def update_precision_presets(self, scan_mode_name: str):
         self.search_precision_combo.blockSignals(True)
         self.search_precision_combo.clear()
 
         all_presets = list(SEARCH_PRECISION_PRESETS.keys())
-        presets = [p for p in all_presets if "Exhaustive" not in p] if scan_mode == "duplicates" else all_presets
+        is_duplicate_mode = scan_mode_name == ScanMode.DUPLICATES.name
+        presets = [p for p in all_presets if "Exhaustive" not in p] if is_duplicate_mode else all_presets
         self.search_precision_combo.addItems(presets)
 
         current_setting = self.settings.search_precision
@@ -515,8 +516,7 @@ class PerformancePanel(QGroupBox):
         self.quant_combo.setCurrentText(s.quantization_mode)
         self.batch_size_spin.setValue(int(s.perf_batch_size))
         self.search_precision_combo.setCurrentText(s.search_precision)
-        self.cpu_workers_spin.setValue(int(s.perf_model_workers))
-        self.gpu_preproc_workers_spin.setValue(int(getattr(s, "perf_gpu_preproc_workers", 4)))
+        self.num_workers_spin.setValue(int(s.perf_num_workers))
 
 
 class SystemStatusPanel(QGroupBox):
@@ -650,7 +650,7 @@ class ResultsPanel(QGroupBox):
         self.similarity_filter_slider.setRange(0, 100)
         self.similarity_filter_slider.setValue(0)
         self.similarity_filter_value_label = QLabel("0%")
-        self.similarity_filter_value_label.setFixedWidth(40)
+        self.similarity_filter_value_label.setFixedWidth(UIConfig.Sizes.SIMILARITY_LABEL_WIDTH)
         filter_controls_layout.addWidget(self.similarity_filter_label)
         filter_controls_layout.addWidget(self.similarity_filter_slider)
         filter_controls_layout.addWidget(self.similarity_filter_value_label)
@@ -692,11 +692,11 @@ class ResultsPanel(QGroupBox):
 
     @Slot(QModelIndex)
     def _on_fetch_completed(self, parent_index: QModelIndex):
-        if self.results_model.mode in ["text_search", "sample_search"]:
+        if self.results_model.mode in [ScanMode.TEXT_SEARCH, ScanMode.SAMPLE_SEARCH]:
             self._emit_visible_results()
 
     def _emit_visible_results(self):
-        if self.results_model.mode not in ["text_search", "sample_search"]:
+        if self.results_model.mode not in [ScanMode.TEXT_SEARCH, ScanMode.SAMPLE_SEARCH]:
             return
         visible_items = []
         if self.proxy_model.rowCount() > 0:
@@ -746,7 +746,7 @@ class ResultsPanel(QGroupBox):
 
     def set_enabled_state(self, is_enabled: bool):
         has_results = self.results_model.rowCount() > 0
-        is_duplicate_mode = self.results_model.mode == "duplicates"
+        is_duplicate_mode = self.results_model.mode == ScanMode.DUPLICATES
 
         enable_general = is_enabled and has_results
         for w in [self.results_view, self.search_entry, self.expand_button, self.collapse_button]:
@@ -779,11 +779,11 @@ class ResultsPanel(QGroupBox):
     def display_results(self, payload, num_found, mode):
         self.search_entry.clear()
         self.results_model.load_data(payload, mode)
-        is_search_mode = mode in ["text_search", "sample_search"]
+        is_search_mode = mode in [ScanMode.TEXT_SEARCH, ScanMode.SAMPLE_SEARCH]
         self.filter_widget.setVisible(is_search_mode)
         self.similarity_filter_slider.setValue(0)
         self.setTitle(f"Results {self.results_model.get_summary_text()}")
-        is_duplicate_mode = self.results_model.mode == "duplicates"
+        is_duplicate_mode = self.results_model.mode == ScanMode.DUPLICATES
         for widget in [
             self.sort_combo,
             self.select_all_button,
@@ -826,7 +826,7 @@ class ResultsPanel(QGroupBox):
         if not node:
             return
 
-        if self.results_model.mode == "duplicates":
+        if self.results_model.mode == ScanMode.DUPLICATES:
             group_id = node.get("group_id", -1)
             scroll_to_path = Path(node["path"]) if node.get("type") != "group" else None
             if group_id != -1:
@@ -985,7 +985,7 @@ class ImageViewerPanel(QGroupBox):
         self.compare_button = QPushButton("Compare (0)")
         parent_layout.addWidget(self.compare_button)
         self.model = ImagePreviewModel(self.thread_pool, self)
-        self.delegate = ImageItemDelegate(self.settings.preview_size, self)
+        self.delegate = ImageItemDelegate(self.settings.preview_size, self.state, self)
         self.list_view = ResizedListView(self)
         self.list_view.setModel(self.model)
         self.list_view.setItemDelegate(self.delegate)
@@ -1011,7 +1011,7 @@ class ImageViewerPanel(QGroupBox):
             btn = QPushButton(channel)
             btn.setCheckable(True)
             btn.setChecked(True)
-            btn.setFixedSize(28, 28)
+            btn.setFixedSize(UIConfig.Sizes.CHANNEL_BUTTON_SIZE, UIConfig.Sizes.CHANNEL_BUTTON_SIZE)
             btn.toggled.connect(self._on_channel_toggled)
             self.channel_buttons[channel] = btn
             self._update_channel_button_style(btn, True)
@@ -1069,6 +1069,7 @@ class ImageViewerPanel(QGroupBox):
         self.overlay_alpha_slider.valueChanged.connect(self._on_overlay_alpha_change)
         self.compare_bg_alpha_slider.valueChanged.connect(self._on_alpha_change)
         self.state.candidates_changed.connect(self._update_compare_button)
+        self.state.candidate_updated.connect(self._on_candidate_updated)
         self.state.image_loaded.connect(self._on_full_res_image_loaded)
         self.state.load_complete.connect(self._on_load_complete)
         self.state.load_error.connect(self.log_message.emit)
@@ -1137,11 +1138,15 @@ class ImageViewerPanel(QGroupBox):
     def _on_item_clicked(self, index):
         if not (item := self.model.data(index, Qt.ItemDataRole.UserRole)):
             return
-        is_now_candidate = self.state.toggle_candidate(item)
-        if not is_now_candidate and len(self.state.get_candidate_paths()) == 2:
-            self.list_view.viewport().update()
-        else:
-            self.list_view.update(index)
+        self.state.toggle_candidate(item)
+
+    @Slot(str, str)
+    def _on_candidate_updated(self, added_path: str, removed_path: str):
+        """Trigger repaint for items that were added or removed from candidates."""
+        for path_str in [added_path, removed_path]:
+            if path_str and (row := self.model.get_row_for_path(Path(path_str))) is not None:
+                index = self.model.index(row, 0)
+                self.list_view.update(index)
 
     @Slot(int)
     def _update_compare_button(self, count):

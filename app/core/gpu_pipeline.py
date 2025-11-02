@@ -46,7 +46,7 @@ class GPUPipelineManager:
         self.cache = cache
         self.on_batch_processed_callback = on_batch_processed_callback
         self.ctx = multiprocessing.get_context("spawn")
-        self.num_workers = self.config.perf.gpu_preproc_workers
+        self.num_workers = self.config.perf.num_workers
         self.shared_mem_buffers = []
         self.infer_proc = None
 

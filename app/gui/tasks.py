@@ -35,6 +35,7 @@ class ModelConverter(QRunnable):
 
     def __init__(self, hf_model_name: str, onnx_name_base: str, quant_mode: QuantizationMode):
         super().__init__()
+        self.setAutoDelete(True)
         self.hf_model_name = hf_model_name
         self.onnx_name_base = onnx_name_base
         self.quant_mode = quant_mode
@@ -184,6 +185,7 @@ class ImageLoader(QRunnable):
         on_error_slot=None,
     ):
         super().__init__()
+        self.setAutoDelete(True)
         self.path_str = path_str
         self.mtime = mtime
         self.target_size = target_size
@@ -280,6 +282,7 @@ class GroupFetcherTask(QRunnable):
 
     def __init__(self, db_path: Path, group_id: int, mode: str, parent: QModelIndex):
         super().__init__()
+        self.setAutoDelete(True)
         self.db_path = db_path
         self.group_id = group_id
         self.mode = mode
@@ -328,6 +331,7 @@ class FileOperationTask(QRunnable):
 
     def __init__(self, mode: str, paths: list[Path] | None = None, link_map: dict[Path, Path] | None = None):
         super().__init__()
+        self.setAutoDelete(True)
         self.mode = mode
         self.paths = paths or []
         self.link_map = link_map or {}

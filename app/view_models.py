@@ -1,6 +1,7 @@
 # app/view_models.py
 """Contains View-Model classes that manage UI state and logic, separating it from the view widgets."""
 
+from collections import OrderedDict
 from pathlib import Path
 
 from PIL import Image
@@ -15,6 +16,7 @@ class ImageComparerState(QObject):
     """Manages the state and logic for the image comparison view."""
 
     candidates_changed = Signal(int)
+    candidate_updated = Signal(str, str)
     images_loading = Signal()
     image_loaded = Signal(str, QPixmap)
     load_complete = Signal()
@@ -28,42 +30,58 @@ class ImageComparerState(QObject):
         """
         super().__init__()
         self.thread_pool = thread_pool
-        self._candidates: dict[str, dict] = {}
+        self._candidates: OrderedDict[str, dict] = OrderedDict()
         self._pil_images: dict[str, Image.Image] = {}
         self._active_loaders: dict[str, ImageLoader] = {}
 
-    def toggle_candidate(self, item_data: dict) -> bool:
+    def toggle_candidate(self, item_data: dict):
         """Adds or removes an item from the comparison candidates list.
-        Maintains a maximum of two candidates.
+        Maintains a maximum of two candidates and emits signals for UI updates.
         """
         path_str = item_data["path"]
-        is_candidate = not item_data.get("is_compare_candidate", False)
-        item_data["is_compare_candidate"] = is_candidate
+        is_currently_candidate = path_str in self._candidates
 
-        if is_candidate:
-            self._candidates[path_str] = item_data
-            if len(self._candidates) > 2:
-                # Get the first key inserted into the dictionary (oldest)
-                oldest_path = next(iter(self._candidates))
-                self._candidates[oldest_path]["is_compare_candidate"] = False
-                del self._candidates[oldest_path]
+        added_path, removed_path = "", ""
+
+        if is_currently_candidate:
+            # Remove the item
+            del self._candidates[path_str]
+            removed_path = path_str
         else:
-            if path_str in self._candidates:
-                del self._candidates[path_str]
+            # Add the item
+            self._candidates[path_str] = item_data
+            added_path = path_str
+            if len(self._candidates) > 2:
+                # If we've added a 3rd, remove the oldest one
+                oldest_path, _ = self._candidates.popitem(last=False)
+                removed_path = oldest_path
 
         self.candidates_changed.emit(len(self._candidates))
-        return is_candidate
+        self.candidate_updated.emit(added_path, removed_path)
+
+    # NEW: Public method for the delegate to query the state.
+    def is_candidate(self, path_str: str) -> bool:
+        """Checks if a given path is currently a comparison candidate."""
+        return path_str in self._candidates
 
     def get_candidate_paths(self) -> list[str]:
         """Returns the paths of the current comparison candidates."""
         return list(self._candidates.keys())
 
     def clear_candidates(self):
-        """Clears the list of comparison candidates."""
-        for item_data in self._candidates.values():
-            item_data["is_compare_candidate"] = False
+        """Clears the list of comparison candidates and notifies the UI."""
+        if not self._candidates:
+            return
+
+        removed_paths = list(self._candidates.keys())
         self._candidates.clear()
+
         self.candidates_changed.emit(0)
+        # Notify UI to un-highlight all previously selected items
+        if len(removed_paths) == 1:
+            self.candidate_updated.emit("", removed_paths[0])
+        elif len(removed_paths) == 2:
+            self.candidate_updated.emit(removed_paths[0], removed_paths[1])
 
     def load_full_res_images(self, tonemap_mode: str):
         """Starts loading full-resolution images for the selected candidates in the background."""

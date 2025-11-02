@@ -6,6 +6,7 @@ and QListView. These components are responsible for managing and presenting data
 import logging
 from collections import OrderedDict, defaultdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import (
     QAbstractItemModel,
@@ -22,7 +23,11 @@ from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QImage, QPen, QPi
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate
 
 from app.constants import DUCKDB_AVAILABLE, UIConfig
+from app.data_models import ScanMode
 from app.utils import find_common_base_name
+
+if TYPE_CHECKING:
+    from app.view_models import ImageComparerState
 
 from .tasks import GroupFetcherTask, ImageLoader
 from .widgets import AlphaBackgroundWidget
@@ -41,7 +46,7 @@ class ResultsTreeModel(QAbstractItemModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.db_path: Path | None = None
-        self.mode = ""
+        self.mode: ScanMode | str = ""
         self.groups_data: dict[int, dict] = {}
         self.sorted_group_ids: list[int] = []
         self.check_states: dict[str, Qt.CheckState] = {}
@@ -248,11 +253,8 @@ class ResultsTreeModel(QAbstractItemModel):
     def _get_display_data(self, index, node):
         if node.get("type") == "group":
             name, count = node["name"], node["count"]
-            display_text = (
-                f"{name} ({count} results)"
-                if self.mode in ["text_search", "sample_search"]
-                else f"Group: {name} ({count} duplicates)"
-            )
+            is_search = self.mode in [ScanMode.TEXT_SEARCH, ScanMode.SAMPLE_SEARCH]
+            display_text = f"{name} ({count} results)" if is_search else f"Group: {name} ({count} duplicates)"
             return display_text if index.column() == 0 else ""
 
         path = Path(node["path"])
@@ -261,13 +263,11 @@ class ResultsTreeModel(QAbstractItemModel):
         if col == 0:
             return path.name
         elif col == 1:
+            method_map = {"xxHash": "Exact Match", "dHash": "Simple Match", "pHash": "Near-Identical"}
             method = node.get("found_by")
-            if method == "xxHash":
-                return "Exact Match"
-            if method == "dHash":
-                return "Simple Match"  # Or another appropriate name
-            if method == "pHash":
-                return "Near-Identical"
+            if display_text := method_map.get(method):
+                return display_text
+
             dist = node.get("distance", -1)
             return f"{dist}%" if dist >= 0 else ""
         elif col == 2:
@@ -374,7 +374,7 @@ class ResultsTreeModel(QAbstractItemModel):
                 pass
         return (
             f"({num_groups} Groups, {total_items} duplicates)"
-            if self.mode == "duplicates"
+            if self.mode == ScanMode.DUPLICATES
             else f"({total_items} results found)"
         )
 
@@ -386,12 +386,12 @@ class ResultsTreeModel(QAbstractItemModel):
                 data["children"] = [f for f in data["children"] if f["path"] not in deleted_set]
                 data["count"] = len(data.get("children", []))
 
-            min_items = 2 if self.mode == "duplicates" else 1
+            min_items = 2 if self.mode == ScanMode.DUPLICATES else 1
             if data.get("count", 0) < min_items:
                 groups_to_remove.append(gid)
             elif (
                 data.get("fetched")
-                and self.mode == "duplicates"
+                and self.mode == ScanMode.DUPLICATES
                 and not any(f.get("is_best") for f in data["children"])
                 and data["children"]
             ):
@@ -546,9 +546,10 @@ class ImagePreviewModel(QAbstractListModel):
 class ImageItemDelegate(QStyledItemDelegate):
     """Custom delegate for rendering items in the ImagePreviewModel."""
 
-    def __init__(self, preview_size: int, parent=None):
+    def __init__(self, preview_size: int, state: "ImageComparerState", parent=None):
         super().__init__(parent)
         self.preview_size = preview_size
+        self.state = state
         self.bg_alpha, self.is_transparency_enabled = 255, True
         self.bold_font = QFont()
         self.bold_font.setBold(True)
@@ -586,7 +587,9 @@ class ImageItemDelegate(QStyledItemDelegate):
             highlight_color = option.palette.highlight().color()
             highlight_color.setAlpha(80)
             painter.fillRect(option.rect, highlight_color)
-        if item_data.get("is_compare_candidate", False):
+
+        path_str = item_data.get("path")
+        if path_str and self.state.is_candidate(path_str):
             painter.setPen(QPen(QColor(UIConfig.Colors.HIGHLIGHT), 2))
             painter.drawRect(option.rect.adjusted(1, 1, -1, -1))
 

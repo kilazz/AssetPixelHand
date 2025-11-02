@@ -7,6 +7,7 @@ consistency and avoids circular import dependencies.
 import json
 import threading
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -24,6 +25,12 @@ from app.constants import (
 
 if TYPE_CHECKING:
     from app.gui.panels import ImageViewerPanel, OptionsPanel, PerformancePanel, ScanOptionsPanel
+
+
+class ScanMode(Enum):
+    DUPLICATES = auto()
+    TEXT_SEARCH = auto()
+    SAMPLE_SEARCH = auto()
 
 
 @dataclass
@@ -91,8 +98,7 @@ SearchResult = list[tuple[ImageFingerprint, float]]
 class PerformanceConfig:
     """Stores performance-related settings for a scan."""
 
-    model_workers: int = 1
-    gpu_preproc_workers: int = 4
+    num_workers: int = 4
     run_at_low_priority: bool = True
     batch_size: int = 256
 
@@ -111,7 +117,7 @@ class ScanConfig:
     selected_extensions: list[str]
     perf: PerformanceConfig
     search_precision: str
-    scan_mode: str
+    scan_mode: ScanMode
     device: str
     find_exact_duplicates: bool
     find_simple_duplicates: bool
@@ -142,8 +148,7 @@ class AppSettings:
     find_exact_duplicates: bool = True
     find_simple_duplicates: bool = True
     find_perceptual_duplicates: bool = True
-    perf_model_workers: str = "1"
-    perf_gpu_preproc_workers: str = "4"
+    perf_num_workers: str = "4"
     perf_low_priority: bool = True
     perf_batch_size: str = "256"
     lancedb_in_memory: bool = True
@@ -163,9 +168,18 @@ class AppSettings:
             with open(CONFIG_FILE, encoding="utf-8") as f:
                 data = json.load(f)
             settings = cls()
+            if "perf_model_workers" in data or "perf_gpu_preproc_workers" in data:
+                num_workers = data.get("perf_model_workers", data.get("perf_gpu_preproc_workers", "4"))
+                data["perf_num_workers"] = num_workers
+                if "perf_model_workers" in data:
+                    del data["perf_model_workers"]
+                if "perf_gpu_preproc_workers" in data:
+                    del data["perf_gpu_preproc_workers"]
+
             for key, value in data.items():
                 if hasattr(settings, key):
                     setattr(settings, key, value)
+
             if not settings.selected_extensions:
                 settings.selected_extensions = list(ALL_SUPPORTED_EXTENSIONS)
             if not settings.folder_path or not Path(settings.folder_path).is_dir():
@@ -204,8 +218,7 @@ class AppSettings:
         self.visuals_columns = scan_options_panel.visuals_columns_spinbox.value()
 
         # Performance & AI Model
-        self.perf_model_workers = performance_panel.cpu_workers_spin.text()
-        self.perf_gpu_preproc_workers = performance_panel.gpu_preproc_workers_spin.text()
+        self.perf_num_workers = performance_panel.num_workers_spin.text()
         self.perf_batch_size = performance_panel.batch_size_spin.text()
         self.search_precision = performance_panel.search_precision_combo.currentText()
         self.device = performance_panel.device_combo.currentText()
@@ -259,7 +272,7 @@ class ScanState:
 class ScannerSignals(QObject):
     """A collection of signals used by the scanner to communicate with the GUI."""
 
-    finished = Signal(object, int, str, float, list)
+    finished = Signal(object, int, object, float, list)
     error = Signal(str)
     log = Signal(str, str)
     deletion_finished = Signal(list, int, int)

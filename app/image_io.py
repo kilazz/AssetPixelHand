@@ -54,38 +54,47 @@ def load_image(
     tonemap_mode: str = "reinhard",
 ) -> Image.Image | None:
     """Loads an image from a path or buffer using the best available library."""
-    # Convert string path to Path object for easier handling
     path = Path(path_or_buffer) if isinstance(path_or_buffer, (str, Path)) else Path("buffer.tmp")
+    filename = path.name
     ext = path.suffix.lower()
 
     pil_image = None
     if ext == ".dds" and DIRECTXTEX_AVAILABLE:
+        app_logger.debug(f"Attempting to load '{filename}' with DirectXTex.")
         try:
             pil_image = _load_with_directxtex(path, tonemap_mode)
+            app_logger.debug(f"Successfully loaded '{filename}' with DirectXTex.")
         except Exception as e:
-            app_logger.warning(f"DirectXTex Decoder failed for {path.name}: {e}. Falling back.")
+            app_logger.debug(f"DirectXTex failed for '{filename}': {e}. Falling back.")
 
     if pil_image is None and OIIO_AVAILABLE:
+        app_logger.debug(f"Attempting to load '{filename}' with OpenImageIO.")
         try:
-            # Pass the original path_or_buffer to OIIO, as it can handle buffers
             pil_image = _load_with_oiio(path_or_buffer, tonemap_mode)
+            app_logger.debug(f"Successfully loaded '{filename}' with OpenImageIO.")
         except Exception as e:
-            app_logger.debug(f"OIIO failed for {path.name}: {e}. Trying Pillow.")
+            app_logger.debug(f"OIIO failed for '{filename}': {e}. Falling back to Pillow.")
 
     if pil_image is None and PILLOW_AVAILABLE:
+        app_logger.debug(f"Attempting to load '{filename}' with Pillow.")
         try:
             with Image.open(path_or_buffer) as img:
-                img.load()  # Make sure image data is loaded into memory
+                img.load()
             pil_image = img
+            app_logger.debug(f"Successfully loaded '{filename}' with Pillow.")
         except Exception as e:
-            app_logger.error(f"All loaders failed for {path.name}. Final Pillow error: {e}")
+            app_logger.error(f"All loaders failed for '{filename}'. Final Pillow error: {e}")
             return None
 
     if pil_image:
         if target_size:
             pil_image.thumbnail(target_size, Image.Resampling.LANCZOS)
-        # Ensure final image is RGBA for consistency in the UI
-        return pil_image.convert("RGBA")
+        if pil_image.mode != "RGBA":
+            return pil_image.convert("RGBA")
+        return pil_image
+
+    if not any([DIRECTXTEX_AVAILABLE, OIIO_AVAILABLE, PILLOW_AVAILABLE]):
+        app_logger.error("No image loading libraries (Pillow, OIIO, etc.) are installed.")
 
     return None
 
@@ -95,8 +104,10 @@ def get_image_metadata(path: Path) -> dict[str, Any] | None:
     try:
         stat = path.stat()
         ext = path.suffix.lower()
+        filename = path.name
 
         if ext == ".dds" and DIRECTXTEX_AVAILABLE:
+            app_logger.debug(f"Getting metadata for '{filename}' with DirectXTex.")
             try:
                 with path.open("rb") as f:
                     meta = directxtex_decoder.get_dds_metadata(f.read())
@@ -114,12 +125,15 @@ def get_image_metadata(path: Path) -> dict[str, Any] | None:
                     "bit_depth": bit_depth,
                 }
             except Exception as e:
-                app_logger.debug(f"DirectXTex metadata failed for {path.name}: {e}. Falling back.")
+                app_logger.debug(f"DirectXTex metadata failed for '{filename}': {e}. Falling back.")
 
         if OIIO_AVAILABLE:
+            app_logger.debug(f"Getting metadata for '{filename}' with OpenImageIO.")
             try:
-                # Use str(path) for OIIO as it's more reliable
                 buf = oiio.ImageBuf(str(path))
+                if buf.has_error:
+                    raise RuntimeError(f"OIIO Error: {buf.geterror()}")
+
                 spec = buf.spec()
                 bit_depth = {
                     oiio.UINT8: 8,
@@ -144,9 +158,10 @@ def get_image_metadata(path: Path) -> dict[str, Any] | None:
                         result["capture_date"] = datetime.strptime(dt, "%Y:%m:%d %H:%M:%S").timestamp()
                 return result
             except Exception as e:
-                app_logger.debug(f"OIIO metadata failed for {path.name}: {e}. Falling back.")
+                app_logger.debug(f"OIIO metadata failed for '{filename}': {e}. Falling back.")
 
         if PILLOW_AVAILABLE:
+            app_logger.debug(f"Getting metadata for '{filename}' with Pillow.")
             with Image.open(path) as img:
                 return {
                     "resolution": img.size,
@@ -194,11 +209,9 @@ def _load_with_directxtex(path: Path, tonemap_mode: str) -> Image.Image | None:
         decoded = directxtex_decoder.decode_dds(f.read())
     numpy_array, dtype = decoded["data"], decoded["data"].dtype
     if np.issubdtype(dtype, np.floating):
-        # Apply tonemapping only if a mode is explicitly set
         if tonemap_mode != "none":
             return Image.fromarray(_tonemap_float_array(numpy_array.astype(np.float32), tonemap_mode))
         else:
-            # Just clip and convert for display without tonemapping
             return Image.fromarray((np.clip(numpy_array, 0.0, 1.0) * 255).astype(np.uint8))
     elif np.issubdtype(dtype, np.uint16):
         return Image.fromarray((numpy_array // 257).astype(np.uint8))
@@ -212,24 +225,19 @@ def _load_with_directxtex(path: Path, tonemap_mode: str) -> Image.Image | None:
 
 
 def _load_with_oiio(path_or_buffer: str | Path | io.BytesIO, tonemap_mode: str) -> Image.Image | None:
-    # OIIO works best with string paths
     path_str = str(path_or_buffer) if isinstance(path_or_buffer, (str, Path)) else path_or_buffer
-    numpy_array = oiio.ImageBuf(path_str).get_pixels()
+    buf = oiio.ImageBuf(path_str)
+    if buf.has_error:
+        raise RuntimeError(f"OIIO Error: {buf.geterror()}")
+
+    numpy_array = buf.get_pixels()
 
     if np.issubdtype(numpy_array.dtype, np.floating):
-        # Heuristic to check if the image is actually HDR by checking if any pixel value exceeds 1.0.
-        # Normalized LDR images (like 16-bit PNGs) will not have values > 1.0.
         is_hdr = np.max(numpy_array) > 1.0
-
-        # Only apply tonemapping if it's a true HDR image AND a tonemapping mode is requested.
         if is_hdr and tonemap_mode != "none":
             return Image.fromarray(_tonemap_float_array(numpy_array, tonemap_mode))
         else:
-            # For normalized LDR images or HDR images where no tonemapping is requested,
-            # just clip the values to the displayable range [0.0, 1.0] and convert to 8-bit.
             return Image.fromarray((np.clip(numpy_array, 0.0, 1.0) * 255).astype(np.uint8))
-
-    # Handle integer types as before
     elif numpy_array.dtype != np.uint8:
         if numpy_array.dtype == np.uint16:
             numpy_array = numpy_array // 256
@@ -240,20 +248,16 @@ def _load_with_oiio(path_or_buffer: str | Path | io.BytesIO, tonemap_mode: str) 
 
 def _tonemap_float_array(float_array: np.ndarray, mode: str) -> np.ndarray:
     """Applies a tonemapping algorithm to a NumPy array of float pixel data."""
-    # Ensure we don't modify the original array in place if it's not a copy
     rgb = np.copy(float_array[..., :3])
     alpha = float_array[..., 3:4] if float_array.shape[-1] == 4 else None
 
     rgb[rgb < 0.0] = 0.0
 
     if mode == "reinhard":
-        # Reinhard tonemapping
         gamma_corrected = np.power(rgb / (1.0 + rgb), 1.0 / 2.2)
     elif mode == "drago":
-        # Simplified Drago tonemapping
         gamma_corrected = np.power(np.log(1.0 + 5.0 * rgb) / np.log(6.0), 1.0 / 1.9)
-    else:  # mode == "none" or unknown
-        # Simple clipping for basic display
+    else:
         gamma_corrected = np.clip(rgb, 0.0, 1.0)
 
     final_rgb = (gamma_corrected * 255).astype(np.uint8)

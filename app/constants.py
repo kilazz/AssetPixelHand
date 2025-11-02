@@ -30,7 +30,6 @@ CONFIG_FILE = APP_DATA_DIR / "app_settings.json"
 CACHE_DIR = APP_DATA_DIR / ".cache"
 
 # --- Ensure the cache directory is created on startup ---
-# This guarantees the folder exists before any part of the app tries to write to it.
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 RESULTS_DB_FILE = CACHE_DIR / "results.duckdb"
@@ -97,8 +96,6 @@ ALL_SUPPORTED_EXTENSIONS = sorted(set(_all_ext))
 
 
 # --- Supported AI Models ---
-
-
 def _get_default_models() -> dict:
     """Returns the hardcoded default model configuration."""
     return {
@@ -169,9 +166,16 @@ class UIConfig:
         HIGHLIGHT = "#4A90E2"
 
     class Sizes:
+        # General
         BROWSE_BUTTON_WIDTH = 35
-        PREVIEW_LABEL_WIDTH = 40
+        # Scan Options Panel
+        MAX_VISUALS_ENTRY_WIDTH = 45
+        VISUALS_COLUMNS_SPINBOX_WIDTH = 40
+        # Results Panel
+        SIMILARITY_LABEL_WIDTH = 40
+        # Viewer Panel
         ALPHA_LABEL_WIDTH = 30
+        CHANNEL_BUTTON_SIZE = 28
         PREVIEW_MIN_SIZE = 100
         PREVIEW_MAX_SIZE = 500
 

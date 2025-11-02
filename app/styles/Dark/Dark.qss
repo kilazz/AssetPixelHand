@@ -1,12 +1,35 @@
-* {
-    font-family: "Helvetica Neue", "Helvetica", "Arial", sans-serif;
-    font-size: 9pt;
-}
+/* --- PALETTE & VARIABLES ---
+ * Main Palette:
+ *   - Darkest (Inputs, Popups): #1e1f22
+ *   - Darker (Main BG, Views):  #2b2d31
+ *   - Dark (App BG):            #313338
+ *   - Mid-Gray (Borders):       #202225
+ *   - Gray (Button BG):         #4e5058
+ *
+ * Text & Accents:
+ *   - Text Primary:             #dcddde
+ *   - Text Secondary:           #949ba4
+ *   - Text Disabled:            #7c808a
+ *
+ * Brand & Actions:
+ *   - Primary Action (Blue):    #5865f2
+ *   - Success (Green):          #248046
+ *   - Destructive (Red):        #da373c
+ *   - Warning (Yellow):         #f0b132
+ *
+ * Key Metrics:
+ *   - Border Radius: 3px / 4px
+ *   - Font Size: 9pt (main), 8pt (labels)
+ * ------------------------------------------------- */
 
+
+/* 1. GLOBAL & TYPOGRAPHY */
 QWidget {
     background-color: #313338;
     color: #dcddde;
-    border: 0px;
+    font-family: "Helvetica Neue", "Helvetica", "Arial", sans-serif;
+    font-size: 9pt;
+    border: none;
     padding: 0px;
     margin: 0px;
 }
@@ -15,66 +38,73 @@ QWidget:disabled {
     color: #7c808a;
 }
 
+QLabel {
+    background-color: transparent;
+}
+
+
+/* 2. MAIN CONTAINERS */
 QGroupBox {
     font-weight: bold;
     background-color: #2b2d31;
     border: 1px solid #202225;
     border-radius: 4px;
-    margin-top: 10px;
+    margin-top: 10px; /* Provides space for the title */
     padding: 6px;
 }
 
+/* Position the title over the top margin */
 QGroupBox::title {
     subcontrol-origin: margin;
     subcontrol-position: top left;
     left: 10px;
-    padding: 0 4px 0 4px;
+    padding: 0 4px;
     color: #949ba4;
     font-size: 8pt;
     text-transform: uppercase;
 }
 
+
+/* 3. INPUT CONTROLS (LineEdit, SpinBox, ComboBox) */
 QLineEdit, QSpinBox, QComboBox {
     background-color: #1e1f22;
-    color: #dcddde;
     border: 1px solid #1e1f22;
     border-radius: 3px;
     padding: 5px;
-    min-height: 18px;
+    min-height: 18px; /* Fixed height for consistency */
     max-height: 18px;
     min-width: 60px;
 }
 
 QLineEdit:hover, QSpinBox:hover, QComboBox:hover {
-    border: 1px solid #3c4196;
+    border-color: #3c4196;
 }
 
 QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
-    border: 1px solid #5865f2;
+    border-color: #5865f2;
 }
 
 QComboBox::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: top right;
     width: 20px;
-    border-left-width: 1px;
-    border-left-color: #4e5058;
-    border-left-style: solid;
+    border-left: 1px solid #4e5058;
     border-top-right-radius: 3px;
     border-bottom-right-radius: 3px;
 }
 
+/* Pure QSS triangle for the dropdown arrow */
 QComboBox::down-arrow {
     width: 0;
     height: 0;
-    border-left: 5px solid transparent;
-    border-right: 5px solid transparent;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
     border-top: 5px solid #949ba4;
     margin: 0 auto;
 }
 
 QComboBox::down-arrow:on {
-    border-top: 5px solid #5865f2;
+    border-top-color: #5865f2;
 }
 
 QComboBox QAbstractItemView {
@@ -85,6 +115,8 @@ QComboBox QAbstractItemView {
     min-width: 100px;
 }
 
+
+/* 4. BUTTONS */
 QPushButton {
     background-color: #4e5058;
     color: #f2f3f5;
@@ -103,60 +135,49 @@ QPushButton:pressed {
 }
 
 QPushButton:disabled {
-    background-color: #2b2d31;
+    background-color: #3a3c41;
     color: #7c808a;
-    border-color: #3a3c41;
 }
 
+/* Specific button types */
 QPushButton#scan_button {
     background-color: #248046;
     border-color: #248046;
     font-weight: bold;
 }
-
-QPushButton#scan_button:hover {
-    background-color: #2a914f;
-}
+QPushButton#scan_button:hover { background-color: #2a914f; }
 
 QPushButton#delete_button, QPushButton#clear_all_data_button {
     background-color: #da373c;
     border-color: #da373c;
 }
-
-QPushButton#delete_button:hover, QPushButton#clear_all_data_button:hover {
-    background-color: #e8454b;
-}
+QPushButton#delete_button:hover, QPushButton#clear_all_data_button:hover { background-color: #e8454b; }
 
 QPushButton#hardlink_button, QPushButton#reflink_button {
     background-color: #5865f2;
     border-color: #5865f2;
 }
-
-QPushButton#hardlink_button:hover, QPushButton#reflink_button:hover {
-    background-color: #6974f3;
-}
+QPushButton#hardlink_button:hover, QPushButton#reflink_button:hover { background-color: #6974f3; }
 
 QPushButton#clear_models_button {
     background-color: #f0b132;
     border-color: #f0b132;
     color: #1e1f22;
 }
+QPushButton#clear_models_button:hover { background-color: #f2bd4e; }
 
-QPushButton#clear_models_button:hover {
-    background-color: #f2bd4e;
-}
 
+/* 5. ITEM VIEWS (TreeView, ListView) */
 QTreeView, QListView {
     background-color: #2b2d31;
     border: 1px solid #202225;
     border-radius: 4px;
-    outline: 0;
+    outline: 0; /* Remove focus rect */
 }
 
 QTreeView::item, QListView::item {
     padding: 4px;
     border-radius: 3px;
-    height: 24px;
 }
 
 QTreeView::item:hover, QListView::item:hover {
@@ -164,7 +185,7 @@ QTreeView::item:hover, QListView::item:hover {
 }
 
 QTreeView::item:selected, QListView::item:selected {
-    background-color: #5865f2;
+    background-color: #4752c4; /* Slightly darker blue for selection */
     color: #f2f3f5;
 }
 
@@ -180,37 +201,24 @@ QHeaderView::section {
     height: 24px;
 }
 
-QScrollBar:vertical {
-    border: none;
+
+/* 6. SCROLLBARS & SLIDERS */
+QScrollBar {
     background: #2b2d31;
-    width: 8px;
+    border: none;
     margin: 0;
 }
+QScrollBar:vertical { width: 8px; }
+QScrollBar:horizontal { height: 8px; }
 
-QScrollBar::handle:vertical {
+QScrollBar::handle {
     background: #1e1f22;
-    min-height: 20px;
     border-radius: 4px;
 }
+QScrollBar::handle:vertical { min-height: 20px; }
+QScrollBar::handle:horizontal { min-width: 20px; }
 
-QScrollBar::handle:vertical:hover {
-    background: #232428;
-}
-
-QScrollBar:horizontal {
-    border: none;
-    background: #2b2d31;
-    height: 8px;
-    margin: 0px;
-}
-
-QScrollBar::handle:horizontal {
-    background: #1e1f22;
-    min-width: 20px;
-    border-radius: 4px;
-}
-
-QScrollBar::handle:horizontal:hover {
+QScrollBar::handle:hover {
     background: #232428;
 }
 
@@ -237,15 +245,17 @@ QSlider::handle:horizontal {
 }
 
 QSlider::handle:horizontal:hover {
-    background: #fff;
-    border-color: #fff;
+    background: #ffffff;
+    border-color: #ffffff;
 }
 
-QCheckBox, QLabel {
+
+/* 7. INDICATORS (CheckBox, TreeView Branch) */
+QCheckBox, QTreeView::indicator {
     background-color: transparent;
 }
 
-QTreeView::indicator, QCheckBox::indicator {
+QCheckBox::indicator, QTreeView::indicator {
     width: 16px;
     height: 16px;
     background-color: #1e1f22;
@@ -253,29 +263,23 @@ QTreeView::indicator, QCheckBox::indicator {
     border-radius: 4px;
 }
 
-QTreeView::indicator:hover, QCheckBox::indicator:hover {
+QCheckBox::indicator:hover, QTreeView::indicator:hover {
     border-color: #5865f2;
 }
 
-QTreeView::indicator:checked, QCheckBox::indicator:checked {
+/* The native checkmark will be drawn by Qt's style engine */
+QCheckBox::indicator:checked, QTreeView::indicator:checked {
     background-color: #5865f2;
-    border: 1px solid #5865f2;
-    image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><path fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" d="M20 6L9 17l-5-5"></path></svg>');
+    border-color: #5865f2;
 }
 
-QTreeView::indicator:checked:hover, QCheckBox::indicator:checked:hover {
+QCheckBox::indicator:checked:hover, QTreeView::indicator:checked:hover {
     background-color: #6974f3;
     border-color: #6974f3;
 }
 
-QTreeView::indicator:selected:unchecked, QTreeView::indicator:selected:!checked {
-    background-color: #1e1f22;
-}
 
-QTreeView::indicator:selected:checked {
-    background-color: #5865f2;
-}
-
+/* 8. OTHER WIDGETS */
 QSplitter::handle {
     background-color: #202225;
 }
@@ -284,10 +288,8 @@ QSplitter::handle:hover {
     background-color: #5865f2;
 }
 
-QSplitter::handle:horizontal, QSplitter::handle:vertical {
-    width: 2px;
-    height: 2px;
-}
+QSplitter::handle:horizontal { width: 4px; }
+QSplitter::handle:vertical { height: 4px; }
 
 QPlainTextEdit#log_display {
     background-color: #1e1f22;
@@ -304,9 +306,8 @@ QMenu {
 }
 
 QMenu::item {
-    padding: 5px 20px 5px 20px;
+    padding: 5px 20px;
     border-radius: 3px;
-    height: 24px;
 }
 
 QMenu::item:selected {

@@ -120,7 +120,7 @@ class FingerprintEngine(QObject):
         success, all_skipped = False, []
         try:
             if self.config.device == "cpu":
-                num_workers = self.config.perf.model_workers
+                num_workers = self.config.perf.num_workers
                 success, all_skipped = self._run_cpu_pipeline(files_to_process, stop_event, cache, num_workers)
             else:
                 gpu_pipeline = GPUPipelineManager(
@@ -288,7 +288,7 @@ class LanceDBSimilarityEngine(QObject):
         all_links = set()
 
         ctx = multiprocessing.get_context("spawn")
-        num_workers = self.config.perf.model_workers
+        num_workers = self.config.perf.num_workers
 
         search_params = {
             "distance_threshold": self.distance_threshold,

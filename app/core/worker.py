@@ -174,8 +174,7 @@ def worker_wrapper_from_paths(
     try:
         images, fps, skipped_tuples = _process_batch_from_paths(paths, g_inference_engine.input_size)
         if images:
-            image_list = [np.array(img.convert("RGB")) for img in images]
-            inputs = g_inference_engine.processor(images=image_list, return_tensors="np")
+            inputs = g_inference_engine.processor(images=images, return_tensors="np")
             pixel_values = inputs.pixel_values.astype(np.float16 if g_inference_engine.is_fp16 else np.float32)
 
             io_binding = g_inference_engine.visual_session.io_binding()
@@ -207,8 +206,7 @@ def worker_wrapper_from_paths_cpu_shared_mem(
         if not images:
             return None, [], skipped_tuples
 
-        np_images = [np.array(img.convert("RGB")) for img in images]
-        pixel_values = g_preprocessor(images=np_images, return_tensors="np").pixel_values
+        pixel_values = g_preprocessor(images=images, return_tensors="np").pixel_values
 
         shm_name = g_free_buffers_q.get()
         existing_shm = shared_memory.SharedMemory(name=shm_name)
@@ -313,8 +311,7 @@ def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
             return None
         if images:
             io_binding = g_inference_engine.visual_session.io_binding()
-            image_list = [np.array(img.convert("RGB")) for img in images]
-            pixel_values = g_inference_engine.processor(images=image_list, return_tensors="np").pixel_values
+            pixel_values = g_inference_engine.processor(images=images, return_tensors="np").pixel_values
             io_binding.bind_cpu_input(
                 "pixel_values",
                 pixel_values.astype(np.float16 if g_inference_engine.is_fp16 else np.float32),

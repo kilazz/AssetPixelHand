@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from app.constants import QuantizationMode
-from app.data_models import PerformanceConfig, ScanConfig
+from app.data_models import PerformanceConfig, ScanConfig, ScanMode
 
 if TYPE_CHECKING:
     from app.gui.panels import OptionsPanel, PerformancePanel, ScanOptionsPanel
@@ -55,7 +55,7 @@ class ScanConfigBuilder:
             visuals_columns=self.scan_opts.visuals_columns_spinbox.value(),
             tonemap_visuals=self.scan_opts.visuals_tonemap_check.isChecked(),
             search_precision=self.perf.search_precision_combo.currentText(),
-            search_query=self.opts.search_entry.text() if self.opts.current_scan_mode == "text_search" else None,
+            search_query=self.opts.search_entry.text() if self.opts.current_scan_mode == ScanMode.TEXT_SEARCH else None,
             sample_path=self.opts._sample_path,
             perf=performance_config,
         )
@@ -72,10 +72,10 @@ class ScanConfigBuilder:
 
     def _validate_search_inputs(self):
         """Validates inputs specific to text or sample search modes."""
-        if self.opts.current_scan_mode == "text_search" and not self.opts.search_entry.text().strip():
+        if self.opts.current_scan_mode == ScanMode.TEXT_SEARCH and not self.opts.search_entry.text().strip():
             raise ValueError("Please enter a text search query.")
 
-        if self.opts.current_scan_mode == "sample_search":
+        if self.opts.current_scan_mode == ScanMode.SAMPLE_SEARCH:
             sample_path = self.opts._sample_path
             if not (sample_path and sample_path.is_file()):
                 raise ValueError("Please select a valid sample image for the search.")
@@ -96,18 +96,12 @@ class ScanConfigBuilder:
             if batch_size <= 0:
                 raise ValueError
         except ValueError:
-            # Suppress the original exception context to provide a cleaner error message.
             raise ValueError("Batch size must be a positive integer.") from None
 
-        is_cpu_mode = self.perf.device_combo.currentData() == "cpu"
-
-        # Use the worker setting that is currently visible to the user, with a ternary operator.
-        num_workers = self.perf.cpu_workers_spin.value() if is_cpu_mode else self.perf.gpu_preproc_workers_spin.value()
+        num_workers = self.perf.num_workers_spin.value()
 
         return PerformanceConfig(
-            # Both config settings now receive the same, unified value.
-            model_workers=num_workers,
-            gpu_preproc_workers=num_workers,
+            num_workers=num_workers,
             run_at_low_priority=self.scan_opts.low_priority_check.isChecked(),
             batch_size=batch_size,
         )
