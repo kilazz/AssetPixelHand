@@ -9,6 +9,7 @@ import webbrowser
 from enum import Enum, auto
 from pathlib import Path
 
+import duckdb
 from PIL import Image, ImageChops
 from PIL.ImageQt import ImageQt
 from PySide6.QtCore import QModelIndex, QPoint, Qt, QThreadPool, QTimer, Signal, Slot
@@ -393,7 +394,6 @@ class ScanOptionsPanel(QGroupBox):
             self.perceptual_duplicates_check.setChecked(False)
 
     def toggle_visuals_option(self, is_checked):
-        # The visuals layout is the 6th item added to the main layout (index 5)
         visuals_layout_item = self.layout().itemAt(5)
         if visuals_layout_item is None:
             return
@@ -874,9 +874,28 @@ class ResultsPanel(QGroupBox):
             self.set_operation_in_progress(FileOperation.REFLINKING)
             self.reflink_requested.emit(to_link)
 
+    def remove_items_from_results_db(self, paths_to_delete: list[Path]):
+        """Physically removes rows from the results.duckdb file."""
+        if not self.results_model.db_path or not paths_to_delete:
+            return
+
+        try:
+            with duckdb.connect(database=str(self.results_model.db_path), read_only=False) as conn:
+                conn.execute("CREATE TEMPORARY TABLE paths_to_delete (path VARCHAR)")
+                conn.executemany("INSERT INTO paths_to_delete VALUES (?)", [(str(p),) for p in paths_to_delete])
+
+                result = conn.execute("DELETE FROM results WHERE path IN (SELECT path FROM paths_to_delete)")
+                app_logger.info(f"Removed {result.fetchone()[0]} rows from results.duckdb.")
+        except duckdb.Error as e:
+            app_logger.error(f"Failed to remove items from results.duckdb: {e}")
+
     def update_after_deletion(self, deleted_paths: list[Path]):
         expanded = self._get_expanded_group_ids()
         self.results_model.remove_deleted_paths(deleted_paths)
+
+        self.proxy_model.sourceModel().beginResetModel()
+        self.proxy_model.sourceModel().endResetModel()
+
         self.setTitle(f"Results {self.results_model.get_summary_text()}")
         self._restore_expanded_group_ids(expanded)
         if self.results_model.rowCount() == 0:

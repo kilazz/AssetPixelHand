@@ -20,9 +20,7 @@ class FileOperationManager(QObject):
     operations from running simultaneously and handles UI updates upon completion.
     """
 
-    # Signal emitted to the main window to re-enable the UI after an operation
-    operation_finished = Signal()
-    # Signal to pass log messages to the UI's log panel
+    operation_finished = Signal(list)
     log_message = Signal(str, str)
 
     def __init__(self, thread_pool: QThreadPool, results_panel: "ResultsPanel", parent: QObject | None = None):
@@ -122,8 +120,8 @@ class FileOperationManager(QObject):
         level = "success" if failed == 0 else "warning" if count > 0 else "error"
         self.log_message.emit(f"{op_name} {count} files. Failed: {failed}.", level)
 
-        self.results_panel.update_after_deletion(affected_paths)
-
         self._is_operation_in_progress = False
         self.results_panel.clear_operation_in_progress()
-        self.operation_finished.emit()
+
+        # Emit the result to the main window for coordinated UI updates
+        self.operation_finished.emit(affected_paths)

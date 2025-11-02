@@ -266,6 +266,7 @@ class App(QMainWindow):
 
         scan_opts = self.scan_options_panel
         scan_opts.exact_duplicates_check.toggled.connect(self._request_settings_save)
+        scan_opts.simple_duplicates_check.toggled.connect(self._request_settings_save)
         scan_opts.perceptual_duplicates_check.toggled.connect(self._request_settings_save)
         scan_opts.lancedb_in_memory_check.toggled.connect(self._request_settings_save)
         scan_opts.low_priority_check.toggled.connect(self._request_settings_save)
@@ -454,10 +455,35 @@ class App(QMainWindow):
         self.set_ui_scan_state(is_scanning=True)
         self.file_op_manager.request_reflink(link_map)
 
-    @Slot()
-    def _on_file_op_finished(self):
-        self.set_ui_scan_state(is_scanning=False)
+    @Slot(list)
+    def _on_file_op_finished(self, affected_paths: list[Path]):
+        """Coordinates UI updates after a file operation is complete."""
+        if not affected_paths:
+            self.set_ui_scan_state(is_scanning=False)
+            return
+
+        # Block signals to prevent cascading updates during the process
+        self.results_panel.results_view.selectionModel().blockSignals(True)
+        self.viewer_panel.list_view.blockSignals(True)
+
+        # Step 1: Physically remove records from the results.duckdb file
+        self.results_panel.remove_items_from_results_db(affected_paths)
+
+        # Step 2: Clear the image viewer panel to prevent it from trying to load deleted files.
         self.viewer_panel.clear_viewer()
+
+        # Step 3: Update the in-memory model and the UI of the ResultsPanel.
+        self.results_panel.update_after_deletion(affected_paths)
+
+        # Step 4: Give Qt time to process all pending redraws and updates.
+        QApplication.processEvents()
+
+        # Unblock signals
+        self.results_panel.results_view.selectionModel().blockSignals(False)
+        self.viewer_panel.list_view.blockSignals(False)
+
+        # Step 5: Re-enable the UI.
+        self.set_ui_scan_state(is_scanning=False)
 
     def _confirm_action(self, title: str, text: str) -> bool:
         if self.controller.is_running():
@@ -504,8 +530,16 @@ class App(QMainWindow):
                 QMessageBox.critical(self, "Error", "Failed to clear all app data.")
 
     def _show_results_context_menu(self, pos):
-        idx = self.results_panel.results_view.indexAt(pos)
-        if (node := idx.internalPointer()) and node.get("type") != "group" and (path := node.get("path")):
+        proxy_idx = self.results_panel.results_view.indexAt(pos)
+        if not proxy_idx.isValid():
+            return
+
+        source_idx = self.results_panel.proxy_model.mapToSource(proxy_idx)
+        if not source_idx.isValid():
+            return
+
+        node = source_idx.internalPointer()
+        if node and node.get("type") != "group" and (path := node.get("path")):
             self.context_menu_path = Path(path)
             self.context_menu.exec(QCursor.pos())
 

@@ -264,6 +264,8 @@ class ResultsTreeModel(QAbstractItemModel):
             method = node.get("found_by")
             if method == "xxHash":
                 return "Exact Match"
+            if method == "dHash":
+                return "Simple Match"  # Or another appropriate name
             if method == "pHash":
                 return "Near-Identical"
             dist = node.get("distance", -1)
@@ -377,13 +379,13 @@ class ResultsTreeModel(QAbstractItemModel):
         )
 
     def remove_deleted_paths(self, deleted_paths: list[Path]):
-        self.beginResetModel()
         deleted_set = {str(p) for p in deleted_paths}
         groups_to_remove = []
         for gid, data in self.groups_data.items():
             if data.get("fetched"):
                 data["children"] = [f for f in data["children"] if f["path"] not in deleted_set]
                 data["count"] = len(data.get("children", []))
+
             min_items = 2 if self.mode == "duplicates" else 1
             if data.get("count", 0) < min_items:
                 groups_to_remove.append(gid)
@@ -394,11 +396,16 @@ class ResultsTreeModel(QAbstractItemModel):
                 and data["children"]
             ):
                 data["children"][0]["is_best"] = True
+
         for gid in groups_to_remove:
             if gid in self.groups_data:
                 del self.groups_data[gid]
         self.sorted_group_ids = [gid for gid in self.sorted_group_ids if gid not in groups_to_remove]
-        self.endResetModel()
+
+        paths_to_clear = list(self.check_states.keys())
+        for path_str in paths_to_clear:
+            if path_str in deleted_set:
+                del self.check_states[path_str]
 
 
 class ImagePreviewModel(QAbstractListModel):
@@ -639,6 +646,8 @@ class ImageItemDelegate(QStyledItemDelegate):
         dist_text = ""
         if method == "xxHash":
             dist_text = "Exact Match | "
+        elif method == "dHash":
+            dist_text = "Simple Match | "
         elif method == "pHash":
             dist_text = "Near-Identical | "
         elif dist >= 0:
@@ -681,9 +690,8 @@ class SimilarityFilterProxyModel(QSortFilterProxyModel):
         if not node or node.get("type") == "group":
             return True
 
-        # Always show non-AI matches regardless of the similarity slider
         method = node.get("found_by")
-        if method in ["xxHash", "pHash"]:
+        if method in ["xxHash", "dHash", "pHash"]:
             return True
 
         similarity_score = node.get("distance", -1)
