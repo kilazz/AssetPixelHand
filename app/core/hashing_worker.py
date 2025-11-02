@@ -43,3 +43,15 @@ def worker_get_phash(path: Path) -> tuple[Union["imagehash.ImageHash", None], Pa
         return phash, path
     except Exception:
         return None, path
+
+
+def worker_get_dhash(path: Path) -> tuple[Union["imagehash.ImageHash", None], Path]:
+    """Worker function to calculate the difference hash (dHash) of an image."""
+    if not IMAGEHASH_AVAILABLE:
+        return None, path
+    try:
+        with Image.open(path) as img:
+            dhash = imagehash.dhash(img)
+        return dhash, path
+    except Exception:
+        return None, path

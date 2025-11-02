@@ -315,6 +315,13 @@ class ScanOptionsPanel(QGroupBox):
     def _init_ui(self):
         layout = QVBoxLayout(self)
         self.exact_duplicates_check = QCheckBox("First find exact duplicates (xxHash)")
+
+        self.simple_duplicates_check = QCheckBox("Also find simple duplicates (dHash)")
+        self.simple_duplicates_check.setToolTip(
+            "Very fast check for resized, re-formatted, or slightly edited images.\n"
+            "Recommended to keep enabled for best performance."
+        )
+
         self.perceptual_duplicates_check = QCheckBox("Also find near-identical images (pHash)")
         self.perceptual_duplicates_check.setToolTip(
             "Finds images that look the same but have different formats, sizes, or compression levels.\n"
@@ -361,31 +368,36 @@ class ScanOptionsPanel(QGroupBox):
         visuals_layout.addWidget(self.open_visuals_folder_button)
 
         layout.addWidget(self.exact_duplicates_check)
+        layout.addWidget(self.simple_duplicates_check)
         layout.addWidget(self.perceptual_duplicates_check)
         layout.addWidget(self.lancedb_in_memory_check)
         layout.addWidget(self.disk_thumbnail_cache_check)
         layout.addWidget(self.low_priority_check)
         layout.addLayout(visuals_layout)
 
-        self.exact_duplicates_check.toggled.connect(self._update_phash_state)
-        self._update_phash_state(self.exact_duplicates_check.isChecked())
+        self.exact_duplicates_check.toggled.connect(self._update_hashing_options_state)
+        self.simple_duplicates_check.toggled.connect(self._update_hashing_options_state)
+        self._update_hashing_options_state(self.exact_duplicates_check.isChecked())
 
     def _connect_signals(self):
         self.save_visuals_check.toggled.connect(self.toggle_visuals_option)
         self.open_visuals_folder_button.clicked.connect(self._open_visuals_folder)
-        # Remember to connect self.visuals_tonemap_check.toggled in main_window.py
 
     @Slot(bool)
-    def _update_phash_state(self, is_exact_checked: bool):
-        self.perceptual_duplicates_check.setEnabled(is_exact_checked)
-        if not is_exact_checked:
+    def _update_hashing_options_state(self, is_checked: bool):
+        exact_enabled = self.exact_duplicates_check.isChecked()
+
+        self.simple_duplicates_check.setEnabled(exact_enabled)
+        self.perceptual_duplicates_check.setEnabled(exact_enabled)
+
+        if not exact_enabled:
+            self.simple_duplicates_check.setChecked(False)
             self.perceptual_duplicates_check.setChecked(False)
 
     def toggle_visuals_option(self, is_checked):
         visuals_layout_item = self.layout().itemAt(6)
         if visuals_layout_item is None:
             return
-        # (Start from 1 to skip the "Save visuals" checkbox itself)
         for i in range(1, visuals_layout_item.layout().count()):
             widget = visuals_layout_item.layout().itemAt(i).widget()
             if widget:
@@ -403,8 +415,9 @@ class ScanOptionsPanel(QGroupBox):
 
     def load_settings(self, s: AppSettings):
         self.exact_duplicates_check.setChecked(s.find_exact_duplicates)
+        self.simple_duplicates_check.setChecked(getattr(s, "find_simple_duplicates", True))
         self.perceptual_duplicates_check.setChecked(s.find_perceptual_duplicates)
-        self._update_phash_state(s.find_exact_duplicates)
+        self._update_hashing_options_state(s.find_exact_duplicates)
         self.lancedb_in_memory_check.setChecked(s.lancedb_in_memory)
         self.disk_thumbnail_cache_check.setChecked(s.disk_thumbnail_cache_enabled)
         self.low_priority_check.setChecked(s.perf_low_priority)

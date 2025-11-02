@@ -47,6 +47,7 @@ class ScanConfigBuilder:
             scan_mode=self.opts.current_scan_mode,
             device=self.perf.device_combo.currentData(),
             find_exact_duplicates=self.scan_opts.exact_duplicates_check.isChecked(),
+            find_simple_duplicates=self.scan_opts.simple_duplicates_check.isChecked(),
             find_perceptual_duplicates=self.scan_opts.perceptual_duplicates_check.isChecked(),
             lancedb_in_memory=self.scan_opts.lancedb_in_memory_check.isChecked(),
             save_visuals=self.scan_opts.save_visuals_check.isChecked(),

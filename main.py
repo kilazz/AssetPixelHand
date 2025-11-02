@@ -17,6 +17,14 @@ sys.path.insert(0, str(script_dir))
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
+if sys.platform == "win32":
+    import pythoncom
+
+    pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+
+from PySide6.QtCore import QObject, Signal
+from PySide6.QtWidgets import QApplication
+
 from app.constants import CRASH_LOG_DIR
 from app.gui.main_window import App
 from app.logging_config import setup_logging
@@ -30,13 +38,13 @@ def log_global_crash(exc_type, exc_value, exc_traceback):
     error_message = f"--- CRITICAL UNHANDLED ERROR ---\n{tb_info}"
     logging.getLogger("AssetPixelHand.main").critical(error_message)
     try:
-        from PySide6.QtWidgets import QApplication, QMessageBox
-
         CRASH_LOG_DIR.mkdir(parents=True, exist_ok=True)
         log_file = CRASH_LOG_DIR / f"crash_report_{datetime.now(UTC).strftime('%Y-%m-%d_%H-%M-%S')}.txt"
         with open(log_file, "w", encoding="utf-8") as f:
             f.write(error_message)
         if QApplication.instance():
+            from PySide6.QtWidgets import QMessageBox
+
             QMessageBox.critical(
                 None,
                 "Critical Error",
@@ -50,40 +58,36 @@ def log_global_crash(exc_type, exc_value, exc_traceback):
 
 def run_application():
     """Initializes and runs the Qt application."""
-    from PySide6.QtCore import QObject, Signal
-    from PySide6.QtWidgets import QApplication
 
     class LogSignalEmitter(QObject):
         log_signal = Signal(str, str)
 
     sys.excepthook = log_global_crash
-    app_logger = logging.getLogger("AssetPixelHand.main")
-    app_logger.info("Starting AssetPixelHand application...")
+
     app = QApplication(sys.argv)
+
     log_emitter = LogSignalEmitter()
     setup_logging(log_emitter, force_debug=IS_DEBUG_MODE)
+
+    app_logger = logging.getLogger("AssetPixelHand.main")
+    app_logger.info("Starting AssetPixelHand application...")
+
     main_window = App(log_emitter=log_emitter)
     log_emitter.log_signal.connect(main_window.log_panel.log_message)
+
     main_window.show()
     app_logger.info("Main window displayed.")
+
     sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    # Correct initialization order to prevent fatal Windows errors
     multiprocessing.freeze_support()
 
     if multiprocessing.get_start_method(allow_none=True) != "spawn":
         multiprocessing.set_start_method("spawn", force=True)
 
-    if sys.platform == "win32":
-        import pythoncom
-
-        pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
-
     faulthandler.enable()
-    setup_logging(force_debug=IS_DEBUG_MODE)
-    app_logger = logging.getLogger("AssetPixelHand.main")
 
     try:
         run_application()

@@ -115,6 +115,7 @@ class ScanConfig:
     scan_mode: str
     device: str
     find_exact_duplicates: bool
+    find_simple_duplicates: bool
     find_perceptual_duplicates: bool
     lancedb_in_memory: bool
     visuals_columns: int
@@ -140,6 +141,7 @@ class AppSettings:
     show_transparency: bool = True
     selected_extensions: list[str] = field(default_factory=list)
     find_exact_duplicates: bool = True
+    find_simple_duplicates: bool = True
     find_perceptual_duplicates: bool = True
     perf_model_workers: str = "1"
     perf_gpu_preproc_workers: str = "4"
@@ -198,6 +200,7 @@ class AppSettings:
 
         # Scan & Output Options
         self.find_exact_duplicates = scan_options_panel.exact_duplicates_check.isChecked()
+        self.find_simple_duplicates = scan_options_panel.simple_duplicates_check.isChecked()
         self.find_perceptual_duplicates = scan_options_panel.perceptual_duplicates_check.isChecked()
         self.lancedb_in_memory = scan_options_panel.lancedb_in_memory_check.isChecked()
         self.disk_thumbnail_cache_enabled = scan_options_panel.disk_thumbnail_cache_check.isChecked()
