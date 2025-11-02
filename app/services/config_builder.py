@@ -52,6 +52,7 @@ class ScanConfigBuilder:
             save_visuals=self.scan_opts.save_visuals_check.isChecked(),
             max_visuals=int(self.scan_opts.max_visuals_entry.text()),
             visuals_columns=self.scan_opts.visuals_columns_spinbox.value(),
+            tonemap_visuals=self.scan_opts.visuals_tonemap_check.isChecked(),
             search_precision=self.perf.search_precision_combo.currentText(),
             search_query=self.opts.search_entry.text() if self.opts.current_scan_mode == "text_search" else None,
             sample_path=self.opts._sample_path,

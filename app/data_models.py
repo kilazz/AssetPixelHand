@@ -118,6 +118,7 @@ class ScanConfig:
     find_perceptual_duplicates: bool
     lancedb_in_memory: bool
     visuals_columns: int
+    tonemap_visuals: bool
     model_info: dict = field(default_factory=dict)
     sample_path: Path | None = None
     search_query: str | None = None
@@ -134,6 +135,7 @@ class AppSettings:
     save_visuals: bool = False
     max_visuals: str = "100"
     visuals_columns: int = 6
+    visuals_tonemap_enabled: bool = False
     preview_size: int = 250
     show_transparency: bool = True
     selected_extensions: list[str] = field(default_factory=list)
@@ -201,6 +203,7 @@ class AppSettings:
         self.disk_thumbnail_cache_enabled = scan_options_panel.disk_thumbnail_cache_check.isChecked()
         self.perf_low_priority = scan_options_panel.low_priority_check.isChecked()
         self.save_visuals = scan_options_panel.save_visuals_check.isChecked()
+        self.visuals_tonemap_enabled = scan_options_panel.visuals_tonemap_check.isChecked()
         self.max_visuals = scan_options_panel.max_visuals_entry.text()
         self.visuals_columns = scan_options_panel.visuals_columns_spinbox.value()
 
@@ -264,4 +267,3 @@ class ScannerSignals(QObject):
     error = Signal(str)
     log = Signal(str, str)
     deletion_finished = Signal(list, int, int)
-    save_visuals_finished = Signal()

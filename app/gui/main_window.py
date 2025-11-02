@@ -220,7 +220,7 @@ class App(QMainWindow):
         self.viewer_panel.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
     def _connect_signals(self):
-        # --- UI Panel Signals ---
+        # UI Panel Signals
         self.options_panel.scan_requested.connect(self._start_scan)
         self.options_panel.clear_scan_cache_requested.connect(self._clear_scan_cache)
         self.options_panel.clear_models_cache_requested.connect(self._clear_models_cache)
@@ -230,38 +230,36 @@ class App(QMainWindow):
         self.performance_panel.log_message.connect(self.log_panel.log_message)
         self.performance_panel.device_changed.connect(self._update_low_priority_option)
 
-        # --- Results and Viewer Panel Signals ---
+        # Results and Viewer Panel Signals
         self.results_panel.selection_in_group_changed.connect(self.viewer_panel.show_image_group)
         self.results_panel.visible_results_changed.connect(self.viewer_panel.display_results)
         self.results_panel.results_view.customContextMenuRequested.connect(self._show_results_context_menu)
         self.viewer_panel.list_view.customContextMenuRequested.connect(self._show_viewer_context_menu)
         self.viewer_panel.log_message.connect(self.log_panel.log_message)
 
-        # --- File Operation Signals (Delegated to FileOperationManager) ---
+        # File Operation Signals
         self.results_panel.deletion_requested.connect(self.file_op_manager.request_deletion)
         self.results_panel.hardlink_requested.connect(self._handle_hardlink_request)
         self.results_panel.reflink_requested.connect(self._handle_reflink_request)
         self.file_op_manager.operation_finished.connect(self._on_file_op_finished)
         self.file_op_manager.log_message.connect(self.log_panel.log_message)
 
-        # --- Scanner Controller Signals ---
+        # Scanner Controller Signals
         conn = Qt.ConnectionType.QueuedConnection
         self.controller.signals.finished.connect(self.on_scan_complete, conn)
         self.controller.signals.error.connect(self.on_scan_error, conn)
         self.controller.signals.log.connect(self.log_panel.log_message, conn)
 
-        # --- Context Menu Signals ---
+        # Context Menu Signals
         self.open_action.triggered.connect(self._context_open_file)
         self.show_action.triggered.connect(self._context_show_in_explorer)
         self.delete_action.triggered.connect(self._context_delete_file)
 
-        # --- Settings Save Timer ---
+        # Settings Save Timer
         self.settings_save_timer.timeout.connect(self._save_settings)
         self._connect_settings_signals()
 
     def _connect_settings_signals(self):
-        # This method connects various UI element changes to request a settings save.
-        # Its implementation remains the same.
         opts = self.options_panel
         opts.folder_path_entry.textChanged.connect(self._request_settings_save)
         opts.threshold_spinbox.valueChanged.connect(self._request_settings_save)
@@ -275,6 +273,7 @@ class App(QMainWindow):
         scan_opts.disk_thumbnail_cache_check.toggled.connect(self._on_thumbnail_cache_toggled)
         scan_opts.low_priority_check.toggled.connect(self._request_settings_save)
         scan_opts.save_visuals_check.toggled.connect(self._request_settings_save)
+        scan_opts.visuals_tonemap_check.toggled.connect(self._request_settings_save)
         scan_opts.max_visuals_entry.textChanged.connect(self._request_settings_save)
         scan_opts.visuals_columns_spinbox.valueChanged.connect(self._request_settings_save)
 
@@ -310,7 +309,6 @@ class App(QMainWindow):
         if self.controller.is_running():
             return
 
-        # Delegate config creation to the builder
         if not (config := self._get_config()):
             return
 
@@ -331,7 +329,6 @@ class App(QMainWindow):
         self.stats_dialog.show()
 
     def _get_config(self) -> ScanConfig | None:
-        """Builds the scan configuration using the dedicated ScanConfigBuilder."""
         try:
             builder = ScanConfigBuilder(self.options_panel, self.performance_panel, self.scan_options_panel)
             return builder.build()
@@ -359,8 +356,6 @@ class App(QMainWindow):
         self.options_panel.set_scan_button_state(is_scanning)
         QApplication.processEvents()
 
-    # --- Scan Completion Handlers ---
-
     @Slot(object, int, str, float, list)
     def on_scan_complete(self, payload, num_found, mode, duration, skipped):
         if not mode:
@@ -378,6 +373,7 @@ class App(QMainWindow):
         self.log_panel.log_message(log_msg, "success")
 
         self.results_panel.display_results(db_path, num_found, mode)
+
         if num_found > 0 and mode == "duplicates":
             link_support = check_link_support(self.controller.config.folder_path)
             self.results_panel.hardlink_available = link_support.get("hardlink", False)
@@ -386,7 +382,7 @@ class App(QMainWindow):
             log_msg = (
                 "Filesystem supports Reflinks (CoW)."
                 if link_support.get("reflink")
-                else "Filesystem does not support Reflinks (CoW). Option disabled."
+                else "Filesystem does not support Reflinks (CoW)."
             )
             self.log_panel.log_message(log_msg, log_level)
 
@@ -402,6 +398,7 @@ class App(QMainWindow):
             self._start_visualization_task(groups_data)
         else:
             if self.stats_dialog:
+                # Update the dialog to its final "Scan Finished" state
                 self.stats_dialog.scan_finished(payload, num_found, mode, duration, skipped)
             self.on_scan_end()
 
@@ -413,7 +410,7 @@ class App(QMainWindow):
         self.on_scan_end()
 
     def on_scan_end(self):
-        """Finalizes any scan-related state and re-enables the UI."""
+        """Finalizes any scan-related state, closes dialogs, and re-enables the UI."""
         if self.stats_dialog:
             self.stats_dialog.close()
             self.stats_dialog = None
@@ -432,7 +429,7 @@ class App(QMainWindow):
             return
 
         config = self.controller.config
-        task = VisualizationTask(groups_data, config.max_visuals, config.folder_path, config.visuals_columns)
+        task = VisualizationTask(groups_data, config)
 
         if self.stats_dialog:
             task.signals.progress.connect(self.stats_dialog.update_visualization_progress)
@@ -441,50 +438,37 @@ class App(QMainWindow):
 
         self.shared_thread_pool.start(task)
 
-    # This slot is no longer needed as the main window doesn't directly handle progress updates
-    # def _on_visuals_progress(...)
-
     @Slot()
     def _on_save_visuals_finished(self):
         """Handles the completion of the visualization task."""
         self.log_panel.log_message(f"Visualizations saved to '{VISUALS_DIR.resolve()}'.", "success")
-        # Now that everything is finished, call on_scan_end to close the dialog and re-enable the UI
         self.on_scan_end()
 
-    # --- File Operation Handlers ---
     @Slot(list)
     def _handle_hardlink_request(self, paths: list[Path]):
-        """Delegates hardlink request to the manager."""
         if not paths:
-            self.log_panel.log_message("No valid duplicates selected for linking.", "warning")
             return
         link_map = self.results_panel.results_model.get_link_map_for_paths(paths)
         if not link_map:
-            self.log_panel.log_message("No valid link pairs found from the model's data.", "warning")
             return
         self.set_ui_scan_state(is_scanning=True)
         self.file_op_manager.request_hardlink(link_map)
 
     @Slot(list)
     def _handle_reflink_request(self, paths: list[Path]):
-        """Delegates reflink request to the manager."""
         if not paths:
-            self.log_panel.log_message("No valid duplicates selected for linking.", "warning")
             return
         link_map = self.results_panel.results_model.get_link_map_for_paths(paths)
         if not link_map:
-            self.log_panel.log_message("No valid link pairs found from the model's data.", "warning")
             return
         self.set_ui_scan_state(is_scanning=True)
         self.file_op_manager.request_reflink(link_map)
 
     @Slot()
     def _on_file_op_finished(self):
-        """Called when the FileOperationManager signals completion."""
         self.set_ui_scan_state(is_scanning=False)
         self.viewer_panel.clear_viewer()
 
-    # --- Cache Clearing ---
     def _confirm_action(self, title: str, text: str) -> bool:
         if self.controller.is_running():
             self.log_panel.log_message("Action disabled during scan.", "warning")
@@ -492,29 +476,30 @@ class App(QMainWindow):
         return QMessageBox.question(self, title, text) == QMessageBox.StandardButton.Yes
 
     def _clear_scan_cache(self):
-        if self._confirm_action("Clear Scan Cache", "This will delete all temporary scan data. Are you sure?"):
+        if self._confirm_action("Clear Scan Cache", "Delete all temporary scan data?"):
             thumbnail_cache.close()
             success = clear_scan_cache()
             setup_thumbnail_cache(self.settings)
-            msg, level = ("Scan cache cleared.", "success") if success else ("Failed to clear scan cache.", "error")
-            self.log_panel.log_message(msg, level)
+            self.log_panel.log_message(
+                *(("Scan cache cleared.", "success") if success else ("Failed to clear scan cache.", "error"))
+            )
             if success:
                 self.results_panel.clear_results()
                 self.viewer_panel.clear_viewer()
 
     def _clear_models_cache(self):
-        if self._confirm_action("Clear AI Models", "This will delete all downloaded AI models. Are you sure?"):
-            msg, level = (
-                ("AI models cache cleared.", "success")
-                if clear_models_cache()
-                else ("Failed to clear AI models cache.", "error")
+        if self._confirm_action("Clear AI Models", "Delete all downloaded AI models?"):
+            self.log_panel.log_message(
+                *(
+                    ("AI models cache cleared.", "success")
+                    if clear_models_cache()
+                    else ("Failed to clear AI models cache.", "error")
+                )
             )
-            self.log_panel.log_message(msg, level)
 
     def _clear_app_data(self):
         if self._confirm_action(
-            "Clear All App Data",
-            "This will delete ALL caches, logs, settings, and models. This cannot be undone. Are you sure?",
+            "Clear All App Data", "Delete ALL app data (caches, logs, settings, models)? This cannot be undone."
         ):
             thumbnail_cache.close()
             logging.shutdown()
@@ -530,7 +515,6 @@ class App(QMainWindow):
             else:
                 QMessageBox.critical(self, "Error", "Failed to clear all app data.")
 
-    # --- Context Menu and System Interaction ---
     def _show_results_context_menu(self, pos):
         idx = self.results_panel.results_view.indexAt(pos)
         if (node := idx.internalPointer()) and node.get("type") != "group" and (path := node.get("path")):
@@ -550,10 +534,9 @@ class App(QMainWindow):
 
     @Slot()
     def _context_delete_file(self):
-        if not self.context_menu_path:
-            return
         if (
-            QMessageBox.question(self, "Confirm Move", f"Move '{self.context_menu_path.name}' to the system trash?")
+            self.context_menu_path
+            and QMessageBox.question(self, "Confirm Move", f"Move '{self.context_menu_path.name}' to trash?")
             == QMessageBox.StandardButton.Yes
         ):
             self.set_ui_scan_state(is_scanning=True)
@@ -567,13 +550,7 @@ class App(QMainWindow):
                 app_logger.error(f"Could not open path '{path}': {e}")
 
     def _save_settings(self):
-        """Gathers settings from UI panels and saves them via the AppSettings class."""
-        self.settings.save(
-            options_panel=self.options_panel,
-            performance_panel=self.performance_panel,
-            scan_options_panel=self.scan_options_panel,
-            viewer_panel=self.viewer_panel,
-        )
+        self.settings.save(self.options_panel, self.performance_panel, self.scan_options_panel, self.viewer_panel)
 
     @Slot(bool)
     def _update_low_priority_option(self, is_cpu: bool):
@@ -583,11 +560,7 @@ class App(QMainWindow):
         self._save_settings()
         thumbnail_cache.close()
         if self.shared_thread_pool.activeThreadCount() > 0:
-            QMessageBox.warning(
-                self,
-                "Operation in Progress",
-                "Please wait for the current file operation to complete.",
-            )
+            QMessageBox.warning(self, "Operation in Progress", "Please wait for file operations to complete.")
             event.ignore()
             return
         if self.controller.is_running():

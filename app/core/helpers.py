@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 from PySide6.QtCore import QObject, QRunnable, Signal
 
 from app.constants import VISUALS_DIR
-from app.data_models import DuplicateResults, ScannerSignals, ScanState
+from app.data_models import DuplicateResults, ScanConfig, ScannerSignals, ScanState
 from app.image_io import load_image
 
 app_logger = logging.getLogger("AssetPixelHand.scanner_helpers")
@@ -38,6 +38,8 @@ class FileFinder:
         self.state = state
         self.folder_path = folder_path
 
+        # This line is simplified to avoid any call to .resolve(), which was
+        # the true source of the deadlock on complex file systems.
         self.excluded_paths = {str(folder_path.joinpath(p.strip())) for p in excluded if p.strip()}
 
         self.extensions = set(extensions)
@@ -109,12 +111,10 @@ class VisualizationTask(QRunnable):
         finished = Signal()
         progress = Signal(str, int, int)
 
-    def __init__(self, groups: DuplicateResults, max_visuals: int, config_folder_path: Path, num_columns: int):
+    def __init__(self, groups: DuplicateResults, config: ScanConfig):
         super().__init__()
         self.groups = groups
-        self.max_visuals = max_visuals
-        self.folder_path = config_folder_path
-        self.num_columns = num_columns
+        self.config = config  # Store the whole config object
         self.signals = self.Signals()
 
     def run(self):
@@ -123,7 +123,7 @@ class VisualizationTask(QRunnable):
         VISUALS_DIR.mkdir(parents=True, exist_ok=True)
 
         THUMB, PADDING, TEXT_AREA, MAX_IMGS, IMGS_PER_FILE = 300, 25, 120, 200, 50
-        MAX_COLS = self.num_columns
+        MAX_COLS = self.config.visuals_columns
 
         try:
             font = ImageFont.truetype("verdana.ttf", 14)
@@ -135,10 +135,12 @@ class VisualizationTask(QRunnable):
         sorted_groups = sorted(self.groups.items(), key=lambda item: len(item[1]), reverse=True)
         report_count = 0
 
-        total_groups_to_process = min(len(sorted_groups), self.max_visuals)
+        total_groups_to_process = min(len(sorted_groups), self.config.max_visuals)
+
+        tonemap_mode = "reinhard" if self.config.tonemap_visuals else "none"
 
         for i, (orig_fp, dups) in enumerate(sorted_groups):
-            if report_count >= self.max_visuals or not dups:
+            if report_count >= self.config.max_visuals or not dups:
                 continue
 
             self.signals.progress.emit(f"Processing group {i + 1}...", i + 1, total_groups_to_process)
@@ -147,7 +149,7 @@ class VisualizationTask(QRunnable):
             to_visualize = all_fps[:MAX_IMGS]
 
             for page in range(math.ceil(len(to_visualize) / IMGS_PER_FILE)):
-                if report_count >= self.max_visuals:
+                if report_count >= self.config.max_visuals:
                     break
                 page_fps = to_visualize[page * IMGS_PER_FILE : (page + 1) * IMGS_PER_FILE]
                 if not page_fps:
@@ -166,7 +168,7 @@ class VisualizationTask(QRunnable):
                     x = PADDING + col * (THUMB + PADDING)
                     y = PADDING + row * (THUMB + TEXT_AREA + PADDING)
                     try:
-                        img = load_image(str(fp.path), tonemap_mode="none")
+                        img = load_image(str(fp.path), tonemap_mode=tonemap_mode)
                         if not img:
                             raise ValueError("Image failed to load")
 

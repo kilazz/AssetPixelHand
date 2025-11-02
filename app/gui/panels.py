@@ -53,7 +53,6 @@ from app.constants import (
 from app.data_models import AppSettings
 from app.view_models import ImageComparerState
 
-# --- REFACTOR: Updated relative import paths for components within the 'gui' package ---
 from .dialogs import FileTypesDialog
 from .models import (
     ImageItemDelegate,
@@ -332,25 +331,29 @@ class ScanOptionsPanel(QGroupBox):
         visuals_layout = QHBoxLayout()
         self.save_visuals_check = QCheckBox("Save visuals")
 
+        self.visuals_tonemap_check = QCheckBox("TM HDR")
+        self.visuals_tonemap_check.setToolTip("Apply tonemapping to HDR images (e.g., EXR) in the saved visuals.")
+
         self.max_visuals_entry = QLineEdit()
         self.max_visuals_entry.setValidator(QIntValidator(0, 9999))
-        self.max_visuals_entry.setFixedWidth(50)
+        self.max_visuals_entry.setFixedWidth(45)
 
         self.visuals_columns_spinbox = QSpinBox()
         self.visuals_columns_spinbox.setRange(2, 12)
-        self.visuals_columns_spinbox.setFixedWidth(45)
+        self.visuals_columns_spinbox.setFixedWidth(40)
 
         self.open_visuals_folder_button = QPushButton("📂")
         self.open_visuals_folder_button.setToolTip("Open visualizations folder")
         self.open_visuals_folder_button.setFixedWidth(35)
 
         visuals_layout.addWidget(self.save_visuals_check)
+        visuals_layout.addWidget(self.visuals_tonemap_check)
         visuals_layout.addStretch()
 
         visuals_layout.addWidget(QLabel("Cols:"))
         visuals_layout.addWidget(self.visuals_columns_spinbox)
 
-        visuals_layout.addSpacing(10)
+        visuals_layout.addSpacing(5)
 
         visuals_layout.addWidget(QLabel("Max:"))
         visuals_layout.addWidget(self.max_visuals_entry)
@@ -370,6 +373,7 @@ class ScanOptionsPanel(QGroupBox):
     def _connect_signals(self):
         self.save_visuals_check.toggled.connect(self.toggle_visuals_option)
         self.open_visuals_folder_button.clicked.connect(self._open_visuals_folder)
+        # Remember to connect self.visuals_tonemap_check.toggled in main_window.py
 
     @Slot(bool)
     def _update_phash_state(self, is_exact_checked: bool):
@@ -381,6 +385,7 @@ class ScanOptionsPanel(QGroupBox):
         visuals_layout_item = self.layout().itemAt(6)
         if visuals_layout_item is None:
             return
+        # (Start from 1 to skip the "Save visuals" checkbox itself)
         for i in range(1, visuals_layout_item.layout().count()):
             widget = visuals_layout_item.layout().itemAt(i).widget()
             if widget:
@@ -404,6 +409,7 @@ class ScanOptionsPanel(QGroupBox):
         self.disk_thumbnail_cache_check.setChecked(s.disk_thumbnail_cache_enabled)
         self.low_priority_check.setChecked(s.perf_low_priority)
         self.save_visuals_check.setChecked(s.save_visuals)
+        self.visuals_tonemap_check.setChecked(getattr(s, "visuals_tonemap_enabled", False))
         self.max_visuals_entry.setText(s.max_visuals)
         self.visuals_columns_spinbox.setValue(s.visuals_columns)
         self.toggle_visuals_option(s.save_visuals)
