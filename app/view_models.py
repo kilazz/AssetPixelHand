@@ -8,7 +8,6 @@ from PIL.ImageQt import fromqimage
 from PySide6.QtCore import QObject, QThreadPool, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
 
-# --- REFACTOR: Updated import path for the GUI task module ---
 from app.gui.tasks import ImageLoader
 
 

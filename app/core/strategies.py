@@ -42,7 +42,12 @@ from app.image_io import get_image_metadata
 from app.utils import find_best_in_group
 
 from .engines import FingerprintEngine, LanceDBSimilarityEngine
-from .hashing_worker import worker_get_dhash, worker_get_phash, worker_get_xxhash
+from .hashing_worker import (
+    worker_create_dummy_fp,
+    worker_get_dhash,
+    worker_get_phash,
+    worker_get_xxhash,
+)
 from .helpers import FileFinder
 from .worker import init_worker, worker_get_single_vector, worker_get_text_vector
 
@@ -214,14 +219,32 @@ class FindDuplicatesStrategy(ScanStrategy):
             self._report_and_cleanup({}, start_time)
             return
 
-        self.all_image_fps = {path: fp for path in all_files if (fp := self._create_dummy_fp(path))}
+        # --- Stage 1/6: Reading image metadata (in parallel) ---
+        self.state.set_phase("Phase 1/6: Reading image metadata...", 0.10)
+
+        ctx = multiprocessing.get_context("spawn")
+        num_workers = self.config.perf.model_workers
+
+        self.all_image_fps = {}
+        with ctx.Pool(processes=num_workers) as pool:
+            results_fp = pool.imap_unordered(worker_create_dummy_fp, all_files, chunksize=100)
+            for i, fp in enumerate(results_fp, 1):
+                if stop_event.is_set():
+                    return
+                if i % 500 == 0:
+                    self.state.update_progress(i, len(all_files))
+                if fp:
+                    self.all_image_fps[fp.path] = fp
+
         app_logger.info(f"Created {len(self.all_image_fps)} initial fingerprints.")
 
+        # --- Hashing Stages ---
         files_for_ai_stage = self._run_hashing_stages(list(self.all_image_fps.keys()), stop_event)
         if stop_event.is_set():
             return
 
-        success, _ = self._generate_fingerprints(files_for_ai_stage, stop_event, 5, 4, 0.4)
+        # --- AI Fingerprinting Stage ---
+        success, _ = self._generate_fingerprints(files_for_ai_stage, stop_event, 6, 5, 0.4)
         if not success and not stop_event.is_set():
             final_groups = self._build_final_groups_from_links(stop_event)
             self._report_and_cleanup(final_groups, start_time)
@@ -269,8 +292,8 @@ class FindDuplicatesStrategy(ScanStrategy):
         ctx = multiprocessing.get_context("spawn")
         num_workers = self.config.perf.model_workers
 
-        # --- Stage 1: xxHash ---
-        self.state.set_phase("Phase 1/5: Finding exact duplicates (xxHash)...", 0.10)
+        # --- Stage 2/6: xxHash ---
+        self.state.set_phase("Phase 2/6: Finding exact duplicates (xxHash)...", 0.10)
         xxhash_map = defaultdict(list)
         with ctx.Pool(processes=num_workers) as pool:
             results_xx = pool.imap_unordered(worker_get_xxhash, all_files, chunksize=200)
@@ -290,10 +313,10 @@ class FindDuplicatesStrategy(ScanStrategy):
                 for follower in paths[1:]:
                     self._add_link(rep, follower, 100.0, "xxHash")
 
-        # --- Stage 2: dHash (conditional execution) ---
+        # --- Stage 3/6: dHash (conditional execution) ---
         representatives_after_dhash = representatives_after_xxhash
         if self.config.find_simple_duplicates:
-            self.state.set_phase("Phase 2/5: Finding simple duplicates (dHash)...", 0.15)
+            self.state.set_phase("Phase 3/6: Finding simple duplicates (dHash)...", 0.15)
             dhash_map = defaultdict(list)
             with ctx.Pool(processes=num_workers) as pool:
                 results_dh = pool.imap_unordered(worker_get_dhash, representatives_after_xxhash, chunksize=150)
@@ -313,11 +336,11 @@ class FindDuplicatesStrategy(ScanStrategy):
                     for follower in paths[1:]:
                         self._add_link(rep, follower, 100.0, "dHash")
 
-        # --- Stage 3: pHash (conditional execution) ---
+        # --- Stage 4/6: pHash (conditional execution) ---
         if not (self.config.find_perceptual_duplicates and IMAGEHASH_AVAILABLE):
             return representatives_after_dhash
 
-        self.state.set_phase("Phase 3/5: Finding near-duplicates (pHash)...", 0.20)
+        self.state.set_phase("Phase 4/6: Finding near-duplicates (pHash)...", 0.20)
         phashes = []
         with ctx.Pool(processes=num_workers) as pool:
             results_ph = pool.imap_unordered(worker_get_phash, representatives_after_dhash, chunksize=100)
@@ -341,8 +364,8 @@ class FindDuplicatesStrategy(ScanStrategy):
 
     def _run_ai_linking_stage(self, stop_event: threading.Event):
         """Finds AI-based links and adds them to the evidence pool."""
-        self.state.set_phase("Phase 5/5: Finding similar images (AI)...", 0.3)
-        sim_engine = LanceDBSimilarityEngine(self.config, self.state, self.signals, self.table)
+        self.state.set_phase("Phase 6/6: Finding similar images (AI)...", 0.3)
+        sim_engine = LanceDBSimilarityEngine(self.config, self.state, self.signals, self.scanner_core.db, self.table)
 
         ai_links = sim_engine.find_similar_pairs(stop_event)
 
@@ -437,7 +460,8 @@ class SearchStrategy(ScanStrategy):
             self.signals.error.emit("Could not generate a vector for the search query.")
             return
 
-        sim_engine = LanceDBSimilarityEngine(self.config, self.state, self.signals, self.table)
+        sim_engine = LanceDBSimilarityEngine(self.config, self.state, self.signals, self.scanner_core.db, self.table)
+
         raw_hits_df = (
             self.table.search(query_vector)
             .metric("cosine")

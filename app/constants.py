@@ -57,7 +57,7 @@ if DEEP_LEARNING_AVAILABLE:
     transformers_logging.set_verbosity_error()
 
 # --- Application-wide Constants ---
-DB_WRITE_BATCH_SIZE = 2048
+DB_WRITE_BATCH_SIZE = 4096
 CACHE_VERSION = "v4"
 
 # --- Supported File Formats ---

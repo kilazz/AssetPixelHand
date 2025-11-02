@@ -99,9 +99,15 @@ class ScanConfigBuilder:
             # Suppress the original exception context to provide a cleaner error message.
             raise ValueError("Batch size must be a positive integer.") from None
 
+        is_cpu_mode = self.perf.device_combo.currentData() == "cpu"
+
+        # Use the worker setting that is currently visible to the user, with a ternary operator.
+        num_workers = self.perf.cpu_workers_spin.value() if is_cpu_mode else self.perf.gpu_preproc_workers_spin.value()
+
         return PerformanceConfig(
-            model_workers=self.perf.cpu_workers_spin.value(),
-            gpu_preproc_workers=self.perf.gpu_preproc_workers_spin.value(),
+            # Both config settings now receive the same, unified value.
+            model_workers=num_workers,
+            gpu_preproc_workers=num_workers,
             run_at_low_priority=self.scan_opts.low_priority_check.isChecked(),
             batch_size=batch_size,
         )

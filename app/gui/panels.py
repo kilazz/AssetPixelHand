@@ -459,11 +459,11 @@ class PerformancePanel(QGroupBox):
 
         self.cpu_workers_spin = QSpinBox()
         self.cpu_workers_spin.setRange(1, (multiprocessing.cpu_count() or 1) * 2)
-        layout.addRow("CPU Model Workers:", self.cpu_workers_spin)
+        layout.addRow("CPU Workers:", self.cpu_workers_spin)
 
         self.gpu_preproc_workers_spin = QSpinBox()
         self.gpu_preproc_workers_spin.setRange(1, (multiprocessing.cpu_count() or 1) * 2)
-        layout.addRow("CPU Prep Workers:", self.gpu_preproc_workers_spin)
+        layout.addRow("CPU Preproc Workers:", self.gpu_preproc_workers_spin)
 
     def _detect_and_setup_devices(self):
         self.device_combo.addItem("CPU", "cpu")

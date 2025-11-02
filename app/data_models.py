@@ -22,7 +22,6 @@ from app.constants import (
     QuantizationMode,
 )
 
-# --- REFACTOR: Use TYPE_CHECKING with new paths to avoid circular imports at runtime ---
 if TYPE_CHECKING:
     from app.gui.panels import ImageViewerPanel, OptionsPanel, PerformancePanel, ScanOptionsPanel
 
@@ -190,7 +189,6 @@ class AppSettings:
         This approach is more robust than passing a dictionary as it avoids key errors
         and centralizes the knowledge of where settings come from.
         """
-        # --- REFACTOR: Pull settings directly from UI panels ---
         # Main Options
         self.folder_path = options_panel.folder_path_entry.text()
         self.threshold = str(options_panel.threshold_spinbox.value())

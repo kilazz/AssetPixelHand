@@ -151,7 +151,6 @@ def _process_batch_from_paths(
                 skipped_tuples.append((str(path), "Metadata extraction failed"))
                 continue
 
-            # --- REFACTOR: Use the new centralized `load_image` function ---
             img_obj = load_image(path, target_size=input_size, tonemap_mode="none")
 
             if img_obj is not None:

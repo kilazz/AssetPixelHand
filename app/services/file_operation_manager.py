@@ -8,11 +8,9 @@ from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QObject, QThreadPool, Signal, Slot
 
-# --- REFACTOR: Updated import path for the GUI task module ---
 from app.gui.tasks import FileOperationTask
 
 if TYPE_CHECKING:
-    # --- REFACTOR: Updated import path for panel classes ---
     from app.gui.panels import FileOperation, ResultsPanel
 
 

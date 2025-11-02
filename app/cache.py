@@ -35,17 +35,21 @@ def _configure_db_connection(conn):
     try:
         cpu_cores = os.cpu_count() or 2
         conn.execute(f"PRAGMA threads={max(1, cpu_cores // 2)}")
-        conn.execute("PRAGMA wal_autocheckpoint='128MB'")
+        conn.execute("PRAGMA memory_limit='1GB'")
+        conn.execute("PRAGMA wal_autocheckpoint='256MB'")
         app_logger.debug("DuckDB performance PRAGMAs applied.")
     except duckdb.Error as e:
         app_logger.warning(f"Could not apply DuckDB performance PRAGMAs: {e}")
 
 
 class CacheManager:
-    """Manages a DuckDB cache for file fingerprints."""
+    """Manages a DuckDB cache for file fingerprints, supporting both on-disk and in-memory modes."""
 
-    def __init__(self, scanned_folder_path: Path, model_name: str):
+    def __init__(self, scanned_folder_path: Path, model_name: str, in_memory: bool):
         self.conn = None
+        self.db_path = None
+        self.in_memory_mode = in_memory
+
         if ZSTD_AVAILABLE:
             self.compressor = zstandard.ZstdCompressor(level=3, threads=-1)
             self.decompressor = zstandard.ZstdDecompressor()
@@ -56,13 +60,22 @@ class CacheManager:
         if not DUCKDB_AVAILABLE:
             app_logger.error("DuckDB library not found; file caching will be disabled.")
             return
+
         try:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             folder_hash = hashlib.md5(str(scanned_folder_path).encode()).hexdigest()[:8]
             model_hash = hashlib.md5(model_name.encode()).hexdigest()[:8]
             db_name = f"file_cache_{CACHE_VERSION}_{folder_hash}_{model_hash}.duckdb"
-            db_path = CACHE_DIR / db_name
-            self.conn = duckdb.connect(database=str(db_path), read_only=False)
+            self.db_path = CACHE_DIR / db_name
+
+            if self.in_memory_mode:
+                # --- In-Memory Mode ---
+                self.conn = duckdb.connect(database="", read_only=False)
+                app_logger.info("Using in-memory database for fingerprint cache during scan.")
+            else:
+                # --- HDD-Friendly On-Disk Mode ---
+                self.conn = duckdb.connect(database=str(self.db_path), read_only=False)
+                app_logger.info("Using on-disk database for fingerprint cache (HDD-friendly mode).")
 
             _configure_db_connection(self.conn)
 
@@ -84,8 +97,16 @@ class CacheManager:
                 app_logger.error(f"Failed to create file cache table: {e}")
 
     def get_cached_fingerprints(self, all_file_paths: list[Path]) -> tuple[list[Path], list[ImageFingerprint]]:
+        if self.in_memory_mode and self.db_path and self.db_path.exists() and self.conn:
+            try:
+                self.conn.execute(f"IMPORT DATABASE '{self.db_path!s}';")
+                app_logger.info(f"Successfully imported existing fingerprint cache '{self.db_path.name}' into memory.")
+            except duckdb.Error as e:
+                app_logger.warning(f"Could not import existing cache file, starting fresh. Error: {e}")
+
         if not self.conn or not all_file_paths:
             return all_file_paths, []
+
         try:
             disk_files_data = [(str(p), s.st_mtime, s.st_size) for p in all_file_paths if (s := p.stat())]
             if not disk_files_data:
@@ -150,14 +171,32 @@ class CacheManager:
                 self.conn.rollback()
 
     def close(self):
-        if self.conn:
+        if not self.conn:
+            return
+
+        if self.in_memory_mode and self.db_path:
+            # --- In-Memory Mode: Write the database to a file on disk ---
+            try:
+                self.db_path.unlink(missing_ok=True)
+                # Step 1: Attach the disk file as a new DB named 'disk_db'
+                self.conn.execute(f"ATTACH '{self.db_path!s}' AS disk_db;")
+                # Step 2: Create a table in 'disk_db' as a full copy of the table from 'main' (in-memory)
+                self.conn.execute("CREATE TABLE disk_db.fingerprints AS SELECT * FROM main.fingerprints;")
+                # Step 3: Detach the disk DB to finalize the write operation
+                self.conn.execute("DETACH disk_db;")
+                app_logger.info(f"Successfully wrote in-memory cache to '{self.db_path.name}'.")
+            except duckdb.Error as e:
+                app_logger.error(f"Failed to write fingerprint cache to disk: {e}")
+        else:
+            # --- On-Disk Mode: Just perform a checkpoint ---
             try:
                 self.conn.execute("CHECKPOINT;")
-                self.conn.close()
             except duckdb.Error as e:
                 app_logger.warning(f"Error closing file cache DB: {e}")
-            finally:
-                self.conn = None
+
+        # Close the connection in any case
+        self.conn.close()
+        self.conn = None
 
 
 class AbstractThumbnailCache(abc.ABC):
@@ -182,7 +221,7 @@ class DiskThumbnailCache(AbstractThumbnailCache):
         self._buffer = {}
         self._lock = threading.Lock()
 
-        self.BUFFER_SIZE = 1024
+        self.BUFFER_SIZE = 4096
 
         if not DUCKDB_AVAILABLE:
             app_logger.error("DuckDB not found, persistent thumbnail cache is disabled.")

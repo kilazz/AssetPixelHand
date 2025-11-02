@@ -1,13 +1,17 @@
 # app/core/hashing_worker.py
-"""Contains lightweight, standalone worker functions for hashing.
+"""Contains lightweight, standalone worker functions for hashing and metadata extraction.
 This file is kept separate from worker.py to ensure that processes
-spawned for hashing do not load heavy AI libraries (torch, onnxruntime, etc.).
+spawned for these tasks do not load heavy AI libraries (torch, onnxruntime, etc.).
 """
 
 from pathlib import Path
 from typing import Union
 
+import numpy as np
 import xxhash
+
+from app.data_models import ImageFingerprint
+from app.image_io import get_image_metadata
 
 try:
     import imagehash
@@ -55,3 +59,12 @@ def worker_get_dhash(path: Path) -> tuple[Union["imagehash.ImageHash", None], Pa
         return dhash, path
     except Exception:
         return None, path
+
+
+def worker_create_dummy_fp(path: Path) -> ImageFingerprint | None:
+    """Worker function to create a placeholder ImageFingerprint with metadata."""
+    meta = get_image_metadata(path)
+    if not meta:
+        return None
+    # hashes will be empty; it gets populated during the AI stage
+    return ImageFingerprint(path=path, hashes=np.array([]), **meta)

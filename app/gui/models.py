@@ -24,7 +24,6 @@ from PySide6.QtWidgets import QStyle, QStyledItemDelegate
 from app.constants import DUCKDB_AVAILABLE, UIConfig
 from app.utils import find_common_base_name
 
-# --- REFACTOR: Updated relative import paths for components within the 'gui' package ---
 from .tasks import GroupFetcherTask, ImageLoader
 from .widgets import AlphaBackgroundWidget
 
