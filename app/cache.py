@@ -1,6 +1,6 @@
 # app/cache.py
 """Manages file and fingerprint caching to avoid reprocessing unchanged files.
-Also manages the optional, persistent thumbnail cache.
+Also manages the optional, session-based thumbnail cache.
 """
 
 import abc
@@ -8,8 +8,8 @@ import hashlib
 import logging
 import os
 import pickle
-import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -17,7 +17,6 @@ from app.constants import (
     CACHE_DIR,
     CACHE_VERSION,
     DUCKDB_AVAILABLE,
-    THUMBNAIL_CACHE_DB,
     ZSTD_AVAILABLE,
 )
 from app.data_models import ImageFingerprint
@@ -26,6 +25,10 @@ if DUCKDB_AVAILABLE:
     import duckdb
 if ZSTD_AVAILABLE:
     import zstandard
+
+if TYPE_CHECKING:
+    from app.data_models import ScanConfig
+
 
 app_logger = logging.getLogger("AssetPixelHand.cache")
 
@@ -36,6 +39,7 @@ def _configure_db_connection(conn):
         cpu_cores = os.cpu_count() or 2
         conn.execute(f"PRAGMA threads={max(1, cpu_cores // 2)}")
         conn.execute("PRAGMA memory_limit='1GB'")
+        # This setting is now primarily for the on-disk mode
         conn.execute("PRAGMA wal_autocheckpoint='256MB'")
         app_logger.debug("DuckDB performance PRAGMAs applied.")
     except duckdb.Error as e:
@@ -69,11 +73,9 @@ class CacheManager:
             self.db_path = CACHE_DIR / db_name
 
             if self.in_memory_mode:
-                # --- In-Memory Mode ---
                 self.conn = duckdb.connect(database="", read_only=False)
                 app_logger.info("Using in-memory database for fingerprint cache during scan.")
             else:
-                # --- HDD-Friendly On-Disk Mode ---
                 self.conn = duckdb.connect(database=str(self.db_path), read_only=False)
                 app_logger.info("Using on-disk database for fingerprint cache (HDD-friendly mode).")
 
@@ -175,28 +177,25 @@ class CacheManager:
             return
 
         if self.in_memory_mode and self.db_path:
-            # --- In-Memory Mode: Write the database to a file on disk ---
             try:
                 self.db_path.unlink(missing_ok=True)
-                # Step 1: Attach the disk file as a new DB named 'disk_db'
                 self.conn.execute(f"ATTACH '{self.db_path!s}' AS disk_db;")
-                # Step 2: Create a table in 'disk_db' as a full copy of the table from 'main' (in-memory)
                 self.conn.execute("CREATE TABLE disk_db.fingerprints AS SELECT * FROM main.fingerprints;")
-                # Step 3: Detach the disk DB to finalize the write operation
                 self.conn.execute("DETACH disk_db;")
                 app_logger.info(f"Successfully wrote in-memory cache to '{self.db_path.name}'.")
             except duckdb.Error as e:
                 app_logger.error(f"Failed to write fingerprint cache to disk: {e}")
         else:
-            # --- On-Disk Mode: Just perform a checkpoint ---
             try:
                 self.conn.execute("CHECKPOINT;")
             except duckdb.Error as e:
                 app_logger.warning(f"Error closing file cache DB: {e}")
 
-        # Close the connection in any case
         self.conn.close()
         self.conn = None
+
+
+# --- New Simplified Thumbnail Cache System ---
 
 
 class AbstractThumbnailCache(abc.ABC):
@@ -213,72 +212,57 @@ class AbstractThumbnailCache(abc.ABC):
         pass
 
 
-class DiskThumbnailCache(AbstractThumbnailCache):
-    """A persistent, thread-safe, disk-based thumbnail cache using DuckDB."""
+class DuckDBThumbnailCache(AbstractThumbnailCache):
+    """A session-based thumbnail cache using DuckDB, supports in-memory and on-disk modes."""
 
-    def __init__(self):
-        self.db_path = THUMBNAIL_CACHE_DB
-        self._buffer = {}
-        self._lock = threading.Lock()
-
-        self.BUFFER_SIZE = 4096
-
+    def __init__(self, in_memory: bool):
+        self.conn = None
         if not DUCKDB_AVAILABLE:
-            app_logger.error("DuckDB not found, persistent thumbnail cache is disabled.")
+            app_logger.error("DuckDB not found, thumbnail cache is disabled.")
             return
+
         try:
-            with duckdb.connect(database=str(self.db_path), read_only=False) as conn:
-                _configure_db_connection(conn)
-                conn.execute("CREATE TABLE IF NOT EXISTS thumbnails (key VARCHAR PRIMARY KEY, data BLOB)")
+            db_path = ":memory:" if in_memory else str(CACHE_DIR / "session_thumbnail_cache.duckdb")
+            if in_memory:
+                app_logger.info("Using in-memory database for thumbnail cache.")
+            else:
+                (CACHE_DIR / "session_thumbnail_cache.duckdb").unlink(missing_ok=True)
+                app_logger.info("Using on-disk database for thumbnail cache (HDD-friendly mode).")
+
+            self.conn = duckdb.connect(database=db_path, read_only=False)
+            _configure_db_connection(self.conn)
+            self.conn.execute("CREATE TABLE IF NOT EXISTS thumbnails (key VARCHAR PRIMARY KEY, data BLOB)")
         except duckdb.Error as e:
-            app_logger.error(f"Failed to initialize thumbnail cache table: {e}")
+            app_logger.error(f"Failed to initialize thumbnail cache: {e}")
 
     def get(self, key: str) -> bytes | None:
-        with self._lock:
-            if key in self._buffer:
-                return self._buffer[key]
+        if not self.conn:
+            return None
         try:
-            with duckdb.connect(database=str(self.db_path), read_only=True) as conn:
-                result = conn.execute("SELECT data FROM thumbnails WHERE key = ?", [key]).fetchone()
-                return result[0] if result else None
+            result = self.conn.execute("SELECT data FROM thumbnails WHERE key = ?", [key]).fetchone()
+            return result[0] if result else None
         except duckdb.Error as e:
             app_logger.warning(f"Thumbnail cache read failed: {e}")
             return None
 
     def put(self, key: str, data: bytes):
-        with self._lock:
-            self._buffer[key] = data
-            if len(self._buffer) >= self.BUFFER_SIZE:
-                self.flush(internal_call=True)
-
-    def flush(self, internal_call: bool = False):
-        items_to_insert = {}
-        with self._lock:
-            if not self._buffer or (not internal_call and len(self._buffer) == 0):
-                return
-            items_to_insert = self._buffer.copy()
-            self._buffer.clear()
-
-        if not items_to_insert:
+        if not self.conn:
             return
-
         try:
-            with duckdb.connect(database=str(self.db_path), read_only=False) as conn:
-                _configure_db_connection(conn)
-                conn.executemany("INSERT OR REPLACE INTO thumbnails VALUES (?, ?)", list(items_to_insert.items()))
+            self.conn.execute("INSERT OR REPLACE INTO thumbnails VALUES (?, ?)", [key, data])
         except duckdb.Error as e:
-            app_logger.error(f"Failed to write thumbnail cache batch: {e}")
-            with self._lock:
-                self._buffer.update(items_to_insert)
+            app_logger.error(f"Failed to write to thumbnail cache: {e}")
 
     def close(self):
-        self.flush()
-        if DUCKDB_AVAILABLE and self.db_path.exists():
+        if self.conn:
             try:
-                with duckdb.connect(database=str(self.db_path), read_only=False) as conn:
-                    conn.execute("CHECKPOINT;")
-            except duckdb.Error as e:
-                app_logger.warning(f"Final checkpoint on thumbnail cache failed: {e}")
+                # No need to checkpoint an in-memory db, but doesn't hurt for on-disk
+                self.conn.execute("CHECKPOINT;")
+                self.conn.close()
+            except duckdb.Error:
+                pass  # Ignore errors on close
+            finally:
+                self.conn = None
 
 
 class DummyThumbnailCache(AbstractThumbnailCache):
@@ -292,6 +276,7 @@ class DummyThumbnailCache(AbstractThumbnailCache):
         pass
 
 
+# Global variable to access the current session's thumbnail cache
 thumbnail_cache: AbstractThumbnailCache = DummyThumbnailCache()
 
 
@@ -300,20 +285,28 @@ def get_thumbnail_cache_key(path_str: str, mtime: float, target_size: int, tonem
     return hashlib.sha1(key_str.encode()).hexdigest()
 
 
-def setup_thumbnail_cache(settings):
-    """Initializes the appropriate thumbnail cache based on user settings."""
+# --- New Cache Lifecycle Management Functions ---
+
+
+def setup_caches(config: "ScanConfig"):
+    """Initializes both fingerprint and thumbnail caches based on scan settings."""
     global thumbnail_cache
+
+    # Close any old cache instance
     thumbnail_cache.close()
 
-    if settings.disk_thumbnail_cache_enabled:
-        app_logger.debug("Persistent thumbnail cache is ENABLED.")
-        thumbnail_cache = DiskThumbnailCache()
-    else:
-        app_logger.debug("Persistent thumbnail cache is DISABLED.")
-        thumbnail_cache = DummyThumbnailCache()
-        if THUMBNAIL_CACHE_DB.exists():
-            try:
-                THUMBNAIL_CACHE_DB.unlink()
-                app_logger.debug("Removed old thumbnail cache file.")
-            except OSError as e:
-                app_logger.warning(f"Could not remove old thumbnail cache file: {e}")
+    # Clean up the old persistent thumbnail cache file if it exists, as it's no longer used.
+    from app.constants import THUMBNAIL_CACHE_DB
+
+    THUMBNAIL_CACHE_DB.unlink(missing_ok=True)
+
+    # Create a new thumbnail cache instance in the correct mode for the current scan.
+    thumbnail_cache = DuckDBThumbnailCache(in_memory=config.lancedb_in_memory)
+
+
+def teardown_caches():
+    """Closes and cleans up all active caches."""
+    global thumbnail_cache
+    thumbnail_cache.close()
+    # Reset to the dummy cache to ensure no resources are held after the scan.
+    thumbnail_cache = DummyThumbnailCache()

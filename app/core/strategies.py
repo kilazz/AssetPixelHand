@@ -80,7 +80,7 @@ class ScanStrategy(ABC):
 
     def _find_files_as_list(self, stop_event: threading.Event) -> list[Path]:
         """Finds all image files and returns them as a single list."""
-        self.state.set_phase("Phase 1: Finding image files...", 0.1)
+        self.state.set_phase("Finding image files...", 0.1)  # This is a sub-phase now
         finder = FileFinder(
             self.state,
             self.config.folder_path,
@@ -125,66 +125,79 @@ class ScanStrategy(ABC):
         return ImageFingerprint(path=path, hashes=np.array([]), **meta)
 
     def _save_results_to_db(self, final_groups: DuplicateResults, search_context: str | None = None):
-        """Saves the final results to a DuckDB file for the UI to display."""
+        """Saves the final results to a DuckDB file using an in-memory buffer for max HDD performance."""
         if not DUCKDB_AVAILABLE:
             return
+
         RESULTS_DB_FILE.unlink(missing_ok=True)
+
+        mem_conn = None
         try:
-            with duckdb.connect(database=str(RESULTS_DB_FILE), read_only=False) as conn:
-                _configure_db_connection(conn)
+            mem_conn = duckdb.connect(database="", read_only=False)
+            _configure_db_connection(mem_conn)
 
-                conn.execute(
-                    "CREATE TABLE results (group_id INTEGER, is_best BOOLEAN, path VARCHAR, resolution_w INTEGER, resolution_h INTEGER, file_size UBIGINT, mtime DOUBLE, capture_date DOUBLE, distance INTEGER, format_str VARCHAR, format_details VARCHAR, has_alpha BOOLEAN, bit_depth INTEGER, search_context VARCHAR, found_by VARCHAR)"
+            mem_conn.execute(
+                "CREATE TABLE results (group_id INTEGER, is_best BOOLEAN, path VARCHAR, resolution_w INTEGER, resolution_h INTEGER, file_size UBIGINT, mtime DOUBLE, capture_date DOUBLE, distance INTEGER, format_str VARCHAR, format_details VARCHAR, has_alpha BOOLEAN, bit_depth INTEGER, search_context VARCHAR, found_by VARCHAR)"
+            )
+
+            data_to_insert = []
+            for i, (best_fp, dups) in enumerate(final_groups.items(), 1):
+                data_to_insert.append(
+                    (
+                        i,
+                        True,
+                        str(best_fp.path),
+                        *best_fp.resolution,
+                        best_fp.file_size,
+                        best_fp.mtime,
+                        best_fp.capture_date,
+                        -1,
+                        best_fp.format_str,
+                        best_fp.format_details,
+                        best_fp.has_alpha,
+                        best_fp.bit_depth,
+                        search_context,
+                        "Original",
+                    )
                 )
-
-                data_to_insert = []
-                for i, (best_fp, dups) in enumerate(final_groups.items(), 1):
+                for dup_fp, dist, method in dups:
                     data_to_insert.append(
                         (
                             i,
-                            True,
-                            str(best_fp.path),
-                            *best_fp.resolution,
-                            best_fp.file_size,
-                            best_fp.mtime,
-                            best_fp.capture_date,
-                            -1,
-                            best_fp.format_str,
-                            best_fp.format_details,
-                            best_fp.has_alpha,
-                            best_fp.bit_depth,
-                            search_context,
-                            "Original",
+                            False,
+                            str(dup_fp.path),
+                            *dup_fp.resolution,
+                            dup_fp.file_size,
+                            dup_fp.mtime,
+                            dup_fp.capture_date,
+                            dist,
+                            dup_fp.format_str,
+                            dup_fp.format_details,
+                            dup_fp.has_alpha,
+                            dup_fp.bit_depth,
+                            None,
+                            method,
                         )
                     )
-                    for dup_fp, dist, method in dups:
-                        data_to_insert.append(
-                            (
-                                i,
-                                False,
-                                str(dup_fp.path),
-                                *dup_fp.resolution,
-                                dup_fp.file_size,
-                                dup_fp.mtime,
-                                dup_fp.capture_date,
-                                dist,
-                                dup_fp.format_str,
-                                dup_fp.format_details,
-                                dup_fp.has_alpha,
-                                dup_fp.bit_depth,
-                                None,
-                                method,
-                            )
-                        )
 
-                if data_to_insert:
-                    conn.executemany(
-                        "INSERT INTO results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", data_to_insert
-                    )
+            if data_to_insert:
+                mem_conn.executemany(
+                    "INSERT INTO results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", data_to_insert
+                )
 
-                conn.execute("CHECKPOINT;")
+            # --- Correctly write in-memory DB to disk file ---
+            mem_conn.execute(f"ATTACH '{RESULTS_DB_FILE!s}' AS disk_db;")
+            mem_conn.execute("CREATE TABLE disk_db.results AS SELECT * FROM main.results;")
+            mem_conn.execute("DETACH disk_db;")
+
+            app_logger.info(f"Successfully saved results to '{RESULTS_DB_FILE.name}'.")
+
         except duckdb.Error as e:
             self.signals.log.emit(f"Failed to write results to DuckDB: {e}", "error")
+            app_logger.error(f"Failed to write results DB: {e}", exc_info=True)
+        finally:
+            if mem_conn:
+                mem_conn.close()
 
 
 class FindDuplicatesStrategy(ScanStrategy):
@@ -200,7 +213,6 @@ class FindDuplicatesStrategy(ScanStrategy):
         key = tuple(sorted((path1.as_posix(), path2.as_posix())))
         current_score, current_method = self.links.get(key, (101.0, "Unknown"))
 
-        # Priority: xxHash > dHash > pHash > AI. For AI, lower score (distance) is better.
         method_priority = {"xxHash": 4, "dHash": 3, "pHash": 2, "AI": 1, "Unknown": 0}
 
         new_link_is_better = False
@@ -219,7 +231,6 @@ class FindDuplicatesStrategy(ScanStrategy):
             self._report_and_cleanup({}, start_time)
             return
 
-        # --- Stage 1/6: Reading image metadata (in parallel) ---
         self.state.set_phase("Phase 1/6: Reading image metadata...", 0.10)
 
         ctx = multiprocessing.get_context("spawn")
@@ -238,12 +249,10 @@ class FindDuplicatesStrategy(ScanStrategy):
 
         app_logger.info(f"Created {len(self.all_image_fps)} initial fingerprints.")
 
-        # --- Hashing Stages ---
         files_for_ai_stage = self._run_hashing_stages(list(self.all_image_fps.keys()), stop_event)
         if stop_event.is_set():
             return
 
-        # --- AI Fingerprinting Stage ---
         success, _ = self._generate_fingerprints(files_for_ai_stage, stop_event, 6, 5, 0.4)
         if not success and not stop_event.is_set():
             final_groups = self._build_final_groups_from_links(stop_event)

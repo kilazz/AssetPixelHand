@@ -328,11 +328,10 @@ class ScanOptionsPanel(QGroupBox):
             "Slightly slower, but significantly reduces the number of files for AI processing."
         )
         self.lancedb_in_memory_check = QCheckBox("Use in-memory database (fastest)")
-        self.lancedb_in_memory_check.setToolTip("Stores the vector index in RAM. Fastest, but not persistent.")
-        self.disk_thumbnail_cache_check = QCheckBox("Enable persistent thumbnail cache")
-        self.disk_thumbnail_cache_check.setToolTip(
-            "Saves generated thumbnails to disk to speed up future sessions.\nCan use significant disk space over time."
+        self.lancedb_in_memory_check.setToolTip(
+            "Stores caches and vector index in RAM. Fastest, but not persistent across runs."
         )
+
         self.low_priority_check = QCheckBox("Run scan at lower priority")
 
         visuals_layout = QHBoxLayout()
@@ -371,7 +370,6 @@ class ScanOptionsPanel(QGroupBox):
         layout.addWidget(self.simple_duplicates_check)
         layout.addWidget(self.perceptual_duplicates_check)
         layout.addWidget(self.lancedb_in_memory_check)
-        layout.addWidget(self.disk_thumbnail_cache_check)
         layout.addWidget(self.low_priority_check)
         layout.addLayout(visuals_layout)
 
@@ -395,7 +393,8 @@ class ScanOptionsPanel(QGroupBox):
             self.perceptual_duplicates_check.setChecked(False)
 
     def toggle_visuals_option(self, is_checked):
-        visuals_layout_item = self.layout().itemAt(6)
+        # The visuals layout is the 6th item added to the main layout (index 5)
+        visuals_layout_item = self.layout().itemAt(5)
         if visuals_layout_item is None:
             return
         for i in range(1, visuals_layout_item.layout().count()):
@@ -419,7 +418,6 @@ class ScanOptionsPanel(QGroupBox):
         self.perceptual_duplicates_check.setChecked(s.find_perceptual_duplicates)
         self._update_hashing_options_state(s.find_exact_duplicates)
         self.lancedb_in_memory_check.setChecked(s.lancedb_in_memory)
-        self.disk_thumbnail_cache_check.setChecked(s.disk_thumbnail_cache_enabled)
         self.low_priority_check.setChecked(s.perf_low_priority)
         self.save_visuals_check.setChecked(s.save_visuals)
         self.visuals_tonemap_check.setChecked(getattr(s, "visuals_tonemap_enabled", False))

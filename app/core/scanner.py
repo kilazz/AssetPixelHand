@@ -42,12 +42,17 @@ class ScannerCore(QObject):
 
     def run(self, stop_event: threading.Event):
         """Main entry point for the scanner logic, executed in a separate thread."""
+        from app.cache import setup_caches, teardown_caches
+
         self.scan_has_finished = False
         start_time = time.time()
         self.all_skipped_files.clear()
         self._set_process_priority()
 
         try:
+            # Initialize caches based on the current scan's configuration
+            setup_caches(self.config)
+
             if not self._setup_lancedb():
                 return
 
@@ -70,6 +75,9 @@ class ScannerCore(QObject):
                 app_logger.error(f"Critical scan error: {e}", exc_info=True)
                 self.signals.error.emit(f"Scan aborted due to critical error: {e}")
         finally:
+            # Ensure caches are closed and cleaned up at the end of the scan
+            teardown_caches()
+
             total_duration = time.time() - start_time
             app_logger.info("Scan process finished.")
             if stop_event.is_set() and not self.scan_has_finished:

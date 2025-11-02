@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.cache import setup_thumbnail_cache, thumbnail_cache
+from app.cache import thumbnail_cache
 from app.constants import (
     DEEP_LEARNING_AVAILABLE,
     SCRIPT_DIR,
@@ -67,7 +67,6 @@ class App(QMainWindow):
         self.setGeometry(100, 100, 1600, 900)
 
         self.settings = AppSettings.load()
-        setup_thumbnail_cache(self.settings)
 
         self.log_emitter = log_emitter
         self.stats_dialog: ScanStatisticsDialog | None = None
@@ -95,7 +94,6 @@ class App(QMainWindow):
         self._apply_initial_theme()
 
     def _setup_ui(self):
-        # UI setup remains largely the same as it's about layout, not logic.
         SPACING = 6
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -270,7 +268,6 @@ class App(QMainWindow):
         scan_opts.exact_duplicates_check.toggled.connect(self._request_settings_save)
         scan_opts.perceptual_duplicates_check.toggled.connect(self._request_settings_save)
         scan_opts.lancedb_in_memory_check.toggled.connect(self._request_settings_save)
-        scan_opts.disk_thumbnail_cache_check.toggled.connect(self._on_thumbnail_cache_toggled)
         scan_opts.low_priority_check.toggled.connect(self._request_settings_save)
         scan_opts.save_visuals_check.toggled.connect(self._request_settings_save)
         scan_opts.visuals_tonemap_check.toggled.connect(self._request_settings_save)
@@ -294,12 +291,6 @@ class App(QMainWindow):
     @Slot()
     def _request_settings_save(self):
         self.settings_save_timer.start()
-
-    @Slot()
-    def _on_thumbnail_cache_toggled(self):
-        self.settings.disk_thumbnail_cache_enabled = self.scan_options_panel.disk_thumbnail_cache_check.isChecked()
-        setup_thumbnail_cache(self.settings)
-        self._request_settings_save()
 
     def _log_system_status(self):
         app_logger.info("Application ready. System capabilities are displayed in the status panel.")
@@ -398,7 +389,6 @@ class App(QMainWindow):
             self._start_visualization_task(groups_data)
         else:
             if self.stats_dialog:
-                # Update the dialog to its final "Scan Finished" state
                 self.stats_dialog.scan_finished(payload, num_found, mode, duration, skipped)
             self.on_scan_end()
 
@@ -479,7 +469,6 @@ class App(QMainWindow):
         if self._confirm_action("Clear Scan Cache", "Delete all temporary scan data?"):
             thumbnail_cache.close()
             success = clear_scan_cache()
-            setup_thumbnail_cache(self.settings)
             self.log_panel.log_message(
                 *(("Scan cache cleared.", "success") if success else ("Failed to clear scan cache.", "error"))
             )
@@ -507,7 +496,6 @@ class App(QMainWindow):
                 success = clear_all_app_data()
             finally:
                 setup_logging(self.log_emitter)
-                setup_thumbnail_cache(self.settings)
             if success:
                 self.results_panel.clear_results()
                 self.viewer_panel.clear_viewer()

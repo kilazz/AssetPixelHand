@@ -147,7 +147,6 @@ class AppSettings:
     perf_low_priority: bool = True
     perf_batch_size: str = "256"
     lancedb_in_memory: bool = True
-    disk_thumbnail_cache_enabled: bool = True
     search_precision: str = DEFAULT_SEARCH_PRECISION
     device: str = "CPU"
     quantization_mode: str = QuantizationMode.FP16.value
@@ -185,10 +184,7 @@ class AppSettings:
         scan_options_panel: "ScanOptionsPanel",
         viewer_panel: "ImageViewerPanel",
     ):
-        """Updates settings directly from the UI panels and serializes them to JSON.
-        This approach is more robust than passing a dictionary as it avoids key errors
-        and centralizes the knowledge of where settings come from.
-        """
+        """Updates settings directly from the UI panels and serializes them to JSON."""
         # Main Options
         self.folder_path = options_panel.folder_path_entry.text()
         self.threshold = str(options_panel.threshold_spinbox.value())
@@ -201,7 +197,6 @@ class AppSettings:
         self.find_simple_duplicates = scan_options_panel.simple_duplicates_check.isChecked()
         self.find_perceptual_duplicates = scan_options_panel.perceptual_duplicates_check.isChecked()
         self.lancedb_in_memory = scan_options_panel.lancedb_in_memory_check.isChecked()
-        self.disk_thumbnail_cache_enabled = scan_options_panel.disk_thumbnail_cache_check.isChecked()
         self.perf_low_priority = scan_options_panel.low_priority_check.isChecked()
         self.save_visuals = scan_options_panel.save_visuals_check.isChecked()
         self.visuals_tonemap_enabled = scan_options_panel.visuals_tonemap_check.isChecked()
