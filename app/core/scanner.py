@@ -205,6 +205,14 @@ class ScannerController(QObject):
         self.scan_thread = QThread()
         self.scanner_core = ScannerCore(config, self.scan_state, self.signals)
         self.scanner_core.moveToThread(self.scan_thread)
+
+        # When the scanner_core task is finished, it emits a 'finished' signal.
+        # This connection tells the containing QThread ('scan_thread') to quit its event loop.
+        # This allows the thread to terminate naturally, so is_running() will correctly
+        # return False, enabling the UI for the next scan.
+        self.scanner_core.signals.finished.connect(self.scan_thread.quit)
+        self.scanner_core.signals.error.connect(self.scan_thread.quit)  # Also quit on error
+
         self.scan_thread.started.connect(lambda: self.scanner_core.run(self.stop_event))
         self.scan_thread.finished.connect(self._on_scan_thread_finished)
         self.scan_thread.start()
@@ -214,6 +222,9 @@ class ScannerController(QObject):
         if self.is_running():
             self.signals.log.emit("Cancellation requested...", "warning")
             self.stop_event.set()
+            # On cancellation, we also need to ensure the thread quits if the task gets stuck
+            if self.scan_thread:
+                self.scan_thread.quit()
 
     def stop_and_cleanup_thread(self):
         if not self.is_running():
@@ -221,11 +232,12 @@ class ScannerController(QObject):
         self.cancel_scan()
         if self.scan_thread:
             self.scan_thread.quit()
-            self.scan_thread.wait(5000)
+            self.scan_thread.wait(5000)  # Wait for thread to finish
         self._on_scan_thread_finished()
 
     @Slot()
     def _on_scan_thread_finished(self):
+        # This method is now correctly called after EVERY scan (successful or cancelled).
         if self.scanner_core:
             self.scanner_core.deleteLater()
         if self.scan_thread:
