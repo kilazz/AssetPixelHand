@@ -18,13 +18,9 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-# Suppress decompression bomb warnings for very large images
 Image.MAX_IMAGE_PIXELS = None
-
-# Set up logging for this module
 app_logger = logging.getLogger("AssetPixelHand.image_io")
 
-# --- Library Availability Checks ---
 try:
     import OpenImageIO as oiio
 
@@ -53,7 +49,6 @@ def load_image(
     target_size: tuple[int, int] | None = None,
     tonemap_mode: str = "reinhard",
 ) -> Image.Image | None:
-    """Loads an image from a path or buffer using the best available library."""
     path = Path(path_or_buffer) if isinstance(path_or_buffer, (str, Path)) else Path("buffer.tmp")
     filename = path.name
     ext = path.suffix.lower()
@@ -99,10 +94,11 @@ def load_image(
     return None
 
 
-def get_image_metadata(path: Path) -> dict[str, Any] | None:
+def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | None:
     """Extracts image metadata using the best available library."""
     try:
-        stat = path.stat()
+        # If a stat object isn't provided, get it. Otherwise, use the precomputed one.
+        stat = precomputed_stat if precomputed_stat else path.stat()
         ext = path.suffix.lower()
         filename = path.name
 
@@ -132,16 +128,12 @@ def get_image_metadata(path: Path) -> dict[str, Any] | None:
             try:
                 buf = oiio.ImageBuf(str(path))
                 if buf.has_error:
-                    raise RuntimeError(f"OIIO Error: {buf.geterror()}")
+                    raise RuntimeError(f"OIIO Error: {buf.geterror(autoclear=1)}")
 
                 spec = buf.spec()
-                bit_depth = {
-                    oiio.UINT8: 8,
-                    oiio.UINT16: 16,
-                    oiio.HALF: 16,
-                    oiio.FLOAT: 32,
-                    oiio.DOUBLE: 64,
-                }.get(spec.format.basetype, 8)
+                bit_depth = {oiio.UINT8: 8, oiio.UINT16: 16, oiio.HALF: 16, oiio.FLOAT: 32, oiio.DOUBLE: 64}.get(
+                    spec.format.basetype, 8
+                )
                 ch_str = {1: "Grayscale", 2: "GA", 3: "RGB", 4: "RGBA"}.get(spec.nchannels, f"{spec.nchannels}ch")
                 result = {
                     "resolution": (spec.width, spec.height),
@@ -176,7 +168,7 @@ def get_image_metadata(path: Path) -> dict[str, Any] | None:
     except Exception as e:
         app_logger.error(f"All metadata methods failed for {path.name}. Error: {e}")
         try:
-            stat = path.stat()
+            stat = precomputed_stat if precomputed_stat else path.stat()
             return {
                 "resolution": (0, 0),
                 "file_size": stat.st_size,
@@ -194,7 +186,6 @@ def get_image_metadata(path: Path) -> dict[str, Any] | None:
 
 
 def is_dds_hdr(format_str: str) -> tuple[bool, int]:
-    """Checks if a DDS format string from DirectXTex represents an HDR format."""
     fmt = format_str.upper()
     if any(x in fmt for x in ["BC6H", "R16G16B16A16_FLOAT", "R16G16_FLOAT", "R16_FLOAT"]):
         return True, 16
@@ -203,7 +194,6 @@ def is_dds_hdr(format_str: str) -> tuple[bool, int]:
     return False, 8
 
 
-# --- Internal Helper Functions ---
 def _load_with_directxtex(path: Path, tonemap_mode: str) -> Image.Image | None:
     with path.open("rb") as f:
         decoded = directxtex_decoder.decode_dds(f.read())
@@ -228,10 +218,9 @@ def _load_with_oiio(path_or_buffer: str | Path | io.BytesIO, tonemap_mode: str) 
     path_str = str(path_or_buffer) if isinstance(path_or_buffer, (str, Path)) else path_or_buffer
     buf = oiio.ImageBuf(path_str)
     if buf.has_error:
-        raise RuntimeError(f"OIIO Error: {buf.geterror()}")
+        raise RuntimeError(f"OIIO Error: {buf.geterror(autoclear=1)}")
 
     numpy_array = buf.get_pixels()
-
     if np.issubdtype(numpy_array.dtype, np.floating):
         is_hdr = np.max(numpy_array) > 1.0
         if is_hdr and tonemap_mode != "none":
@@ -240,30 +229,24 @@ def _load_with_oiio(path_or_buffer: str | Path | io.BytesIO, tonemap_mode: str) 
             return Image.fromarray((np.clip(numpy_array, 0.0, 1.0) * 255).astype(np.uint8))
     elif numpy_array.dtype != np.uint8:
         if numpy_array.dtype == np.uint16:
-            numpy_array = numpy_array // 256
+            numpy_array = (numpy_array / 257).astype(np.uint8)
         return Image.fromarray(numpy_array.astype(np.uint8))
     else:
         return Image.fromarray(numpy_array)
 
 
 def _tonemap_float_array(float_array: np.ndarray, mode: str) -> np.ndarray:
-    """Applies a tonemapping algorithm to a NumPy array of float pixel data."""
     rgb = np.copy(float_array[..., :3])
     alpha = float_array[..., 3:4] if float_array.shape[-1] == 4 else None
-
     rgb[rgb < 0.0] = 0.0
-
     if mode == "reinhard":
         gamma_corrected = np.power(rgb / (1.0 + rgb), 1.0 / 2.2)
     elif mode == "drago":
         gamma_corrected = np.power(np.log(1.0 + 5.0 * rgb) / np.log(6.0), 1.0 / 1.9)
     else:
         gamma_corrected = np.clip(rgb, 0.0, 1.0)
-
     final_rgb = (gamma_corrected * 255).astype(np.uint8)
-
     if alpha is not None:
         final_alpha = (np.clip(alpha, 0.0, 1.0) * 255).astype(np.uint8)
         return np.concatenate([final_rgb, final_alpha], axis=-1)
-
     return final_rgb

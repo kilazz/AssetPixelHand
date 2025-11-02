@@ -182,10 +182,10 @@ class UIConfig:
 
 # --- Search Configuration ---
 SEARCH_PRECISION_PRESETS = {
-    "Fast": {"nprobes": 10, "refine_factor": 1},
-    "Balanced (Default)": {"nprobes": 20, "refine_factor": 2},
-    "Thorough": {"nprobes": 40, "refine_factor": 5},
-    "Exhaustive (Slow)": {"nprobes": 256, "refine_factor": 10},
+    "Fast": {"nprobes": 8, "refine_factor": 1},
+    "Balanced (Default)": {"nprobes": 20, "refine_factor": 3},
+    "Accurate": {"nprobes": 80, "refine_factor": 8},
+    "Exhaustive (Slow)": {"nprobes": 256, "refine_factor": 20},
 }
 DEFAULT_SEARCH_PRECISION = "Balanced (Default)"
 

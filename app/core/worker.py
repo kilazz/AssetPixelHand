@@ -4,6 +4,7 @@ This includes AI model inference and image preprocessing tasks, ensuring the mai
 thread remains responsive.
 """
 
+import contextlib
 import logging
 import multiprocessing
 import os
@@ -16,10 +17,16 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import onnxruntime as ort
+from PIL import Image
 
 from app.constants import APP_DATA_DIR, DEEP_LEARNING_AVAILABLE, MODELS_DIR, WIN32_AVAILABLE
 from app.data_models import ImageFingerprint
-from app.image_io import get_image_metadata, load_image
+from app.image_io import (
+    DIRECTXTEX_AVAILABLE,
+    PILLOW_AVAILABLE,
+    _load_with_directxtex,
+    get_image_metadata,
+)
 
 if WIN32_AVAILABLE:
     import win32api
@@ -36,7 +43,6 @@ g_free_buffers_q = None
 
 
 def normalize_vectors_numpy(embeddings: np.ndarray) -> np.ndarray:
-    """Normalizes a batch of numpy vectors to unit length."""
     if embeddings.dtype != np.float32:
         embeddings = embeddings.astype(np.float32)
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
@@ -98,20 +104,17 @@ class InferenceEngine:
             app_logger.error("ONNX text model returned empty output")
             return np.array([])
 
-        embedding = outputs[0]
-        return normalize_vectors_numpy(embedding).flatten()
+        return normalize_vectors_numpy(outputs[0]).flatten()
 
 
 def _init_worker_process(config: dict):
     """Lowers the process priority on Windows if requested."""
     if config.get("low_priority") and WIN32_AVAILABLE:
-        try:
+        with contextlib.suppress(Exception):
             pid = win32api.GetCurrentProcessId()
             handle = win32api.OpenProcess(win32con.PROCESS_ALL_ACCESS, True, pid)
             win32process.SetPriorityClass(handle, win32process.BELOW_NORMAL_PRIORITY_CLASS)
             win32api.CloseHandle(handle)
-        except Exception:
-            pass
 
 
 def init_worker(config: dict):
@@ -142,35 +145,98 @@ def init_preprocessor_worker(config: dict, queue: "multiprocessing.Queue"):
 def _process_batch_from_paths(
     paths: list[Path], input_size
 ) -> tuple[list, list[ImageFingerprint], list[tuple[str, str]]]:
-    """Helper function to load images and extract metadata for a batch of paths."""
+    """
+    Helper to load images and metadata for a batch of paths using a robust,
+    version-agnostic approach for OIIO optimization.
+    """
+    try:
+        import OpenImageIO as oiio
+    except ImportError:
+        oiio = None
+
     images, fingerprints, skipped_tuples = [], [], []
-    for path in paths:
-        try:
-            metadata = get_image_metadata(path)
-            if not metadata or metadata["resolution"][0] == 0:
-                skipped_tuples.append((str(path), "Metadata extraction failed"))
-                continue
 
-            img_obj = load_image(path, target_size=input_size, tonemap_mode="none")
+    oiio_cache = None
+    cache_needs_destroy = False
+    if oiio:
+        # Try the official, modern static method first
+        if hasattr(oiio.ImageCache, "create"):
+            with contextlib.suppress(Exception):
+                oiio_cache = oiio.ImageCache.create(shared=False)
+                cache_needs_destroy = True
 
-            if img_obj is not None:
-                images.append(img_obj)
-                fingerprints.append(ImageFingerprint(path=path, hashes=np.array([]), **metadata))
-            else:
-                skipped_tuples.append((str(path), "Image loading failed"))
-        except Exception as e:
-            app_logger.error(f"Error processing file in batch: {path.name}", exc_info=True)
-            error_message = f"{type(e).__name__}: {str(e).splitlines()[0]}"
-            skipped_tuples.append((str(path), error_message))
+        # If that failed, try the simple constructor (for oiio-python)
+        if not oiio_cache and hasattr(oiio, "ImageCache"):
+            with contextlib.suppress(Exception):
+                oiio_cache = oiio.ImageCache()
+                # This version does not need destroy(), so the flag remains False
+
+        if not oiio_cache:
+            app_logger.warning(
+                "Could not create/get OIIO ImageCache. Performance may be reduced. Consider updating 'openimageio' library."
+            )
+
+    try:
+        for path in paths:
+            try:
+                metadata = get_image_metadata(path)
+                if not metadata or not metadata.get("resolution") or metadata["resolution"][0] == 0:
+                    skipped_tuples.append((str(path), "Metadata extraction failed"))
+                    continue
+
+                pil_image = None
+                ext = path.suffix.lower()
+
+                if ext == ".dds" and DIRECTXTEX_AVAILABLE:
+                    with contextlib.suppress(Exception):
+                        pil_image = _load_with_directxtex(path, "none")
+
+                if pil_image is None and oiio:
+                    with contextlib.suppress(Exception):
+                        buf = oiio.ImageBuf()
+                        if oiio_cache:
+                            oiio_cache.get_imagebuf(str(path), buf)
+                        else:  # Fallback if cache creation failed
+                            buf.reset(str(path))
+
+                        if not buf.has_error:
+                            numpy_array = buf.get_pixels()
+                            pil_image = Image.fromarray(numpy_array)
+                        else:
+                            raise RuntimeError(buf.geterror(autoclear=1))
+
+                if pil_image is None and PILLOW_AVAILABLE:
+                    try:
+                        with Image.open(path) as img:
+                            img.load()
+                        pil_image = img
+                    except Exception:
+                        skipped_tuples.append((str(path), "Image loading failed"))
+                        continue
+
+                if pil_image:
+                    pil_image.thumbnail(input_size, Image.Resampling.LANCZOS)
+                    if pil_image.mode != "RGBA":
+                        pil_image = pil_image.convert("RGBA")
+                    images.append(pil_image)
+                    fingerprints.append(ImageFingerprint(path=path, hashes=np.array([]), **metadata))
+                else:
+                    skipped_tuples.append((str(path), "All image loaders failed"))
+
+            except Exception as e:
+                app_logger.error(f"Error processing {path.name} in batch", exc_info=True)
+                skipped_tuples.append((str(path), f"{type(e).__name__}: {str(e).splitlines()[0]}"))
+    finally:
+        # Only destroy the cache if it was created via the official factory method
+        if oiio_cache and cache_needs_destroy:
+            oiio_cache.destroy()
+
     return images, fingerprints, skipped_tuples
 
 
-def worker_wrapper_from_paths(
-    paths: list[Path],
-) -> tuple[list[ImageFingerprint], list[tuple[str, str]]]:
-    """Main function for CPU workers."""
+def worker_wrapper_from_paths(paths: list[Path]) -> tuple[list[ImageFingerprint], list[tuple[str, str]]]:
     if g_inference_engine is None:
-        return [], [(str(p), "Worker process not initialized") for p in paths]
+        return [], [(str(p), "Worker not initialized") for p in paths]
     try:
         images, fps, skipped_tuples = _process_batch_from_paths(paths, g_inference_engine.input_size)
         if images:
@@ -190,14 +256,12 @@ def worker_wrapper_from_paths(
         return fps, skipped_tuples
     except Exception as e:
         _log_worker_crash(e, "worker_wrapper_from_paths")
-        error_message = f"Batch failed in worker: {type(e).__name__}"
-        return [], [(str(p), error_message) for p in paths]
+        return [], [(str(p), f"Batch failed: {type(e).__name__}") for p in paths]
 
 
 def worker_wrapper_from_paths_cpu_shared_mem(
     paths: list[Path], input_size: tuple[int, int], buffer_shape, dtype
 ) -> tuple:
-    """Main function for GPU pipeline's CPU preprocessor workers."""
     global g_free_buffers_q, g_preprocessor
     if g_free_buffers_q is None or g_preprocessor is None:
         raise RuntimeError("Preprocessor worker not initialized correctly.")
@@ -211,30 +275,18 @@ def worker_wrapper_from_paths_cpu_shared_mem(
         shm_name = g_free_buffers_q.get()
         existing_shm = shared_memory.SharedMemory(name=shm_name)
         shared_array = np.ndarray(buffer_shape, dtype=dtype, buffer=existing_shm.buf)
-
         current_batch_size = pixel_values.shape[0]
         shared_array[:current_batch_size] = pixel_values.astype(dtype)
 
-        meta_message = {
-            "shm_name": shm_name,
-            "shape": (current_batch_size, *buffer_shape[1:]),
-            "dtype": dtype,
-        }
+        meta_message = {"shm_name": shm_name, "shape": (current_batch_size, *buffer_shape[1:]), "dtype": dtype}
         existing_shm.close()
         return meta_message, fps, skipped_tuples
     except Exception as e:
         _log_worker_crash(e, "worker_wrapper_from_paths_cpu_shared_mem")
-        error_message = f"Batch failed in worker: {type(e).__name__}"
-        return None, [], [(str(p), error_message) for p in paths]
+        return None, [], [(str(p), f"Batch failed: {type(e).__name__}") for p in paths]
 
 
-def inference_worker_loop(
-    config: dict,
-    tensor_q: "multiprocessing.Queue",
-    results_q: "multiprocessing.Queue",
-    free_buffers_q: "multiprocessing.Queue",
-):
-    """The main loop for the dedicated GPU inference process."""
+def inference_worker_loop(config: dict, tensor_q, results_q, free_buffers_q):
     init_worker(config)
     if g_inference_engine is None:
         results_q.put(None)
@@ -255,11 +307,7 @@ def inference_worker_loop(
             meta_message, fps, skipped_tuples = item
             pixel_values = None
             if meta_message:
-                shm_name, shape, dtype = (
-                    meta_message["shm_name"],
-                    meta_message["shape"],
-                    meta_message["dtype"],
-                )
+                shm_name, shape, dtype = meta_message["shm_name"], meta_message["shape"], meta_message["dtype"]
                 existing_shm = shared_memory.SharedMemory(name=shm_name)
                 shared_array = np.ndarray(shape, dtype=dtype, buffer=existing_shm.buf)
                 pixel_values = np.copy(shared_array)
@@ -291,7 +339,6 @@ def inference_worker_loop(
 
 
 def _log_worker_crash(e: Exception, context: str):
-    """Logs any unhandled exceptions in a worker process to a crash file."""
     pid = os.getpid()
     crash_log_dir = APP_DATA_DIR / "crash_logs"
     crash_log_dir.mkdir(parents=True, exist_ok=True)
@@ -301,7 +348,6 @@ def _log_worker_crash(e: Exception, context: str):
 
 
 def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
-    """Worker function to get a single vector for an image (used for search-by-sample)."""
     if g_inference_engine is None:
         return None
     try:
@@ -313,8 +359,7 @@ def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
             io_binding = g_inference_engine.visual_session.io_binding()
             pixel_values = g_inference_engine.processor(images=images, return_tensors="np").pixel_values
             io_binding.bind_cpu_input(
-                "pixel_values",
-                pixel_values.astype(np.float16 if g_inference_engine.is_fp16 else np.float32),
+                "pixel_values", pixel_values.astype(np.float16 if g_inference_engine.is_fp16 else np.float32)
             )
             io_binding.bind_output("image_embeds")
             g_inference_engine.visual_session.run_with_iobinding(io_binding)
@@ -326,7 +371,6 @@ def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
 
 
 def worker_get_text_vector(text: str) -> np.ndarray | None:
-    """Worker function to get a vector for a text query."""
     if g_inference_engine is None:
         return None
     try:

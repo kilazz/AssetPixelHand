@@ -493,9 +493,7 @@ class PerformancePanel(QGroupBox):
         self.search_precision_combo.blockSignals(True)
         self.search_precision_combo.clear()
 
-        all_presets = list(SEARCH_PRECISION_PRESETS.keys())
-        is_duplicate_mode = scan_mode_name == ScanMode.DUPLICATES.name
-        presets = [p for p in all_presets if "Exhaustive" not in p] if is_duplicate_mode else all_presets
+        presets = list(SEARCH_PRECISION_PRESETS.keys())
         self.search_precision_combo.addItems(presets)
 
         current_setting = self.settings.search_precision

@@ -37,9 +37,7 @@ class FileFinder:
     ):
         self.state = state
         self.folder_path = folder_path
-
         self.excluded_paths = {str(folder_path.joinpath(p.strip())) for p in excluded if p.strip()}
-
         self.extensions = set(extensions)
         self.signals = signals
         self.found_count = 0
@@ -51,12 +49,12 @@ class FileFinder:
 
         batch = []
         try:
-            for file_path in self._walk_directory(self.folder_path, stop_event):
+            for entry_tuple in self._walk_directory(self.folder_path, stop_event):
                 if stop_event.is_set():
                     app_logger.info("[FileFinder] Stop event detected during streaming. Breaking loop.")
                     break
 
-                batch.append(file_path)
+                batch.append(entry_tuple)
                 if len(batch) >= self.BATCH_SIZE:
                     yield batch
                     batch = []
@@ -70,30 +68,29 @@ class FileFinder:
             app_logger.info(f"[FileFinder] Streaming finished. Found {self.found_count} files.")
 
     def _walk_directory(self, current_path: Path, stop_event: threading.Event):
-        """A generator that recursively walks the directory and yields file paths."""
+        """A generator that recursively walks the directory and yields (path, stat_result) tuples."""
         if stop_event.is_set():
             return
 
         try:
-            # Use scandir for better performance
             with os.scandir(current_path) as it:
                 for entry in it:
                     if stop_event.is_set():
                         return
 
                     try:
-                        entry_path = Path(entry.path)
-                        # Check for directory first
                         if entry.is_dir(follow_symlinks=False):
-                            # The path for comparison must be a simple string, no resolve()
+                            entry_path = Path(entry.path)
                             if str(entry_path) not in self.excluded_paths:
                                 yield from self._walk_directory(entry_path, stop_event)
-                        # Then check for file
-                        elif entry.is_file(follow_symlinks=False) and entry_path.suffix.lower() in self.extensions:
-                            self.found_count += 1
-                            if self.found_count % 100 == 0:  # Update progress less frequently
-                                self.state.update_progress(self.found_count, -1, f"Found: {self.found_count}")
-                            yield entry_path
+                        elif entry.is_file(follow_symlinks=False):
+                            entry_path = Path(entry.path)
+                            if entry_path.suffix.lower() in self.extensions:
+                                self.found_count += 1
+                                if self.found_count % 100 == 0:
+                                    self.state.update_progress(self.found_count, -1, f"Found: {self.found_count}")
+                                # MODIFIED: Yield the path and the stat result together to save a system call.
+                                yield entry_path, entry.stat()
                     except OSError as e:
                         self.signals.log.emit(f"Skipping unreadable entry '{entry.name}': {e}", "warning")
 
@@ -135,7 +132,6 @@ class VisualizationTask(QRunnable):
         report_count = 0
 
         total_groups_to_process = min(len(sorted_groups), self.config.max_visuals)
-
         tonemap_mode = "reinhard" if self.config.tonemap_visuals else "none"
 
         for i, (orig_fp, dups) in enumerate(sorted_groups):
@@ -207,7 +203,7 @@ class VisualizationTask(QRunnable):
                 draw.text((PADDING, height - 30), footer, font=font, fill=(180, 180, 180))
 
                 filename = (
-                    f"group_{i + 1:03d}" + (f"_part_{page + 1}" if (len(to_visualize) > IMGS_PER_FILE) else "") + ".png"
+                    f"group_{i + 1:03d}" + (f"_part_{page + 1}" if len(to_visualize) > IMGS_PER_FILE else "") + ".png"
                 )
                 try:
                     canvas.save(VISUALS_DIR / filename, "PNG")
@@ -219,14 +215,11 @@ class VisualizationTask(QRunnable):
         self.signals.finished.emit()
 
     def _wrap_path(self, path_str: str, width: int, font: ImageFont.FreeTypeFont) -> str:
-        """Wraps a long file path string to fit within a given pixel width."""
-        # This function is now safer because we removed the .resolve() call before passing the path here
         if font.getlength(path_str) <= width:
             return path_str
 
         lines = []
         current_line = ""
-        # Generic separator handling for cross-platform safety
         parts = path_str.replace("\\", "/").split("/")
 
         for i, part in enumerate(parts):
