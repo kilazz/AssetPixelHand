@@ -33,7 +33,7 @@
 *   **Image Processing**: OpenImageIO, Pillow, DirectXTex Decoder
 
 ## Requirements
-*   Python 3.13~
+*   Python 3.13 ~
 
 ## Quick Start
 The project is designed for an effortless launch.

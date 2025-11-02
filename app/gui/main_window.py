@@ -30,6 +30,7 @@ from app.constants import (
     VISUALS_DIR,
     WIN32_AVAILABLE,
 )
+from app.core.helpers import VisualizationTask
 from app.core.scanner import ScannerController
 from app.data_models import AppSettings, ScanConfig
 from app.logging_config import setup_logging
@@ -43,7 +44,6 @@ from app.utils import (
     is_onnx_model_cached,
 )
 
-# --- REFACTOR: Updated relative import paths for GUI components ---
 from .dialogs import ModelConversionDialog, ScanStatisticsDialog, SkippedFilesDialog
 from .panels import (
     ImageViewerPanel,
@@ -249,7 +249,6 @@ class App(QMainWindow):
         self.controller.signals.finished.connect(self.on_scan_complete, conn)
         self.controller.signals.error.connect(self.on_scan_error, conn)
         self.controller.signals.log.connect(self.log_panel.log_message, conn)
-        self.controller.signals.save_visuals_finished.connect(self._on_save_visuals_finished, conn)
 
         # --- Context Menu Signals ---
         self.open_action.triggered.connect(self._context_open_file)
@@ -332,9 +331,7 @@ class App(QMainWindow):
         self.stats_dialog.show()
 
     def _get_config(self) -> ScanConfig | None:
-        """Builds the scan configuration using the dedicated ScanConfigBuilder.
-        This keeps the main window clean from UI implementation details.
-        """
+        """Builds the scan configuration using the dedicated ScanConfigBuilder."""
         try:
             builder = ScanConfigBuilder(self.options_panel, self.performance_panel, self.scan_options_panel)
             return builder.build()
@@ -365,18 +362,22 @@ class App(QMainWindow):
     # --- Scan Completion Handlers ---
 
     @Slot(object, int, str, float, list)
-    def on_scan_complete(self, results, num_found, mode, duration, skipped):
+    def on_scan_complete(self, payload, num_found, mode, duration, skipped):
         if not mode:
             app_logger.warning("Scan was cancelled by the user.")
             self.on_scan_end()
             return
 
         time_str = f"{int(duration // 60)}m {int(duration % 60)}s" if duration > 0 else "less than a second"
+
+        db_path = payload.get("db_path")
+        groups_data = payload.get("groups_data")
+
         log_msg = f"Finished! Found {num_found} {'similar items' if mode == 'duplicates' else 'results'} in {time_str}."
         app_logger.info(log_msg)
         self.log_panel.log_message(log_msg, "success")
 
-        self.results_panel.display_results(results, num_found, mode)
+        self.results_panel.display_results(db_path, num_found, mode)
         if num_found > 0 and mode == "duplicates":
             link_support = check_link_support(self.controller.config.folder_path)
             self.results_panel.hardlink_available = link_support.get("hardlink", False)
@@ -395,27 +396,65 @@ class App(QMainWindow):
             self.log_panel.log_message(f"{len(skipped)} files were skipped due to errors.", "warning")
             SkippedFilesDialog(skipped, self).exec()
 
-        self.on_scan_end()
+        if groups_data and self.controller.config and self.controller.config.save_visuals:
+            if self.stats_dialog:
+                self.stats_dialog.switch_to_visualization_mode()
+            self._start_visualization_task(groups_data)
+        else:
+            if self.stats_dialog:
+                self.stats_dialog.scan_finished(payload, num_found, mode, duration, skipped)
+            self.on_scan_end()
 
     @Slot(str)
     def on_scan_error(self, message: str):
         app_logger.error(f"Scan error received: {message}")
+        if self.stats_dialog:
+            self.stats_dialog.scan_error(message)
         self.on_scan_end()
 
     def on_scan_end(self):
+        """Finalizes any scan-related state and re-enables the UI."""
         if self.stats_dialog:
             self.stats_dialog.close()
             self.stats_dialog = None
         if self.controller.is_running():
-            self.controller.scan_thread.quit()
+            self.controller.stop_and_cleanup_thread()
         self.set_ui_scan_state(is_scanning=False)
         self.results_panel.set_enabled_state(self.results_panel.results_model.rowCount() > 0)
 
-    # --- File Operation Handlers (Now delegated) ---
+    def _start_visualization_task(self, groups_data):
+        """Starts the visualization task and connects its signals to the stats dialog."""
+        self.log_panel.log_message("Starting to generate visualization files...", "info")
 
+        if not self.controller.config:
+            self.log_panel.log_message("Cannot start visualization: scan config is missing.", "error")
+            self.on_scan_end()
+            return
+
+        config = self.controller.config
+        task = VisualizationTask(groups_data, config.max_visuals, config.folder_path, config.visuals_columns)
+
+        if self.stats_dialog:
+            task.signals.progress.connect(self.stats_dialog.update_visualization_progress)
+
+        task.signals.finished.connect(self._on_save_visuals_finished)
+
+        self.shared_thread_pool.start(task)
+
+    # This slot is no longer needed as the main window doesn't directly handle progress updates
+    # def _on_visuals_progress(...)
+
+    @Slot()
+    def _on_save_visuals_finished(self):
+        """Handles the completion of the visualization task."""
+        self.log_panel.log_message(f"Visualizations saved to '{VISUALS_DIR.resolve()}'.", "success")
+        # Now that everything is finished, call on_scan_end to close the dialog and re-enable the UI
+        self.on_scan_end()
+
+    # --- File Operation Handlers ---
     @Slot(list)
     def _handle_hardlink_request(self, paths: list[Path]):
-        """Creates the link map and delegates the hardlink request to the manager."""
+        """Delegates hardlink request to the manager."""
         if not paths:
             self.log_panel.log_message("No valid duplicates selected for linking.", "warning")
             return
@@ -428,7 +467,7 @@ class App(QMainWindow):
 
     @Slot(list)
     def _handle_reflink_request(self, paths: list[Path]):
-        """Creates the link map and delegates the reflink request to the manager."""
+        """Delegates reflink request to the manager."""
         if not paths:
             self.log_panel.log_message("No valid duplicates selected for linking.", "warning")
             return
@@ -446,7 +485,6 @@ class App(QMainWindow):
         self.viewer_panel.clear_viewer()
 
     # --- Cache Clearing ---
-
     def _confirm_action(self, title: str, text: str) -> bool:
         if self.controller.is_running():
             self.log_panel.log_message("Action disabled during scan.", "warning")
@@ -493,12 +531,6 @@ class App(QMainWindow):
                 QMessageBox.critical(self, "Error", "Failed to clear all app data.")
 
     # --- Context Menu and System Interaction ---
-    # These methods remain simple and are fine to keep in the main window class.
-
-    @Slot()
-    def _on_save_visuals_finished(self):
-        self.log_panel.log_message(f"Visualizations saved to '{VISUALS_DIR.resolve()}'.", "success")
-
     def _show_results_context_menu(self, pos):
         idx = self.results_panel.results_view.indexAt(pos)
         if (node := idx.internalPointer()) and node.get("type") != "group" and (path := node.get("path")):
@@ -536,7 +568,6 @@ class App(QMainWindow):
 
     def _save_settings(self):
         """Gathers settings from UI panels and saves them via the AppSettings class."""
-        # This will be updated in the next step to call a cleaner AppSettings.save method
         self.settings.save(
             options_panel=self.options_panel,
             performance_panel=self.performance_panel,

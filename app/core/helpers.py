@@ -38,9 +38,6 @@ class FileFinder:
         self.state = state
         self.folder_path = folder_path
 
-        # --- THE FINAL, CRITICAL FIX IS HERE ---
-        # This line is simplified to avoid any call to .resolve(), which was
-        # the true source of the deadlock on complex file systems.
         self.excluded_paths = {str(folder_path.joinpath(p.strip())) for p in excluded if p.strip()}
 
         self.extensions = set(extensions)
@@ -110,6 +107,7 @@ class VisualizationTask(QRunnable):
 
     class Signals(QObject):
         finished = Signal()
+        progress = Signal(str, int, int)
 
     def __init__(self, groups: DuplicateResults, max_visuals: int, config_folder_path: Path, num_columns: int):
         super().__init__()
@@ -137,9 +135,13 @@ class VisualizationTask(QRunnable):
         sorted_groups = sorted(self.groups.items(), key=lambda item: len(item[1]), reverse=True)
         report_count = 0
 
+        total_groups_to_process = min(len(sorted_groups), self.max_visuals)
+
         for i, (orig_fp, dups) in enumerate(sorted_groups):
             if report_count >= self.max_visuals or not dups:
                 continue
+
+            self.signals.progress.emit(f"Processing group {i + 1}...", i + 1, total_groups_to_process)
 
             all_fps = [orig_fp] + [fp for fp, _, _ in dups]
             to_visualize = all_fps[:MAX_IMGS]
@@ -164,7 +166,7 @@ class VisualizationTask(QRunnable):
                     x = PADDING + col * (THUMB + PADDING)
                     y = PADDING + row * (THUMB + TEXT_AREA + PADDING)
                     try:
-                        img = load_image(str(fp.path))
+                        img = load_image(str(fp.path), tonemap_mode="none")
                         if not img:
                             raise ValueError("Image failed to load")
 

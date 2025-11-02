@@ -26,7 +26,6 @@ from PySide6.QtWidgets import (
 from app.constants import ALL_SUPPORTED_EXTENSIONS, QuantizationMode
 from app.data_models import ScanState
 
-# --- REFACTOR: Updated relative import for a component within the 'gui' package ---
 from .tasks import ModelConverter
 
 app_logger = logging.getLogger("AssetPixelHand.gui.dialogs")
@@ -174,15 +173,15 @@ class ScanStatisticsDialog(QDialog):
         layout.addWidget(self.overall_status_label)
         layout.addWidget(self.overall_progress_bar)
 
-        phase_group = QGroupBox("Current Phase")
-        phase_layout = QGridLayout(phase_group)
+        self.phase_group = QGroupBox("Current Phase")
+        phase_layout = QGridLayout(self.phase_group)
         self.phase_progress_label = QLabel("Details will appear here...")
         self.phase_progress_bar = QProgressBar()
         self.phase_progress_bar.setTextVisible(True)
         self.phase_progress_bar.setFormat("%v / %m")
         phase_layout.addWidget(self.phase_progress_label, 0, 0, 1, 2)
         phase_layout.addWidget(self.phase_progress_bar, 1, 0, 1, 2)
-        layout.addWidget(phase_group)
+        layout.addWidget(self.phase_group)
 
         self.close_button = QPushButton("Close")
         self.close_button.setEnabled(False)
@@ -204,10 +203,33 @@ class ScanStatisticsDialog(QDialog):
         self.phase_progress_bar.setValue(snapshot["phase_current"])
         self.overall_progress_bar.setValue(int(overall_prog * 100))
 
+    def switch_to_visualization_mode(self):
+        """Switches the dialog to display visualization progress."""
+        self.timer.stop()  # Stop polling ScanState, as it's no longer needed
+        self.setWindowTitle("Generating Visualizations")
+        self.overall_status_label.setText("Preparing to save visualization files...")
+        self.overall_progress_bar.setFormat("Group Processing: %p%")
+        self.overall_progress_bar.setValue(0)
+        self.phase_group.setTitle("Current Group")
+        self.phase_progress_label.setText("Waiting for the first group...")
+        self.phase_progress_bar.setVisible(False)  # Hide the secondary bar to reduce clutter
+        self.close_button.setEnabled(False)  # Disable close button until this task is done
+
+    @Slot(str, int, int)
+    def update_visualization_progress(self, message: str, current: int, total: int):
+        """Directly updates the dialog's widgets from the VisualizationTask's signals."""
+        self.overall_status_label.setText("Generating Visualizations")
+        self.phase_progress_label.setText(f"Task: {message}")
+
+        # Use the main progress bar to show overall progress through the groups
+        self.overall_progress_bar.setMaximum(total)
+        self.overall_progress_bar.setValue(current)
+
     @Slot(object, int, str, float, list)
     def scan_finished(self, results, num_found, mode, duration, skipped):
+        """This slot is now called when scan finishes *without* a follow-up visualization task."""
         self.timer.stop()
-        self.update_display()
+        self.update_display()  # Perform one last update from ScanState
         self.overall_status_label.setText(f"Scan Finished! Found: {num_found:,} items.")
         self.overall_progress_bar.setValue(100)
         self.close_button.setEnabled(True)

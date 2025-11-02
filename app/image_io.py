@@ -54,6 +54,7 @@ def load_image(
     tonemap_mode: str = "reinhard",
 ) -> Image.Image | None:
     """Loads an image from a path or buffer using the best available library."""
+    # Convert string path to Path object for easier handling
     path = Path(path_or_buffer) if isinstance(path_or_buffer, (str, Path)) else Path("buffer.tmp")
     ext = path.suffix.lower()
 
@@ -66,14 +67,15 @@ def load_image(
 
     if pil_image is None and OIIO_AVAILABLE:
         try:
-            pil_image = _load_with_oiio(str(path_or_buffer), tonemap_mode)
+            # Pass the original path_or_buffer to OIIO, as it can handle buffers
+            pil_image = _load_with_oiio(path_or_buffer, tonemap_mode)
         except Exception as e:
             app_logger.debug(f"OIIO failed for {path.name}: {e}. Trying Pillow.")
 
     if pil_image is None and PILLOW_AVAILABLE:
         try:
             with Image.open(path_or_buffer) as img:
-                img.load()
+                img.load()  # Make sure image data is loaded into memory
             pil_image = img
         except Exception as e:
             app_logger.error(f"All loaders failed for {path.name}. Final Pillow error: {e}")
@@ -82,6 +84,7 @@ def load_image(
     if pil_image:
         if target_size:
             pil_image.thumbnail(target_size, Image.Resampling.LANCZOS)
+        # Ensure final image is RGBA for consistency in the UI
         return pil_image.convert("RGBA")
 
     return None
@@ -98,7 +101,6 @@ def get_image_metadata(path: Path) -> dict[str, Any] | None:
                 with path.open("rb") as f:
                     meta = directxtex_decoder.get_dds_metadata(f.read())
                 format_str = meta["format_str"].upper()
-                # --- FIX APPLIED HERE: Replaced unused 'is_hdr' with '_' ---
                 _, bit_depth = is_dds_hdr(format_str)
                 has_alpha = any(s in format_str for s in ["A8", "BC2", "BC3", "BC7", "DXT", "RGBA"])
                 return {
@@ -116,6 +118,7 @@ def get_image_metadata(path: Path) -> dict[str, Any] | None:
 
         if OIIO_AVAILABLE:
             try:
+                # Use str(path) for OIIO as it's more reliable
                 buf = oiio.ImageBuf(str(path))
                 spec = buf.spec()
                 bit_depth = {
@@ -191,7 +194,12 @@ def _load_with_directxtex(path: Path, tonemap_mode: str) -> Image.Image | None:
         decoded = directxtex_decoder.decode_dds(f.read())
     numpy_array, dtype = decoded["data"], decoded["data"].dtype
     if np.issubdtype(dtype, np.floating):
-        return Image.fromarray(_tonemap_float_array(numpy_array.astype(np.float32), tonemap_mode))
+        # Apply tonemapping only if a mode is explicitly set
+        if tonemap_mode != "none":
+            return Image.fromarray(_tonemap_float_array(numpy_array.astype(np.float32), tonemap_mode))
+        else:
+            # Just clip and convert for display without tonemapping
+            return Image.fromarray((np.clip(numpy_array, 0.0, 1.0) * 255).astype(np.uint8))
     elif np.issubdtype(dtype, np.uint16):
         return Image.fromarray((numpy_array // 257).astype(np.uint8))
     elif np.issubdtype(dtype, np.signedinteger):
@@ -203,10 +211,25 @@ def _load_with_directxtex(path: Path, tonemap_mode: str) -> Image.Image | None:
     raise TypeError(f"Unhandled NumPy dtype from DirectXTex decoder: {dtype}")
 
 
-def _load_with_oiio(path_str: str, tonemap_mode: str) -> Image.Image | None:
+def _load_with_oiio(path_or_buffer: str | Path | io.BytesIO, tonemap_mode: str) -> Image.Image | None:
+    # OIIO works best with string paths
+    path_str = str(path_or_buffer) if isinstance(path_or_buffer, (str, Path)) else path_or_buffer
     numpy_array = oiio.ImageBuf(path_str).get_pixels()
+
     if np.issubdtype(numpy_array.dtype, np.floating):
-        return Image.fromarray(_tonemap_float_array(numpy_array, tonemap_mode))
+        # Heuristic to check if the image is actually HDR by checking if any pixel value exceeds 1.0.
+        # Normalized LDR images (like 16-bit PNGs) will not have values > 1.0.
+        is_hdr = np.max(numpy_array) > 1.0
+
+        # Only apply tonemapping if it's a true HDR image AND a tonemapping mode is requested.
+        if is_hdr and tonemap_mode != "none":
+            return Image.fromarray(_tonemap_float_array(numpy_array, tonemap_mode))
+        else:
+            # For normalized LDR images or HDR images where no tonemapping is requested,
+            # just clip the values to the displayable range [0.0, 1.0] and convert to 8-bit.
+            return Image.fromarray((np.clip(numpy_array, 0.0, 1.0) * 255).astype(np.uint8))
+
+    # Handle integer types as before
     elif numpy_array.dtype != np.uint8:
         if numpy_array.dtype == np.uint16:
             numpy_array = numpy_array // 256
@@ -217,19 +240,26 @@ def _load_with_oiio(path_str: str, tonemap_mode: str) -> Image.Image | None:
 
 def _tonemap_float_array(float_array: np.ndarray, mode: str) -> np.ndarray:
     """Applies a tonemapping algorithm to a NumPy array of float pixel data."""
-    rgb, alpha = (
-        float_array[..., :3],
-        float_array[..., 3:4] if float_array.shape[-1] == 4 else (float_array, None),
-    )
+    # Ensure we don't modify the original array in place if it's not a copy
+    rgb = np.copy(float_array[..., :3])
+    alpha = float_array[..., 3:4] if float_array.shape[-1] == 4 else None
+
     rgb[rgb < 0.0] = 0.0
+
     if mode == "reinhard":
+        # Reinhard tonemapping
         gamma_corrected = np.power(rgb / (1.0 + rgb), 1.0 / 2.2)
     elif mode == "drago":
+        # Simplified Drago tonemapping
         gamma_corrected = np.power(np.log(1.0 + 5.0 * rgb) / np.log(6.0), 1.0 / 1.9)
-    else:
+    else:  # mode == "none" or unknown
+        # Simple clipping for basic display
         gamma_corrected = np.clip(rgb, 0.0, 1.0)
+
     final_rgb = (gamma_corrected * 255).astype(np.uint8)
+
     if alpha is not None:
         final_alpha = (np.clip(alpha, 0.0, 1.0) * 255).astype(np.uint8)
         return np.concatenate([final_rgb, final_alpha], axis=-1)
+
     return final_rgb

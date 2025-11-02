@@ -13,7 +13,6 @@ from pathlib import Path
 
 import duckdb
 import numpy as np
-from PySide6.QtCore import QThreadPool
 
 try:
     import imagehash  # noqa: F401
@@ -44,7 +43,7 @@ from app.utils import find_best_in_group
 
 from .engines import FingerprintEngine, LanceDBSimilarityEngine
 from .hashing_worker import worker_get_phash, worker_get_xxhash
-from .helpers import FileFinder, VisualizationTask
+from .helpers import FileFinder
 from .worker import init_worker, worker_get_single_vector, worker_get_text_vector
 
 app_logger = logging.getLogger("AssetPixelHand.strategies")
@@ -347,21 +346,20 @@ class FindDuplicatesStrategy(ScanStrategy):
         return int(max(0.0, min(1.0, similarity)) * 100)
 
     def _report_and_cleanup(self, final_groups: DuplicateResults, start_time: float):
+        """Finalizes the scan, saves results, and signals the UI."""
         num_found = sum(len(dups) for dups in final_groups.values())
         duration = time.time() - start_time
 
+        db_path_payload = None
         if num_found > 0:
             self._save_results_to_db(final_groups)
-            if self.config.save_visuals:
-                task = VisualizationTask(
-                    final_groups, self.config.max_visuals, self.config.folder_path, self.config.visuals_columns
-                )
-                task.signals.finished.connect(self.signals.save_visuals_finished.emit)
-                QThreadPool.globalInstance().start(task)
+            db_path_payload = RESULTS_DB_FILE
 
-        self.scanner_core._finalize_scan(
-            RESULTS_DB_FILE if num_found > 0 else [], num_found, "duplicates", duration, self.all_skipped_files
-        )
+        # This payload will carry the DB path and, if needed, the data for visualization.
+        # The VisualizationTask is no longer started here.
+        scan_payload = {"db_path": db_path_payload, "groups_data": final_groups if self.config.save_visuals else None}
+
+        self.scanner_core._finalize_scan(scan_payload, num_found, "duplicates", duration, self.all_skipped_files)
 
 
 class SearchStrategy(ScanStrategy):
@@ -369,7 +367,9 @@ class SearchStrategy(ScanStrategy):
 
     def execute(self, stop_event: threading.Event, start_time: float):
         all_files = self._find_files_as_list(stop_event)
-        if self.scanner_core._check_stop_or_empty(stop_event, all_files, self.config.scan_mode, [], start_time):
+        if self.scanner_core._check_stop_or_empty(
+            stop_event, all_files, self.config.scan_mode, {"db_path": None, "groups_data": None}, start_time
+        ):
             return
 
         success, _ = self._generate_fingerprints(all_files, stop_event, 2, 2, 0.8)
@@ -398,9 +398,10 @@ class SearchStrategy(ScanStrategy):
             (ImageFingerprint.from_db_row(row.to_dict()), row["_distance"]) for _, row in hits_df.iterrows()
         ]
         num_found = len(search_results)
-        payload = []
+
+        db_path_payload = None
         if num_found > 0:
-            payload = RESULTS_DB_FILE
+            db_path_payload = RESULTS_DB_FILE
             dups_list = [(fp, sim_engine._score_to_percentage(score), "AI") for fp, score in search_results]
             if self.config.scan_mode == "sample_search" and self.config.sample_path:
                 best_fp = self._create_dummy_fp(self.config.sample_path.resolve())
@@ -425,7 +426,11 @@ class SearchStrategy(ScanStrategy):
 
         self.signals.log.emit(f"Found {num_found} results.", "info")
         duration = time.time() - start_time
-        self.scanner_core._finalize_scan(payload, num_found, self.config.scan_mode, duration, self.all_skipped_files)
+
+        scan_payload = {"db_path": db_path_payload, "groups_data": None}
+        self.scanner_core._finalize_scan(
+            scan_payload, num_found, self.config.scan_mode, duration, self.all_skipped_files
+        )
 
     def _get_query_vector(self) -> np.ndarray | None:
         worker_config = {"model_name": self.config.model_name, "device": self.config.device}
