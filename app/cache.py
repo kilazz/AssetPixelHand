@@ -1,19 +1,25 @@
 # app/cache.py
-"""
-Manages file and fingerprint caching to avoid reprocessing unchanged files.
+"""Manages file and fingerprint caching to avoid reprocessing unchanged files.
 Also manages the optional, persistent thumbnail cache.
 """
 
 import abc
 import hashlib
 import logging
+import os
 import pickle
 import threading
 from pathlib import Path
 
 import numpy as np
 
-from app.constants import CACHE_DIR, CACHE_VERSION, DUCKDB_AVAILABLE, THUMBNAIL_CACHE_DB, ZSTD_AVAILABLE
+from app.constants import (
+    CACHE_DIR,
+    CACHE_VERSION,
+    DUCKDB_AVAILABLE,
+    THUMBNAIL_CACHE_DB,
+    ZSTD_AVAILABLE,
+)
 from app.data_models import ImageFingerprint
 
 if DUCKDB_AVAILABLE:
@@ -24,6 +30,17 @@ if ZSTD_AVAILABLE:
 app_logger = logging.getLogger("AssetPixelHand.cache")
 
 
+def _configure_db_connection(conn):
+    """Applies performance-tuning PRAGMAs to a DuckDB connection."""
+    try:
+        cpu_cores = os.cpu_count() or 2
+        conn.execute(f"PRAGMA threads={max(1, cpu_cores // 2)}")
+        conn.execute("PRAGMA wal_autocheckpoint='128MB'")
+        app_logger.debug("DuckDB performance PRAGMAs applied.")
+    except duckdb.Error as e:
+        app_logger.warning(f"Could not apply DuckDB performance PRAGMAs: {e}")
+
+
 class CacheManager:
     """Manages a DuckDB cache for file fingerprints."""
 
@@ -32,7 +49,7 @@ class CacheManager:
         if ZSTD_AVAILABLE:
             self.compressor = zstandard.ZstdCompressor(level=3, threads=-1)
             self.decompressor = zstandard.ZstdDecompressor()
-            app_logger.info("Zstandard compression is enabled for caching.")
+            app_logger.debug("Zstandard compression is enabled for caching.")
         else:
             self.compressor, self.decompressor = None, None
             app_logger.warning("Zstandard library not found. Caching will proceed without compression.")
@@ -41,14 +58,17 @@ class CacheManager:
             return
         try:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            folder_hash = hashlib.md5(str(scanned_folder_path.resolve()).encode()).hexdigest()[:8]
+            folder_hash = hashlib.md5(str(scanned_folder_path).encode()).hexdigest()[:8]
             model_hash = hashlib.md5(model_name.encode()).hexdigest()[:8]
             db_name = f"file_cache_{CACHE_VERSION}_{folder_hash}_{model_hash}.duckdb"
             db_path = CACHE_DIR / db_name
             self.conn = duckdb.connect(database=str(db_path), read_only=False)
+
+            _configure_db_connection(self.conn)
+
             temp_dir = CACHE_DIR / "duckdb_temp"
             temp_dir.mkdir(parents=True, exist_ok=True)
-            self.conn.execute(f"SET temp_directory='{str(temp_dir.resolve())}'")
+            self.conn.execute(f"SET temp_directory='{temp_dir.resolve()!s}'")
             self._create_table()
         except duckdb.Error as e:
             app_logger.error(f"Failed to connect to file cache database (DuckDB): {e}")
@@ -132,6 +152,7 @@ class CacheManager:
     def close(self):
         if self.conn:
             try:
+                self.conn.execute("CHECKPOINT;")
                 self.conn.close()
             except duckdb.Error as e:
                 app_logger.warning(f"Error closing file cache DB: {e}")
@@ -140,8 +161,6 @@ class CacheManager:
 
 
 class AbstractThumbnailCache(abc.ABC):
-    """Defines the interface for a thumbnail cache."""
-
     @abc.abstractmethod
     def get(self, key: str) -> bytes | None:
         pass
@@ -162,13 +181,15 @@ class DiskThumbnailCache(AbstractThumbnailCache):
         self.db_path = THUMBNAIL_CACHE_DB
         self._buffer = {}
         self._lock = threading.Lock()
-        self.BUFFER_SIZE = 64
+
+        self.BUFFER_SIZE = 1024
 
         if not DUCKDB_AVAILABLE:
             app_logger.error("DuckDB not found, persistent thumbnail cache is disabled.")
             return
         try:
             with duckdb.connect(database=str(self.db_path), read_only=False) as conn:
+                _configure_db_connection(conn)
                 conn.execute("CREATE TABLE IF NOT EXISTS thumbnails (key VARCHAR PRIMARY KEY, data BLOB)")
         except duckdb.Error as e:
             app_logger.error(f"Failed to initialize thumbnail cache table: {e}")
@@ -177,7 +198,6 @@ class DiskThumbnailCache(AbstractThumbnailCache):
         with self._lock:
             if key in self._buffer:
                 return self._buffer[key]
-
         try:
             with duckdb.connect(database=str(self.db_path), read_only=True) as conn:
                 result = conn.execute("SELECT data FROM thumbnails WHERE key = ?", [key]).fetchone()
@@ -195,18 +215,17 @@ class DiskThumbnailCache(AbstractThumbnailCache):
     def flush(self, internal_call: bool = False):
         items_to_insert = {}
         with self._lock:
-            if not self._buffer:
+            if not self._buffer or (not internal_call and len(self._buffer) == 0):
                 return
-            # If called from a batch-filling put(), flush. If from close(), flush everything.
-            if internal_call or len(self._buffer) > 0:
-                items_to_insert = self._buffer.copy()
-                self._buffer.clear()
+            items_to_insert = self._buffer.copy()
+            self._buffer.clear()
 
         if not items_to_insert:
             return
 
         try:
             with duckdb.connect(database=str(self.db_path), read_only=False) as conn:
+                _configure_db_connection(conn)
                 conn.executemany("INSERT OR REPLACE INTO thumbnails VALUES (?, ?)", list(items_to_insert.items()))
         except duckdb.Error as e:
             app_logger.error(f"Failed to write thumbnail cache batch: {e}")
@@ -215,11 +234,15 @@ class DiskThumbnailCache(AbstractThumbnailCache):
 
     def close(self):
         self.flush()
+        if DUCKDB_AVAILABLE and self.db_path.exists():
+            try:
+                with duckdb.connect(database=str(self.db_path), read_only=False) as conn:
+                    conn.execute("CHECKPOINT;")
+            except duckdb.Error as e:
+                app_logger.warning(f"Final checkpoint on thumbnail cache failed: {e}")
 
 
 class DummyThumbnailCache(AbstractThumbnailCache):
-    """A dummy cache that does nothing. Used when disk caching is disabled."""
-
     def get(self, key: str) -> bytes | None:
         return None
 
@@ -233,21 +256,25 @@ class DummyThumbnailCache(AbstractThumbnailCache):
 thumbnail_cache: AbstractThumbnailCache = DummyThumbnailCache()
 
 
+def get_thumbnail_cache_key(path_str: str, mtime: float, target_size: int, tonemap_mode: str) -> str:
+    key_str = f"{path_str}|{mtime}|{target_size}|{tonemap_mode}"
+    return hashlib.sha1(key_str.encode()).hexdigest()
+
+
 def setup_thumbnail_cache(settings):
     """Initializes the appropriate thumbnail cache based on user settings."""
     global thumbnail_cache
-
     thumbnail_cache.close()
 
     if settings.disk_thumbnail_cache_enabled:
-        app_logger.info("Persistent thumbnail cache is ENABLED.")
+        app_logger.debug("Persistent thumbnail cache is ENABLED.")
         thumbnail_cache = DiskThumbnailCache()
     else:
-        app_logger.info("Persistent thumbnail cache is DISABLED.")
+        app_logger.debug("Persistent thumbnail cache is DISABLED.")
         thumbnail_cache = DummyThumbnailCache()
         if THUMBNAIL_CACHE_DB.exists():
             try:
                 THUMBNAIL_CACHE_DB.unlink()
-                app_logger.info("Removed old thumbnail cache file.")
+                app_logger.debug("Removed old thumbnail cache file.")
             except OSError as e:
                 app_logger.warning(f"Could not remove old thumbnail cache file: {e}")

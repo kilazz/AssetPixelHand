@@ -1,12 +1,12 @@
-# app/gui_widgets.py
-"""
-Contains small, reusable custom QWidget subclasses used throughout the GUI.
+# app/gui/widgets.py
+"""Contains small, reusable custom QWidget subclasses used throughout the GUI.
 These widgets encapsulate specific functionalities like displaying images with
 transparency, comparing images, or emitting signals on resize.
 """
 
 import math
 from collections import OrderedDict
+from typing import ClassVar
 
 from PySide6.QtCore import QPoint, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
@@ -18,7 +18,7 @@ from app.constants import CompareMode, UIConfig
 class AlphaBackgroundWidget(QWidget):
     """A widget that displays a pixmap on a checkered background to show transparency."""
 
-    _checkered_cache = OrderedDict()
+    _checkered_cache: ClassVar[OrderedDict] = OrderedDict()
     _CACHE_MAX = 64
 
     def __init__(self, parent=None):
@@ -56,7 +56,9 @@ class AlphaBackgroundWidget(QWidget):
                 painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.error_message)
             elif not self.pixmap.isNull():
                 scaled = self.pixmap.scaled(
-                    self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+                    self.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
                 )
                 centered_rect = QRect(
                     (self.width() - scaled.width()) // 2,
@@ -81,7 +83,11 @@ class AlphaBackgroundWidget(QWidget):
             for y in range(math.ceil(size.height() / tile_size)):
                 for x in range(math.ceil(size.width() / tile_size)):
                     painter.fillRect(
-                        x * tile_size, y * tile_size, tile_size, tile_size, light if (x + y) % 2 == 0 else dark
+                        x * tile_size,
+                        y * tile_size,
+                        tile_size,
+                        tile_size,
+                        light if (x + y) % 2 == 0 else dark,
                     )
 
         cls._checkered_cache[key] = pixmap
@@ -130,7 +136,10 @@ class ImageCompareWidget(QWidget):
         super().paintEvent(event)
         with QPainter(self) as painter:
             if self.is_transparency_enabled:
-                painter.drawPixmap(self.rect(), AlphaBackgroundWidget._get_checkered_pixmap(self.size(), self.bg_alpha))
+                painter.drawPixmap(
+                    self.rect(),
+                    AlphaBackgroundWidget._get_checkered_pixmap(self.size(), self.bg_alpha),
+                )
             else:
                 painter.fillRect(self.rect(), self.palette().base())
             if self.pixmap1.isNull() or self.pixmap2.isNull():
@@ -160,7 +169,9 @@ class ImageCompareWidget(QWidget):
 
     def _calculate_scaled_rect(self, pixmap: QPixmap) -> QRect:
         scaled = pixmap.scaled(
-            self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
         )
         return QRect(
             (self.width() - scaled.width()) // 2,

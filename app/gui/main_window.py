@@ -1,7 +1,8 @@
-# app/gui_main_window.py
-"""
-This module contains the main application window class, App(QMainWindow), which
+# app/gui/main_window.py
+"""This module contains the main application window class, App(QMainWindow), which
 assembles all UI components and manages the overall application state and logic.
+It acts as the central coordinator, delegating business logic to specialized
+controllers and managers.
 """
 
 import logging
@@ -28,12 +29,23 @@ from app.constants import (
     SCRIPT_DIR,
     VISUALS_DIR,
     WIN32_AVAILABLE,
-    QuantizationMode,
 )
-from app.data_models import AppSettings, PerformanceConfig, ScanConfig
-from app.gui_dialogs import ModelConversionDialog, ScanStatisticsDialog, SkippedFilesDialog
-from app.gui_panels import (
-    FileOperation,
+from app.core.scanner import ScannerController
+from app.data_models import AppSettings, ScanConfig
+from app.logging_config import setup_logging
+from app.services.config_builder import ScanConfigBuilder
+from app.services.file_operation_manager import FileOperationManager
+from app.utils import (
+    check_link_support,
+    clear_all_app_data,
+    clear_models_cache,
+    clear_scan_cache,
+    is_onnx_model_cached,
+)
+
+# --- REFACTOR: Updated relative import paths for GUI components ---
+from .dialogs import ModelConversionDialog, ScanStatisticsDialog, SkippedFilesDialog
+from .panels import (
     ImageViewerPanel,
     LogPanel,
     OptionsPanel,
@@ -41,16 +53,6 @@ from app.gui_panels import (
     ResultsPanel,
     ScanOptionsPanel,
     SystemStatusPanel,
-)
-from app.gui_tasks import FileOperationTask
-from app.logging_config import setup_logging
-from app.scanner import ScannerController
-from app.utils import (
-    check_link_support,
-    clear_all_app_data,
-    clear_models_cache,
-    clear_scan_cache,
-    is_onnx_model_cached,
 )
 
 app_logger = logging.getLogger("AssetPixelHand.gui.main")
@@ -63,7 +65,6 @@ class App(QMainWindow):
         super().__init__()
         self.setWindowTitle("AssetPixelHand")
         self.setGeometry(100, 100, 1600, 900)
-        self.controller = ScannerController()
 
         self.settings = AppSettings.load()
         setup_thumbnail_cache(self.settings)
@@ -71,6 +72,8 @@ class App(QMainWindow):
         self.log_emitter = log_emitter
         self.stats_dialog: ScanStatisticsDialog | None = None
 
+        # --- Core Controllers and Managers ---
+        self.controller = ScannerController()
         self.shared_thread_pool = QThreadPool()
         self.shared_thread_pool.setMaxThreadCount(max(4, os.cpu_count() or 4))
 
@@ -79,14 +82,20 @@ class App(QMainWindow):
         self.settings_save_timer.setInterval(1000)
 
         self._setup_ui()
+
+        # Instantiate the manager for handling file operations
+        self.file_op_manager = FileOperationManager(self.shared_thread_pool, self.results_panel, self)
+
         self._create_menu_bar()
         self._create_context_menu()
         self._connect_signals()
+
         self.options_panel._update_scan_context()
         self._log_system_status()
         self._apply_initial_theme()
 
     def _setup_ui(self):
+        # UI setup remains largely the same as it's about layout, not logic.
         SPACING = 6
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -211,6 +220,7 @@ class App(QMainWindow):
         self.viewer_panel.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
     def _connect_signals(self):
+        # --- UI Panel Signals ---
         self.options_panel.scan_requested.connect(self._start_scan)
         self.options_panel.clear_scan_cache_requested.connect(self._clear_scan_cache)
         self.options_panel.clear_models_cache_requested.connect(self._clear_models_cache)
@@ -220,30 +230,39 @@ class App(QMainWindow):
         self.performance_panel.log_message.connect(self.log_panel.log_message)
         self.performance_panel.device_changed.connect(self._update_low_priority_option)
 
+        # --- Results and Viewer Panel Signals ---
         self.results_panel.selection_in_group_changed.connect(self.viewer_panel.show_image_group)
         self.results_panel.visible_results_changed.connect(self.viewer_panel.display_results)
-
-        self.results_panel.deletion_requested.connect(self._handle_deletion_request)
-        self.results_panel.hardlink_requested.connect(self._handle_hardlink_request)
-        self.results_panel.reflink_requested.connect(self._handle_reflink_request)
         self.results_panel.results_view.customContextMenuRequested.connect(self._show_results_context_menu)
         self.viewer_panel.list_view.customContextMenuRequested.connect(self._show_viewer_context_menu)
         self.viewer_panel.log_message.connect(self.log_panel.log_message)
 
+        # --- File Operation Signals (Delegated to FileOperationManager) ---
+        self.results_panel.deletion_requested.connect(self.file_op_manager.request_deletion)
+        self.results_panel.hardlink_requested.connect(self._handle_hardlink_request)
+        self.results_panel.reflink_requested.connect(self._handle_reflink_request)
+        self.file_op_manager.operation_finished.connect(self._on_file_op_finished)
+        self.file_op_manager.log_message.connect(self.log_panel.log_message)
+
+        # --- Scanner Controller Signals ---
         conn = Qt.ConnectionType.QueuedConnection
         self.controller.signals.finished.connect(self.on_scan_complete, conn)
         self.controller.signals.error.connect(self.on_scan_error, conn)
         self.controller.signals.log.connect(self.log_panel.log_message, conn)
         self.controller.signals.save_visuals_finished.connect(self._on_save_visuals_finished, conn)
 
+        # --- Context Menu Signals ---
         self.open_action.triggered.connect(self._context_open_file)
         self.show_action.triggered.connect(self._context_show_in_explorer)
         self.delete_action.triggered.connect(self._context_delete_file)
 
+        # --- Settings Save Timer ---
         self.settings_save_timer.timeout.connect(self._save_settings)
         self._connect_settings_signals()
 
     def _connect_settings_signals(self):
+        # This method connects various UI element changes to request a settings save.
+        # Its implementation remains the same.
         opts = self.options_panel
         opts.folder_path_entry.textChanged.connect(self._request_settings_save)
         opts.threshold_spinbox.valueChanged.connect(self._request_settings_save)
@@ -291,14 +310,18 @@ class App(QMainWindow):
     def _start_scan(self):
         if self.controller.is_running():
             return
+
+        # Delegate config creation to the builder
         if not (config := self._get_config()):
             return
+
         if (
             DEEP_LEARNING_AVAILABLE
             and not is_onnx_model_cached(config.model_name)
             and not self._run_model_conversion(config)
         ):
             return
+
         self.results_panel.clear_results()
         self.viewer_panel.clear_viewer()
         self.log_panel.clear()
@@ -309,45 +332,13 @@ class App(QMainWindow):
         self.stats_dialog.show()
 
     def _get_config(self) -> ScanConfig | None:
+        """Builds the scan configuration using the dedicated ScanConfigBuilder.
+        This keeps the main window clean from UI implementation details.
+        """
         try:
-            folder_path = Path(self.options_panel.folder_path_entry.text())
-            if not folder_path.is_dir():
-                raise ValueError("Please select a valid folder.")
-            opts, perf, scan_opts = self.options_panel, self.performance_panel, self.scan_options_panel
-            model_info = opts.get_selected_model_info()
-            quant_mode = perf.get_selected_quantization()
-            onnx_name = model_info["onnx_name"] + ("_fp16" if quant_mode == QuantizationMode.FP16 else "")
-            if opts.current_scan_mode == "text_search" and not opts.search_entry.text():
-                raise ValueError("Please enter a text search query.")
-            if opts.current_scan_mode == "sample_search" and not (opts._sample_path and opts._sample_path.is_file()):
-                raise ValueError("Please select a valid sample image.")
-            return ScanConfig(
-                folder_path=folder_path,
-                similarity_threshold=opts.threshold_spinbox.value(),
-                excluded_folders=[p.strip() for p in opts.exclude_entry.text().split(",")],
-                model_name=onnx_name,
-                model_dim=model_info["dim"],
-                model_info=model_info,
-                selected_extensions=opts.selected_extensions,
-                scan_mode=opts.current_scan_mode,
-                device=perf.device_combo.currentData(),
-                find_exact_duplicates=scan_opts.exact_duplicates_check.isChecked(),
-                find_perceptual_duplicates=scan_opts.perceptual_duplicates_check.isChecked(),
-                lancedb_in_memory=scan_opts.lancedb_in_memory_check.isChecked(),
-                save_visuals=scan_opts.save_visuals_check.isChecked(),
-                max_visuals=int(scan_opts.max_visuals_entry.text()),
-                visuals_columns=scan_opts.visuals_columns_spinbox.value(),
-                search_precision=perf.search_precision_combo.currentText(),
-                search_query=opts.search_entry.text() if opts.current_scan_mode == "text_search" else None,
-                sample_path=opts._sample_path,
-                perf=PerformanceConfig(
-                    model_workers=perf.cpu_workers_spin.value(),
-                    gpu_preproc_workers=perf.gpu_preproc_workers_spin.value(),
-                    run_at_low_priority=scan_opts.low_priority_check.isChecked(),
-                    batch_size=perf.batch_size_spin.value(),
-                ),
-            )
-        except (ValueError, OSError, TypeError) as e:
+            builder = ScanConfigBuilder(self.options_panel, self.performance_panel, self.scan_options_panel)
+            return builder.build()
+        except ValueError as e:
             self.log_panel.log_message(f"Configuration Error: {e}", "error")
             return None
 
@@ -371,29 +362,39 @@ class App(QMainWindow):
         self.options_panel.set_scan_button_state(is_scanning)
         QApplication.processEvents()
 
+    # --- Scan Completion Handlers ---
+
     @Slot(object, int, str, float, list)
     def on_scan_complete(self, results, num_found, mode, duration, skipped):
         if not mode:
             app_logger.warning("Scan was cancelled by the user.")
             self.on_scan_end()
             return
+
         time_str = f"{int(duration // 60)}m {int(duration % 60)}s" if duration > 0 else "less than a second"
         log_msg = f"Finished! Found {num_found} {'similar items' if mode == 'duplicates' else 'results'} in {time_str}."
         app_logger.info(log_msg)
         self.log_panel.log_message(log_msg, "success")
+
         self.results_panel.display_results(results, num_found, mode)
         if num_found > 0 and mode == "duplicates":
             link_support = check_link_support(self.controller.config.folder_path)
             self.results_panel.hardlink_available = link_support.get("hardlink", False)
             self.results_panel.reflink_available = link_support.get("reflink", False)
-            if link_support.get("reflink"):
-                self.log_panel.log_message("Filesystem supports Reflinks (CoW).", "success")
-            else:
-                self.log_panel.log_message("Filesystem does not support Reflinks (CoW). Option disabled.", "warning")
+            log_level = "success" if link_support.get("reflink") else "warning"
+            log_msg = (
+                "Filesystem supports Reflinks (CoW)."
+                if link_support.get("reflink")
+                else "Filesystem does not support Reflinks (CoW). Option disabled."
+            )
+            self.log_panel.log_message(log_msg, log_level)
+
         self.results_panel.set_enabled_state(num_found > 0)
+
         if skipped:
             self.log_panel.log_message(f"{len(skipped)} files were skipped due to errors.", "warning")
             SkippedFilesDialog(skipped, self).exec()
+
         self.on_scan_end()
 
     @Slot(str)
@@ -410,6 +411,42 @@ class App(QMainWindow):
         self.set_ui_scan_state(is_scanning=False)
         self.results_panel.set_enabled_state(self.results_panel.results_model.rowCount() > 0)
 
+    # --- File Operation Handlers (Now delegated) ---
+
+    @Slot(list)
+    def _handle_hardlink_request(self, paths: list[Path]):
+        """Creates the link map and delegates the hardlink request to the manager."""
+        if not paths:
+            self.log_panel.log_message("No valid duplicates selected for linking.", "warning")
+            return
+        link_map = self.results_panel.results_model.get_link_map_for_paths(paths)
+        if not link_map:
+            self.log_panel.log_message("No valid link pairs found from the model's data.", "warning")
+            return
+        self.set_ui_scan_state(is_scanning=True)
+        self.file_op_manager.request_hardlink(link_map)
+
+    @Slot(list)
+    def _handle_reflink_request(self, paths: list[Path]):
+        """Creates the link map and delegates the reflink request to the manager."""
+        if not paths:
+            self.log_panel.log_message("No valid duplicates selected for linking.", "warning")
+            return
+        link_map = self.results_panel.results_model.get_link_map_for_paths(paths)
+        if not link_map:
+            self.log_panel.log_message("No valid link pairs found from the model's data.", "warning")
+            return
+        self.set_ui_scan_state(is_scanning=True)
+        self.file_op_manager.request_reflink(link_map)
+
+    @Slot()
+    def _on_file_op_finished(self):
+        """Called when the FileOperationManager signals completion."""
+        self.set_ui_scan_state(is_scanning=False)
+        self.viewer_panel.clear_viewer()
+
+    # --- Cache Clearing ---
+
     def _confirm_action(self, title: str, text: str) -> bool:
         if self.controller.is_running():
             self.log_panel.log_message("Action disabled during scan.", "warning")
@@ -421,7 +458,6 @@ class App(QMainWindow):
             thumbnail_cache.close()
             success = clear_scan_cache()
             setup_thumbnail_cache(self.settings)
-
             msg, level = ("Scan cache cleared.", "success") if success else ("Failed to clear scan cache.", "error")
             self.log_panel.log_message(msg, level)
             if success:
@@ -444,13 +480,11 @@ class App(QMainWindow):
         ):
             thumbnail_cache.close()
             logging.shutdown()
-
             try:
                 success = clear_all_app_data()
             finally:
                 setup_logging(self.log_emitter)
                 setup_thumbnail_cache(self.settings)
-
             if success:
                 self.results_panel.clear_results()
                 self.viewer_panel.clear_viewer()
@@ -458,56 +492,8 @@ class App(QMainWindow):
             else:
                 QMessageBox.critical(self, "Error", "Failed to clear all app data.")
 
-    def _execute_file_operation(self, task: FileOperationTask):
-        """Helper to run a file operation task on the shared thread pool."""
-        if self.shared_thread_pool.activeThreadCount() > 0:
-            self.log_panel.log_message("Another file operation is in progress.", "warning")
-            return
-        self.set_ui_scan_state(is_scanning=True)
-        task.signals.finished.connect(self._on_file_op_complete)
-        task.signals.log.connect(self.log_panel.log_message)
-        self.shared_thread_pool.start(task)
-
-    def _handle_deletion_request(self, paths_to_delete: list[Path]):
-        self.log_panel.log_message(f"Moving {len(paths_to_delete)} files to trash...", "info")
-        task = FileOperationTask(mode="delete", paths=paths_to_delete)
-        self._execute_file_operation(task)
-
-    @Slot(list, int, int)
-    def _on_file_op_complete(self, affected_paths, count, failed):
-        """Handles completion of any file operation (delete, link, etc.)."""
-        current_op = self.results_panel.current_operation
-        op_name = "Moved"
-        if current_op in [FileOperation.HARDLINKING, FileOperation.REFLINKING]:
-            op_name = "Replaced"
-
-        level = "success" if failed == 0 else "warning" if count > 0 else "error"
-        self.log_panel.log_message(f"{op_name} {count} files. Failed: {failed}.", level)
-
-        self.results_panel.update_after_deletion(affected_paths)
-        self.viewer_panel.clear_viewer()
-        self.set_ui_scan_state(is_scanning=False)
-        self.results_panel.clear_operation_in_progress()
-
-    def _handle_hardlink_request(self, paths: list[Path]):
-        self._handle_link_request(paths, "hardlink")
-
-    def _handle_reflink_request(self, paths: list[Path]):
-        self._handle_link_request(paths, "reflink")
-
-    def _handle_link_request(self, paths: list[Path], method: str):
-        if not paths:
-            self.log_panel.log_message("No valid duplicates selected for linking.", "warning")
-            return
-
-        link_map = self.results_panel.results_model.get_link_map_for_paths(paths)
-        if not link_map:
-            self.log_panel.log_message("No valid link pairs found from the model's data.", "warning")
-            return
-
-        self.log_panel.log_message(f"Replacing {len(paths)} files with {method}s...", "info")
-        task = FileOperationTask(mode=method, link_map=link_map)
-        self._execute_file_operation(task)
+    # --- Context Menu and System Interaction ---
+    # These methods remain simple and are fine to keep in the main window class.
 
     @Slot()
     def _on_save_visuals_finished(self):
@@ -538,7 +524,8 @@ class App(QMainWindow):
             QMessageBox.question(self, "Confirm Move", f"Move '{self.context_menu_path.name}' to the system trash?")
             == QMessageBox.StandardButton.Yes
         ):
-            self._handle_deletion_request([self.context_menu_path])
+            self.set_ui_scan_state(is_scanning=True)
+            self.file_op_manager.request_deletion([self.context_menu_path])
 
     def _open_path(self, path: Path | None):
         if path and path.exists():
@@ -548,37 +535,14 @@ class App(QMainWindow):
                 app_logger.error(f"Could not open path '{path}': {e}")
 
     def _save_settings(self):
-        """Gathers settings from UI panels and saves them."""
-        opts, perf = self.options_panel, self.performance_panel
-        scan_opts, viewer = self.scan_options_panel, self.viewer_panel
-
-        settings_dict = {
-            "folder_path": opts.folder_path_entry.text(),
-            "threshold": str(opts.threshold_spinbox.value()),
-            "exclude": opts.exclude_entry.text(),
-            "model_key": opts.model_combo.currentText(),
-            "preview_size": viewer.preview_size_slider.value(),
-            "show_transparency": viewer.bg_alpha_check.isChecked(),
-            "selected_extensions": opts.selected_extensions,
-            "find_exact_duplicates": scan_opts.exact_duplicates_check.isChecked(),
-            "find_perceptual_duplicates": scan_opts.perceptual_duplicates_check.isChecked(),
-            "lancedb_in_memory": scan_opts.lancedb_in_memory_check.isChecked(),
-            "disk_thumbnail_cache_enabled": scan_opts.disk_thumbnail_cache_check.isChecked(),
-            "perf_low_priority": scan_opts.low_priority_check.isChecked(),
-            "save_visuals": scan_opts.save_visuals_check.isChecked(),
-            "max_visuals": scan_opts.max_visuals_entry.text(),
-            "visuals_columns": scan_opts.visuals_columns_spinbox.value(),
-            "perf_model_workers": perf.cpu_workers_spin.text(),
-            "perf_gpu_preproc_workers": perf.gpu_preproc_workers_spin.text(),
-            "perf_batch_size": perf.batch_size_spin.text(),
-            "search_precision": perf.search_precision_combo.currentText(),
-            "device": perf.device_combo.currentText(),
-            "quantization_mode": perf.quant_combo.currentText(),
-            "theme": self.settings.theme,
-            "thumbnail_tonemap_enabled": viewer.thumbnail_tonemap_check.isChecked(),
-            "compare_tonemap_enabled": viewer.compare_tonemap_check.isChecked(),
-        }
-        self.settings.save(settings_dict)
+        """Gathers settings from UI panels and saves them via the AppSettings class."""
+        # This will be updated in the next step to call a cleaner AppSettings.save method
+        self.settings.save(
+            options_panel=self.options_panel,
+            performance_panel=self.performance_panel,
+            scan_options_panel=self.scan_options_panel,
+            viewer_panel=self.viewer_panel,
+        )
 
     @Slot(bool)
     def _update_low_priority_option(self, is_cpu: bool):
@@ -589,7 +553,9 @@ class App(QMainWindow):
         thumbnail_cache.close()
         if self.shared_thread_pool.activeThreadCount() > 0:
             QMessageBox.warning(
-                self, "Operation in Progress", "Please wait for the current file operation to complete."
+                self,
+                "Operation in Progress",
+                "Please wait for the current file operation to complete.",
             )
             event.ignore()
             return

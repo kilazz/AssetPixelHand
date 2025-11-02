@@ -1,6 +1,5 @@
 # app/data_models.py
-"""
-Contains all primary data structures (dataclasses) and Qt signal containers used
+"""Contains all primary data structures (dataclasses) and Qt signal containers used
 throughout the application. Centralizing these helps to ensure type
 consistency and avoids circular import dependencies.
 """
@@ -23,8 +22,9 @@ from app.constants import (
     QuantizationMode,
 )
 
+# --- REFACTOR: Use TYPE_CHECKING with new paths to avoid circular imports at runtime ---
 if TYPE_CHECKING:
-    pass
+    from app.gui.panels import ImageViewerPanel, OptionsPanel, PerformancePanel, ScanOptionsPanel
 
 
 @dataclass
@@ -32,16 +32,16 @@ class ImageFingerprint:
     """A container for all metadata and the AI-generated hash of an image."""
 
     __slots__ = [
-        "path",
-        "hashes",
-        "resolution",
-        "file_size",
-        "mtime",
-        "capture_date",
-        "format_str",
-        "format_details",
-        "has_alpha",
         "bit_depth",
+        "capture_date",
+        "file_size",
+        "format_details",
+        "format_str",
+        "has_alpha",
+        "hashes",
+        "mtime",
+        "path",
+        "resolution",
     ]
     path: Path
     hashes: np.ndarray
@@ -175,11 +175,51 @@ class AppSettings:
             print(f"Warning: Could not load settings file, using defaults. Error: {e}")
             return cls(selected_extensions=list(ALL_SUPPORTED_EXTENSIONS), folder_path=str(SCRIPT_DIR))
 
-    def save(self, settings_dict: dict[str, Any]):
-        """Updates settings from a dictionary and serializes them to JSON."""
-        for key, value in settings_dict.items():
-            if hasattr(self, key):
-                setattr(self, key, value)
+    def save(
+        self,
+        options_panel: "OptionsPanel",
+        performance_panel: "PerformancePanel",
+        scan_options_panel: "ScanOptionsPanel",
+        viewer_panel: "ImageViewerPanel",
+    ):
+        """Updates settings directly from the UI panels and serializes them to JSON.
+        This approach is more robust than passing a dictionary as it avoids key errors
+        and centralizes the knowledge of where settings come from.
+        """
+        # --- REFACTOR: Pull settings directly from UI panels ---
+        # Main Options
+        self.folder_path = options_panel.folder_path_entry.text()
+        self.threshold = str(options_panel.threshold_spinbox.value())
+        self.exclude = options_panel.exclude_entry.text()
+        self.model_key = options_panel.model_combo.currentText()
+        self.selected_extensions = options_panel.selected_extensions
+
+        # Scan & Output Options
+        self.find_exact_duplicates = scan_options_panel.exact_duplicates_check.isChecked()
+        self.find_perceptual_duplicates = scan_options_panel.perceptual_duplicates_check.isChecked()
+        self.lancedb_in_memory = scan_options_panel.lancedb_in_memory_check.isChecked()
+        self.disk_thumbnail_cache_enabled = scan_options_panel.disk_thumbnail_cache_check.isChecked()
+        self.perf_low_priority = scan_options_panel.low_priority_check.isChecked()
+        self.save_visuals = scan_options_panel.save_visuals_check.isChecked()
+        self.max_visuals = scan_options_panel.max_visuals_entry.text()
+        self.visuals_columns = scan_options_panel.visuals_columns_spinbox.value()
+
+        # Performance & AI Model
+        self.perf_model_workers = performance_panel.cpu_workers_spin.text()
+        self.perf_gpu_preproc_workers = performance_panel.gpu_preproc_workers_spin.text()
+        self.perf_batch_size = performance_panel.batch_size_spin.text()
+        self.search_precision = performance_panel.search_precision_combo.currentText()
+        self.device = performance_panel.device_combo.currentText()
+        self.quantization_mode = performance_panel.quant_combo.currentText()
+
+        # Viewer Panel
+        self.preview_size = viewer_panel.preview_size_slider.value()
+        self.show_transparency = viewer_panel.bg_alpha_check.isChecked()
+        self.thumbnail_tonemap_enabled = viewer_panel.thumbnail_tonemap_check.isChecked()
+        self.compare_tonemap_enabled = viewer_panel.compare_tonemap_check.isChecked()
+
+        # The theme is set separately in the main window
+        # self.theme is already up-to-date.
 
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:

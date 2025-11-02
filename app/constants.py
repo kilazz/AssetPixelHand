@@ -28,6 +28,11 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 # --- File Paths ---
 CONFIG_FILE = APP_DATA_DIR / "app_settings.json"
 CACHE_DIR = APP_DATA_DIR / ".cache"
+
+# --- Ensure the cache directory is created on startup ---
+# This guarantees the folder exists before any part of the app tries to write to it.
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 RESULTS_DB_FILE = CACHE_DIR / "results.duckdb"
 THUMBNAIL_CACHE_DB = CACHE_DIR / "thumbnail_cache.duckdb"
 CRASH_LOG_DIR = APP_DATA_DIR / "crash_logs"
@@ -52,13 +57,11 @@ if DEEP_LEARNING_AVAILABLE:
     transformers_logging.set_verbosity_error()
 
 # --- Application-wide Constants ---
-DB_WRITE_BATCH_SIZE = 8192
+DB_WRITE_BATCH_SIZE = 2048
 CACHE_VERSION = "v4"
 
 # --- Supported File Formats ---
-# This list is based on the libraries confirmed to be bundled with core dependencies.
 _main_supported_ext = [
-    # Standard Web & Raster Formats
     ".avif",
     ".bmp",
     ".cur",
@@ -68,7 +71,6 @@ _main_supported_ext = [
     ".jpg",
     ".png",
     ".webp",
-    # Professional & High Bit Depth Formats
     ".cin",
     ".dpx",
     ".exr",
@@ -77,7 +79,6 @@ _main_supported_ext = [
     ".tga",
     ".tif",
     ".tiff",
-    # Modern & Niche Formats
     ".heic",
     ".heif",
     ".j2k",
@@ -86,13 +87,6 @@ _main_supported_ext = [
     ".xbm",
     ".xpm",
 ]
-
-# Note: The following formats require system-level libraries NOT bundled with dependencies
-# and are therefore EXCLUDED by default to ensure stability.
-# To enable them, the user must manually install the required libraries.
-# ".svg"     # Requires 'librsvg'
-# ".cr2", ".nef", ".arw", ".dng" # Requires 'libraw'
-# ".mov", ".mp4" # Requires 'ffmpeg'
 
 _all_ext = list(_main_supported_ext)
 
@@ -106,7 +100,7 @@ ALL_SUPPORTED_EXTENSIONS = sorted(set(_all_ext))
 
 
 def _get_default_models() -> dict:
-    """Returns the hardcoded default model configuration to be used as a fallback or for initial creation."""
+    """Returns the hardcoded default model configuration."""
     return {
         "Fastest (OpenAI ViT-B/32)": {
             "hf_name": "openai/clip-vit-base-patch32",
@@ -141,11 +135,7 @@ def _get_default_models() -> dict:
 
 
 def _load_models_config() -> dict:
-    """
-    Loads model configurations from models.json.
-    If the file doesn't exist, it creates it with default values.
-    If the file is corrupted or unreadable, it falls back to the default values for the session.
-    """
+    """Loads model configurations from models.json, with fallbacks."""
     default_models = _get_default_models()
 
     if MODELS_CONFIG_FILE.exists():
@@ -161,7 +151,6 @@ def _load_models_config() -> dict:
                 json.dump(default_models, f, indent=4)
         except OSError as e:
             print(f"Warning: Could not create 'models.json': {e}. Using default models for this session.")
-
         return default_models
 
 

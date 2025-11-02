@@ -1,6 +1,5 @@
-# app/gui_dialogs.py
-"""
-Contains all QDialog-based classes for the application, providing modal windows
+# app/gui/dialogs.py
+"""Contains all QDialog-based classes for the application, providing modal windows
 for user interaction, progress display, and specific settings.
 """
 
@@ -26,7 +25,9 @@ from PySide6.QtWidgets import (
 
 from app.constants import ALL_SUPPORTED_EXTENSIONS, QuantizationMode
 from app.data_models import ScanState
-from app.gui_tasks import ModelConverter
+
+# --- REFACTOR: Updated relative import for a component within the 'gui' package ---
+from .tasks import ModelConverter
 
 app_logger = logging.getLogger("AssetPixelHand.gui.dialogs")
 
@@ -98,7 +99,14 @@ class FileTypesDialog(QDialog):
 class ModelConversionDialog(QDialog):
     """A modal dialog showing the progress of an AI model download and conversion."""
 
-    def __init__(self, model_key: str, hf_name: str, onnx_name: str, quant_mode: QuantizationMode, parent=None):
+    def __init__(
+        self,
+        model_key: str,
+        hf_name: str,
+        onnx_name: str,
+        quant_mode: QuantizationMode,
+        parent=None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Preparing Model")
         self.setModal(True)

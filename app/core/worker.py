@@ -1,6 +1,5 @@
-# app/worker.py
-"""
-Contains code designed to be executed in separate worker processes for parallel computation.
+# app/core/worker.py
+"""Contains code designed to be executed in separate worker processes for parallel computation.
 This includes AI model inference and image preprocessing tasks, ensuring the main GUI
 thread remains responsive.
 """
@@ -13,15 +12,14 @@ import traceback
 from multiprocessing import shared_memory
 from pathlib import Path
 from queue import Empty
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING
 
 import numpy as np
 import onnxruntime as ort
-import xxhash
 
 from app.constants import APP_DATA_DIR, DEEP_LEARNING_AVAILABLE, MODELS_DIR, WIN32_AVAILABLE
 from app.data_models import ImageFingerprint
-from app.utils import _load_image_static_cached, get_image_metadata
+from app.image_io import get_image_metadata, load_image
 
 if WIN32_AVAILABLE:
     import win32api
@@ -29,15 +27,16 @@ if WIN32_AVAILABLE:
     import win32process
 
 if TYPE_CHECKING:
-    import imagehash
+    pass
 
 app_logger = logging.getLogger("AssetPixelHand.worker")
 g_inference_engine = None
-g_preprocessor = None  # Global for the lightweight preprocessor
+g_preprocessor = None
 g_free_buffers_q = None
 
 
 def normalize_vectors_numpy(embeddings: np.ndarray) -> np.ndarray:
+    """Normalizes a batch of numpy vectors to unit length."""
     if embeddings.dtype != np.float32:
         embeddings = embeddings.astype(np.float32)
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
@@ -104,6 +103,7 @@ class InferenceEngine:
 
 
 def _init_worker_process(config: dict):
+    """Lowers the process priority on Windows if requested."""
     if config.get("low_priority") and WIN32_AVAILABLE:
         try:
             pid = win32api.GetCurrentProcessId()
@@ -115,7 +115,7 @@ def _init_worker_process(config: dict):
 
 
 def init_worker(config: dict):
-    """Initializes a full worker (CPU or GPU inference), creating the global inference engine."""
+    """Initializes a full worker, creating the global inference engine."""
     global g_inference_engine
     _init_worker_process(config)
     try:
@@ -125,7 +125,7 @@ def init_worker(config: dict):
 
 
 def init_preprocessor_worker(config: dict, queue: "multiprocessing.Queue"):
-    """Initializes a CPU-only preprocessing worker. Does NOT load ONNX models."""
+    """Initializes a CPU-only preprocessing worker."""
     global g_preprocessor, g_free_buffers_q
     _init_worker_process(config)
     g_free_buffers_q = queue
@@ -142,6 +142,7 @@ def init_preprocessor_worker(config: dict, queue: "multiprocessing.Queue"):
 def _process_batch_from_paths(
     paths: list[Path], input_size
 ) -> tuple[list, list[ImageFingerprint], list[tuple[str, str]]]:
+    """Helper function to load images and extract metadata for a batch of paths."""
     images, fingerprints, skipped_tuples = [], [], []
     for path in paths:
         try:
@@ -149,7 +150,10 @@ def _process_batch_from_paths(
             if not metadata or metadata["resolution"][0] == 0:
                 skipped_tuples.append((str(path), "Metadata extraction failed"))
                 continue
-            img_obj = _load_image_static_cached(path, target_size=input_size, tonemap_mode="none")
+
+            # --- REFACTOR: Use the new centralized `load_image` function ---
+            img_obj = load_image(path, target_size=input_size, tonemap_mode="none")
+
             if img_obj is not None:
                 images.append(img_obj)
                 fingerprints.append(ImageFingerprint(path=path, hashes=np.array([]), **metadata))
@@ -162,20 +166,25 @@ def _process_batch_from_paths(
     return images, fingerprints, skipped_tuples
 
 
-def worker_wrapper_from_paths(paths: list[Path]) -> tuple[list[ImageFingerprint], list[tuple[str, str]]]:
+def worker_wrapper_from_paths(
+    paths: list[Path],
+) -> tuple[list[ImageFingerprint], list[tuple[str, str]]]:
+    """Main function for CPU workers."""
     if g_inference_engine is None:
         return [], [(str(p), "Worker process not initialized") for p in paths]
     try:
         images, fps, skipped_tuples = _process_batch_from_paths(paths, g_inference_engine.input_size)
         if images:
-            image_list_for_processor = [np.array(img.convert("RGB")) for img in images]
-            inputs = g_inference_engine.processor(images=image_list_for_processor, return_tensors="np")
+            image_list = [np.array(img.convert("RGB")) for img in images]
+            inputs = g_inference_engine.processor(images=image_list, return_tensors="np")
             pixel_values = inputs.pixel_values.astype(np.float16 if g_inference_engine.is_fp16 else np.float32)
+
             io_binding = g_inference_engine.visual_session.io_binding()
             io_binding.bind_cpu_input("pixel_values", pixel_values)
             io_binding.bind_output("image_embeds")
             g_inference_engine.visual_session.run_with_iobinding(io_binding)
             embeddings = io_binding.get_outputs()[0].numpy()
+
             if embeddings.size > 0:
                 embeddings = normalize_vectors_numpy(embeddings)
                 for i, fp in enumerate(fps):
@@ -190,21 +199,25 @@ def worker_wrapper_from_paths(paths: list[Path]) -> tuple[list[ImageFingerprint]
 def worker_wrapper_from_paths_cpu_shared_mem(
     paths: list[Path], input_size: tuple[int, int], buffer_shape, dtype
 ) -> tuple:
+    """Main function for GPU pipeline's CPU preprocessor workers."""
     global g_free_buffers_q, g_preprocessor
     if g_free_buffers_q is None or g_preprocessor is None:
         raise RuntimeError("Preprocessor worker not initialized correctly.")
     try:
-        proc = g_preprocessor
         images, fps, skipped_tuples = _process_batch_from_paths(paths, input_size)
         if not images:
             return None, [], skipped_tuples
+
         np_images = [np.array(img.convert("RGB")) for img in images]
-        pixel_values = proc(images=np_images, return_tensors="np").pixel_values
+        pixel_values = g_preprocessor(images=np_images, return_tensors="np").pixel_values
+
         shm_name = g_free_buffers_q.get()
         existing_shm = shared_memory.SharedMemory(name=shm_name)
         shared_array = np.ndarray(buffer_shape, dtype=dtype, buffer=existing_shm.buf)
+
         current_batch_size = pixel_values.shape[0]
         shared_array[:current_batch_size] = pixel_values.astype(dtype)
+
         meta_message = {
             "shm_name": shm_name,
             "shape": (current_batch_size, *buffer_shape[1:]),
@@ -224,10 +237,12 @@ def inference_worker_loop(
     results_q: "multiprocessing.Queue",
     free_buffers_q: "multiprocessing.Queue",
 ):
+    """The main loop for the dedicated GPU inference process."""
     init_worker(config)
     if g_inference_engine is None:
         results_q.put(None)
         return
+
     io_binding = g_inference_engine.visual_session.io_binding()
     try:
         while True:
@@ -235,32 +250,38 @@ def inference_worker_loop(
                 item = tensor_q.get(timeout=1.0)
             except Empty:
                 continue
+
             if item is None:
                 results_q.put(None)
                 break
+
             meta_message, fps, skipped_tuples = item
             pixel_values = None
             if meta_message:
-                shm_name = meta_message["shm_name"]
-                shape = meta_message["shape"]
-                dtype = meta_message["dtype"]
+                shm_name, shape, dtype = (
+                    meta_message["shm_name"],
+                    meta_message["shape"],
+                    meta_message["dtype"],
+                )
                 existing_shm = shared_memory.SharedMemory(name=shm_name)
                 shared_array = np.ndarray(shape, dtype=dtype, buffer=existing_shm.buf)
                 pixel_values = np.copy(shared_array)
                 existing_shm.close()
-                # FIX: Return the buffer to the queue immediately after use to prevent deadlock.
                 free_buffers_q.put(shm_name)
+
             if pixel_values is not None and pixel_values.size > 0:
                 io_binding.bind_cpu_input("pixel_values", pixel_values)
                 io_binding.bind_output("image_embeds")
                 g_inference_engine.visual_session.run_with_iobinding(io_binding)
                 embeddings = io_binding.get_outputs()[0].numpy()
+
                 if embeddings is None or embeddings.size == 0:
-                    app_logger.error("Inference worker: model returned empty output via I/O Binding")
+                    app_logger.error("Inference worker: model returned empty output")
                     for fp in fps:
-                        skipped_tuples.append((str(fp.path), "Inference returned empty output"))
+                        skipped_tuples.append((str(fp.path), "Inference returned empty"))
                     results_q.put(([], skipped_tuples))
                     continue
+
                 embeddings = normalize_vectors_numpy(embeddings)
                 for i, data in enumerate(fps):
                     data.hashes = embeddings[i].flatten()
@@ -273,6 +294,7 @@ def inference_worker_loop(
 
 
 def _log_worker_crash(e: Exception, context: str):
+    """Logs any unhandled exceptions in a worker process to a crash file."""
     pid = os.getpid()
     crash_log_dir = APP_DATA_DIR / "crash_logs"
     crash_log_dir.mkdir(parents=True, exist_ok=True)
@@ -282,19 +304,21 @@ def _log_worker_crash(e: Exception, context: str):
 
 
 def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
+    """Worker function to get a single vector for an image (used for search-by-sample)."""
     if g_inference_engine is None:
         return None
     try:
-        images, _, skipped_tuples = _process_batch_from_paths([image_path], g_inference_engine.input_size)
-        if skipped_tuples:
-            app_logger.warning(f"Failed to process single vector for {image_path}: {skipped_tuples[0][1]}")
+        images, _, skipped = _process_batch_from_paths([image_path], g_inference_engine.input_size)
+        if skipped:
+            app_logger.warning(f"Failed to process single vector for {image_path}: {skipped[0][1]}")
             return None
         if images:
             io_binding = g_inference_engine.visual_session.io_binding()
             image_list = [np.array(img.convert("RGB")) for img in images]
             pixel_values = g_inference_engine.processor(images=image_list, return_tensors="np").pixel_values
             io_binding.bind_cpu_input(
-                "pixel_values", pixel_values.astype(np.float16 if g_inference_engine.is_fp16 else np.float32)
+                "pixel_values",
+                pixel_values.astype(np.float16 if g_inference_engine.is_fp16 else np.float32),
             )
             io_binding.bind_output("image_embeds")
             g_inference_engine.visual_session.run_with_iobinding(io_binding)
@@ -306,6 +330,7 @@ def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
 
 
 def worker_get_text_vector(text: str) -> np.ndarray | None:
+    """Worker function to get a vector for a text query."""
     if g_inference_engine is None:
         return None
     try:
@@ -313,26 +338,3 @@ def worker_get_text_vector(text: str) -> np.ndarray | None:
     except Exception as e:
         _log_worker_crash(e, "worker_get_text_vector")
     return None
-
-
-def worker_get_xxhash(path: Path) -> tuple[str | None, Path]:
-    try:
-        hasher = xxhash.xxh64()
-        with open(path, "rb") as f:
-            while chunk := f.read(4 * 1024 * 1024):
-                hasher.update(chunk)
-        return hasher.hexdigest(), path
-    except OSError:
-        return None, path
-
-
-def worker_get_phash(path: Path) -> tuple[Union["imagehash.ImageHash", None], Path]:
-    try:
-        import imagehash
-        from PIL import Image
-
-        with Image.open(path) as img:
-            phash = imagehash.phash(img)
-        return phash, path
-    except Exception:
-        return None, path

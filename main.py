@@ -17,6 +17,8 @@ sys.path.insert(0, str(script_dir))
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
+from app.constants import CRASH_LOG_DIR
+from app.gui.main_window import App
 from app.logging_config import setup_logging
 
 IS_DEBUG_MODE = "--debug" in sys.argv
@@ -29,8 +31,6 @@ def log_global_crash(exc_type, exc_value, exc_traceback):
     logging.getLogger("AssetPixelHand.main").critical(error_message)
     try:
         from PySide6.QtWidgets import QApplication, QMessageBox
-
-        from app.constants import CRASH_LOG_DIR
 
         CRASH_LOG_DIR.mkdir(parents=True, exist_ok=True)
         log_file = CRASH_LOG_DIR / f"crash_report_{datetime.now(UTC).strftime('%Y-%m-%d_%H-%M-%S')}.txt"
@@ -52,8 +52,6 @@ def run_application():
     """Initializes and runs the Qt application."""
     from PySide6.QtCore import QObject, Signal
     from PySide6.QtWidgets import QApplication
-
-    from app.gui_main_window import App
 
     class LogSignalEmitter(QObject):
         log_signal = Signal(str, str)

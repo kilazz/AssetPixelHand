@@ -1,6 +1,5 @@
 # app/model_adapter.py
-"""
-Contains adapters to provide a unified interface for different model architectures
+"""Contains adapters to provide a unified interface for different model architectures
 like CLIP, SigLIP, and DINOv2. This abstracts away the differences in how
 they are loaded, processed, and wrapped for ONNX export.
 """
@@ -28,14 +27,10 @@ class ModelAdapter(ABC):
     def get_input_size(self, processor) -> tuple[int, int]:
         """Determines the correct input image size from the processor's configuration."""
         image_proc = getattr(processor, "image_processor", processor)
-
-        # Models use different keys for the input size ('size' or 'crop_size')
         size_config = getattr(image_proc, "size", {}) or getattr(image_proc, "crop_size", {})
-
         if isinstance(size_config, dict) and "height" in size_config:
             return (size_config["height"], size_config["width"])
-
-        return (224, 224)  # A safe default if size is not found
+        return (224, 224)  # A safe default
 
     @abstractmethod
     def get_vision_wrapper(self, model, torch):

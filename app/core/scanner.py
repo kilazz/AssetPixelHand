@@ -1,6 +1,5 @@
-# app/scanner.py
-"""
-Main orchestrator for the scanning process. This module contains the core logic
+# app/core/scanner.py
+"""Main orchestrator for the scanning process. This module contains the core logic
 for controlling the scanner's lifecycle via a dedicated thread.
 """
 
@@ -8,7 +7,6 @@ import hashlib
 import logging
 import os
 import shutil
-import sys
 import threading
 import time
 
@@ -16,15 +14,14 @@ import pyarrow as pa
 from PySide6.QtCore import QObject, QThread, Slot
 
 from app.constants import CACHE_DIR, DUCKDB_AVAILABLE, LANCEDB_AVAILABLE, WIN32_AVAILABLE
+from app.core.strategies import FindDuplicatesStrategy, SearchStrategy
 from app.data_models import ScanConfig, ScannerSignals, ScanState
-from app.scan_strategies import FindDuplicatesStrategy, SearchStrategy
 
 if LANCEDB_AVAILABLE:
     import lancedb
 if DUCKDB_AVAILABLE:
     pass
 if WIN32_AVAILABLE:
-    import pythoncom
     import win32api
     import win32con
     import win32process
@@ -45,10 +42,6 @@ class ScannerCore(QObject):
 
     def run(self, stop_event: threading.Event):
         """Main entry point for the scanner logic, executed in a separate thread."""
-        # FIX: Initialize COM for the new thread on Windows to prevent crashes.
-        if sys.platform == "win32":
-            pythoncom.CoInitializeEx(0)  # 0 = COINIT_MULTITHREADED
-
         self.scan_has_finished = False
         start_time = time.time()
         self.all_skipped_files.clear()
@@ -102,7 +95,7 @@ class ScannerCore(QObject):
     def _setup_lancedb(self) -> bool:
         """Initializes the LanceDB database and table."""
         try:
-            folder_hash = hashlib.md5(str(self.config.folder_path.resolve()).encode()).hexdigest()
+            folder_hash = hashlib.md5(str(self.config.folder_path).encode()).hexdigest()
             sanitized_model = self.config.model_name.replace("/", "_").replace("-", "_")
             db_name = f"lancedb_{folder_hash}_{sanitized_model}"
             db_path = CACHE_DIR / db_name
@@ -146,7 +139,12 @@ class ScannerCore(QObject):
             return False
 
     def _check_stop_or_empty(
-        self, stop_event: threading.Event, collection: list, mode: str, payload: any, start_time: float
+        self,
+        stop_event: threading.Event,
+        collection: list,
+        mode: str,
+        payload: any,
+        start_time: float,
     ) -> bool:
         """Checks if the scan should terminate due to cancellation or lack of files."""
         duration = time.time() - start_time

@@ -1,6 +1,5 @@
-# app/gui_models.py
-"""
-Contains Qt Item Models and Delegates for displaying data in views like QTreeView
+# app/gui/models.py
+"""Contains Qt Item Models and Delegates for displaying data in views like QTreeView
 and QListView. These components are responsible for managing and presenting data to the user.
 """
 
@@ -23,9 +22,11 @@ from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QImage, QPen, QPi
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate
 
 from app.constants import DUCKDB_AVAILABLE, UIConfig
-from app.gui_tasks import GroupFetcherTask, ImageLoader
-from app.gui_widgets import AlphaBackgroundWidget
 from app.utils import find_common_base_name
+
+# --- REFACTOR: Updated relative import paths for components within the 'gui' package ---
+from .tasks import GroupFetcherTask, ImageLoader
+from .widgets import AlphaBackgroundWidget
 
 if DUCKDB_AVAILABLE:
     import duckdb
@@ -358,7 +359,10 @@ class ResultsTreeModel(QAbstractItemModel):
         return [Path(p) for p, s in self.check_states.items() if s == Qt.CheckState.Checked]
 
     def get_summary_text(self) -> str:
-        num_groups, total_items = len(self.sorted_group_ids), sum(d.get("count", 0) for d in self.groups_data.values())
+        num_groups, total_items = (
+            len(self.sorted_group_ids),
+            sum(d.get("count", 0) for d in self.groups_data.values()),
+        )
         if self.filter_text and self.db_path:
             try:
                 with duckdb.connect(database=str(self.db_path), read_only=True) as conn:
@@ -449,13 +453,13 @@ class ImagePreviewModel(QAbstractListModel):
             try:
                 with duckdb.connect(database=str(self.db_path), read_only=True) as conn:
                     is_search = conn.execute(
-                        "SELECT MAX(search_context) IS NOT NULL FROM results WHERE group_id = ?", [self.group_id]
+                        "SELECT MAX(search_context) IS NOT NULL FROM results WHERE group_id = ?",
+                        [self.group_id],
                     ).fetchone()[0]
                     query = "SELECT * FROM results WHERE group_id = ?"
                     if is_search:
                         query += " AND is_best = FALSE"
                     query += " ORDER BY is_best DESC, distance DESC"
-                    # FIX: Correctly extract column names from the description tuples.
                     cols = [desc[0] for desc in conn.execute(query, [self.group_id]).description]
                     for row_tuple in conn.execute(query, [self.group_id]).fetchall():
                         row_dict = dict(zip(cols, row_tuple, strict=False))
@@ -584,14 +588,17 @@ class ImageItemDelegate(QStyledItemDelegate):
         thumb_rect = option.rect.adjusted(5, 5, -(option.rect.width() - self.preview_size - 5), -5)
         if self.is_transparency_enabled:
             painter.drawPixmap(
-                thumb_rect.topLeft(), AlphaBackgroundWidget._get_checkered_pixmap(thumb_rect.size(), self.bg_alpha)
+                thumb_rect.topLeft(),
+                AlphaBackgroundWidget._get_checkered_pixmap(thumb_rect.size(), self.bg_alpha),
             )
         pixmap = index.data(Qt.ItemDataRole.DecorationRole)
         item_data = index.data(Qt.ItemDataRole.UserRole)
         error_msg = item_data.get("error") if item_data else None
         if pixmap and not pixmap.isNull():
             scaled = pixmap.scaled(
-                thumb_rect.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+                thumb_rect.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
             )
             painter.drawPixmap(
                 thumb_rect.x() + (thumb_rect.width() - scaled.width()) // 2,
@@ -641,7 +648,11 @@ class ImageItemDelegate(QStyledItemDelegate):
         meta_text = f"{dist_text}{item_data.get('resolution_w', 0)}x{item_data.get('resolution_h', 0)} | {item_data.get('format_details', '')}"
         painter.drawText(x, y, self.regular_font_metrics.elidedText(meta_text, Qt.ElideRight, text_rect.width()))
         y += line_height
-        painter.drawText(x, y, self.regular_font_metrics.elidedText(str(path.parent), Qt.ElideRight, text_rect.width()))
+        painter.drawText(
+            x,
+            y,
+            self.regular_font_metrics.elidedText(str(path.parent), Qt.ElideRight, text_rect.width()),
+        )
 
 
 class SimilarityFilterProxyModel(QSortFilterProxyModel):

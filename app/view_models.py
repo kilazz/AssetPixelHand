@@ -1,7 +1,5 @@
 # app/view_models.py
-"""
-Contains View-Model classes that manage UI state and logic, separating it from the view widgets.
-"""
+"""Contains View-Model classes that manage UI state and logic, separating it from the view widgets."""
 
 from pathlib import Path
 
@@ -10,7 +8,8 @@ from PIL.ImageQt import fromqimage
 from PySide6.QtCore import QObject, QThreadPool, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
 
-from app.gui_tasks import ImageLoader
+# --- REFACTOR: Updated import path for the GUI task module ---
+from app.gui.tasks import ImageLoader
 
 
 class ImageComparerState(QObject):
@@ -23,8 +22,8 @@ class ImageComparerState(QObject):
     load_error = Signal(str, str)
 
     def __init__(self, thread_pool: QThreadPool):
-        """
-        Initializes the state manager.
+        """Initializes the state manager.
+
         Args:
             thread_pool: The shared QThreadPool from the main application to run background tasks.
         """
@@ -35,8 +34,7 @@ class ImageComparerState(QObject):
         self._active_loaders: dict[str, ImageLoader] = {}
 
     def toggle_candidate(self, item_data: dict) -> bool:
-        """
-        Adds or removes an item from the comparison candidates list.
+        """Adds or removes an item from the comparison candidates list.
         Maintains a maximum of two candidates.
         """
         path_str = item_data["path"]
@@ -46,6 +44,7 @@ class ImageComparerState(QObject):
         if is_candidate:
             self._candidates[path_str] = item_data
             if len(self._candidates) > 2:
+                # Get the first key inserted into the dictionary (oldest)
                 oldest_path = next(iter(self._candidates))
                 self._candidates[oldest_path]["is_compare_candidate"] = False
                 del self._candidates[oldest_path]
@@ -80,9 +79,9 @@ class ImageComparerState(QObject):
             loader = ImageLoader(
                 path_str=path_str,
                 mtime=item_data.get("mtime", 0.0),
-                target_size=None,
+                target_size=None,  # Load full resolution
                 tonemap_mode=tonemap_mode,
-                use_cache=False,
+                use_cache=False,  # Always reload full-res to apply new settings
                 receiver=self,
                 on_finish_slot="_on_image_loaded",
                 on_error_slot="_on_load_error",
@@ -99,9 +98,11 @@ class ImageComparerState(QObject):
         del self._active_loaders[path_str]
 
         if not q_img.isNull():
+            # Convert QImage to PIL Image for processing (e.g., diffing)
             pil_img = fromqimage(q_img)
             self._pil_images[path_str] = pil_img
 
+            # Emit the QPixmap for direct display in the UI
             pixmap = QPixmap.fromImage(q_img)
             self.image_loaded.emit(path_str, pixmap)
 

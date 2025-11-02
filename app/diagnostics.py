@@ -1,7 +1,7 @@
 # app/diagnostics.py
-"""
-A centralized diagnostic script to check the application's environment,
+"""A centralized diagnostic script to check the application's environment,
 verifying Python version, library availability, and ONNX compatibility.
+This can be run standalone to help users troubleshoot setup issues.
 """
 
 import platform
@@ -9,17 +9,18 @@ import shutil
 import sys
 from pathlib import Path
 
+# --- Fallback Path Setup ---
 try:
     from app.constants import APP_DATA_DIR
 except ImportError:
-    # Fallback for running the script standalone
+    # If run as a standalone script, determine the path relative to this file.
     APP_DATA_DIR = Path(__file__).resolve().parent.parent / "app_data"
 
 DIAG_TEMP_DIR = APP_DATA_DIR / "temp_diag"
 
 
 def print_header(title: str, char: str = "="):
-    """Prints a formatted header to the console."""
+    """Prints a formatted header to the console for better readability."""
     width = 70
     print("\n" + char * width)
     print(f"  {title}")
@@ -33,16 +34,18 @@ def print_status(message: str, is_ok: bool):
 
 
 def check_python_version() -> bool:
-    """Verifies that the Python version is 3.12 or newer."""
+    """Verifies that the Python version is 3.13 or newer."""
     print_header("1. Python Version Check")
-    REQUIRED_MAJOR, REQUIRED_MINOR = 3, 12
+    REQUIRED_MAJOR, REQUIRED_MINOR = 3, 13
     current_version = sys.version_info
     print(f"       Found Python version: {platform.python_version()}")
     print(f"       Python executable: {sys.executable}")
     is_ok = current_version >= (REQUIRED_MAJOR, REQUIRED_MINOR)
     print_status(f"Python {REQUIRED_MAJOR}.{REQUIRED_MINOR}+ is required.", is_ok)
     if not is_ok:
-        print("       Error: Your Python version is too old. Please upgrade to Python 3.12 or newer.")
+        print(
+            f"       Error: Your Python version is too old. Please upgrade to Python {REQUIRED_MAJOR}.{REQUIRED_MINOR} or newer."
+        )
     return is_ok
 
 
@@ -62,10 +65,13 @@ def check_library_imports() -> bool:
             "lancedb": "lancedb",
             "xxhash": "xxhash",
             "sentencepiece": "sentencepiece",
-            "OpenImageIO": "oiio-python",  # The package is oiio-python, but it's imported as OpenImageIO
+            "OpenImageIO": "oiio-python",
             "scipy": "scipy",
         },
-        "Optional (for extended file format support and features)": {},
+        "Optional (for extended file format support and features)": {
+            "directxtex_decoder": "directxtex-decoder",
+            "zstandard": "zstandard",
+        },
     }
     overall_ok = True
     for category, libs in libraries.items():
@@ -89,7 +95,7 @@ def check_library_imports() -> bool:
     print("-" * 70)
     print_status("All critical libraries imported successfully.", overall_ok)
     if not overall_ok:
-        print("       Tip: Ensure all required packages are installed, e.g., 'pip install oiio-python'.")
+        print("       Tip: Ensure all required packages are installed, e.g., 'pip install -r requirements.txt'.")
     return overall_ok
 
 
@@ -144,10 +150,14 @@ def check_onnx_model_compatibility() -> bool:
             node = helper.make_node("Identity", ["input"], ["output"])
             graph = helper.make_graph([node], f"graph-{model_name}", [input_tensor], [output_tensor])
             model = helper.make_model(
-                graph, producer_name="diagnostic-checker", opset_imports=[helper.make_opsetid("", 18)], ir_version=11
+                graph,
+                producer_name="diagnostic-checker",
+                opset_imports=[helper.make_opsetid("", 18)],
+                ir_version=9,
             )
             onnx.save(model, str(model_path))
             print_status("Generated test model", True)
+
             session = ort.InferenceSession(str(model_path), providers=ort.get_available_providers())
             session.run(None, {session.get_inputs()[0].name: np.ones((1, 2), dtype=config["numpy_type"])})
             print_status("Loaded model and ran inference", True)

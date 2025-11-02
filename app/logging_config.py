@@ -1,7 +1,5 @@
 # app/logging_config.py
-"""
-Handles the setup of the application-wide logging system.
-"""
+"""Handles the setup of the application-wide logging system."""
 
 import logging
 import os
@@ -41,8 +39,7 @@ class QtHandler(logging.Handler):
 
 
 def setup_logging(ui_signals_emitter: QObject | None = None, force_debug: bool = False):
-    """
-    Configures the root logger for the application.
+    """Configures the root logger for the application.
     - Directs logs to console, a rotating file, and optionally the GUI.
     - Logging level can be set to DEBUG via the APP_DEBUG environment variable or the force_debug flag.
     """

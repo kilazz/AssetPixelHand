@@ -134,7 +134,9 @@ def main():
     parser = argparse.ArgumentParser(description="Image library compatibility tester for Pillow, OIIO, and DirectXTex.")
     parser.add_argument("folder", type=str, help="Path to the folder to scan.")
     parser.add_argument(
-        "--errors-only", action="store_true", help="Only show files that failed in at least one library."
+        "--errors-only",
+        action="store_true",
+        help="Only show files that failed in at least one library.",
     )
     args = parser.parse_args()
 
@@ -165,7 +167,6 @@ def main():
         sys.stdout.write(progress_line.ljust(os.get_terminal_size().columns - 1) + "\r")
         sys.stdout.flush()
 
-        # Run DirectXTex test only for .dds files
         dds_result = test_directxtex(file_path) if file_path.suffix.lower() == ".dds" else colorize("N/A", Colors.GRAY)
 
         test_results = [
@@ -178,7 +179,7 @@ def main():
         if has_failure:
             failed_files_count += 1
         if not args.errors_only or has_failure:
-            results.append([str(relative_path)] + test_results)
+            results.append([str(relative_path), *test_results])
 
     sys.stdout.write(" " * (os.get_terminal_size().columns - 1) + "\r")
     sys.stdout.flush()
@@ -188,7 +189,12 @@ def main():
     print("=" * 80)
 
     if not results:
-        print(colorize("\nAll tested files were successfully read by all applicable libraries!", Colors.GREEN))
+        print(
+            colorize(
+                "\nAll tested files were successfully read by all applicable libraries!",
+                Colors.GREEN,
+            )
+        )
     else:
         print(tabulate(results, headers=headers, tablefmt="grid"))
 

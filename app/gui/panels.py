@@ -1,6 +1,5 @@
-# app/gui_panels.py
-"""
-Contains the main panel widgets (QGroupBox subclasses) that form the core layout
+# app/gui/panels.py
+"""Contains the main panel widgets (QGroupBox subclasses) that form the core layout
 of the application's main window, organizing all user-facing controls and views.
 """
 
@@ -52,10 +51,17 @@ from app.constants import (
     UIConfig,
 )
 from app.data_models import AppSettings
-from app.gui_dialogs import FileTypesDialog
-from app.gui_models import ImageItemDelegate, ImagePreviewModel, ResultsTreeModel, SimilarityFilterProxyModel
-from app.gui_widgets import AlphaBackgroundWidget, ImageCompareWidget, ResizedListView
 from app.view_models import ImageComparerState
+
+# --- REFACTOR: Updated relative import paths for components within the 'gui' package ---
+from .dialogs import FileTypesDialog
+from .models import (
+    ImageItemDelegate,
+    ImagePreviewModel,
+    ResultsTreeModel,
+    SimilarityFilterProxyModel,
+)
+from .widgets import AlphaBackgroundWidget, ImageCompareWidget, ResizedListView
 
 app_logger = logging.getLogger("AssetPixelHand.gui.panels")
 
@@ -483,7 +489,10 @@ class PerformancePanel(QGroupBox):
         self.search_precision_combo.blockSignals(False)
 
     def get_selected_quantization(self) -> QuantizationMode:
-        return next((q for q in QuantizationMode if q.value == self.quant_combo.currentText()), QuantizationMode.FP16)
+        return next(
+            (q for q in QuantizationMode if q.value == self.quant_combo.currentText()),
+            QuantizationMode.FP16,
+        )
 
     def load_settings(self, s: AppSettings):
         self.quant_combo.setCurrentText(s.quantization_mode)
@@ -840,7 +849,8 @@ class ResultsPanel(QGroupBox):
             return
         msg = (
             f"This will replace {len(to_link)} duplicate files with reflinks (Copy-on-Write).\n\n"
-            "ℹ️ INFO:\n• Creates space-saving copies that share data blocks.\n• When you edit a file, only the changed blocks are duplicated.\n"
+            "INFO:\n• Creates space-saving copies that share data blocks.\n"
+            "• When you edit a file, only the changed blocks are duplicated.\n"
             "• Safer than hardlinks but requires filesystem support (APFS, Btrfs, XFS, ReFS).\n• This operation cannot be undone.\n\nAre you sure you want to continue?"
         )
         if QMessageBox.question(self, "Confirm Reflink Replacement", msg) == QMessageBox.StandardButton.Yes:

@@ -1,8 +1,5 @@
-# app/gui_tasks.py
-"""
-Contains QRunnable tasks for performing background operations without freezing the GUI.
-This includes tasks for model conversion, image loading, and file system operations.
-"""
+# app/gui/tasks.py
+"""Contains QRunnable tasks for performing background operations without freezing the GUI."""
 
 import inspect
 import io
@@ -14,10 +11,10 @@ from typing import TYPE_CHECKING
 import send2trash
 from PySide6.QtCore import QModelIndex, QObject, QRunnable, Signal
 
-from app.cache import thumbnail_cache
+from app.cache import get_thumbnail_cache_key, thumbnail_cache
 from app.constants import DEEP_LEARNING_AVAILABLE, DUCKDB_AVAILABLE, QuantizationMode
+from app.image_io import load_image
 from app.model_adapter import get_model_adapter
-from app.utils import _load_image_static_cached, get_thumbnail_cache_key
 
 if DUCKDB_AVAILABLE:
     import duckdb
@@ -155,7 +152,10 @@ class ModelConverter(QRunnable):
             else:
                 onnx_inputs = dummy_text_input["input_ids"]
                 input_names = ["input_ids"]
-                dynamic_axes = {"input_ids": {0: "batch_size", 1: "sequence"}, "text_embeds": {0: "batch_size"}}
+                dynamic_axes = {
+                    "input_ids": {0: "batch_size", 1: "sequence"},
+                    "text_embeds": {0: "batch_size"},
+                }
 
             torch.onnx.export(
                 text_wrapper,
@@ -220,7 +220,7 @@ class ImageLoader(QRunnable):
                     pil_img = None
 
             if pil_img is None:
-                pil_img = _load_image_static_cached(
+                pil_img = load_image(
                     self.path_str,
                     target_size=(self.target_size, self.target_size) if self.target_size else None,
                     tonemap_mode=self.tonemap_mode,
@@ -326,7 +326,7 @@ class FileOperationTask(QRunnable):
         finished = Signal(list, int, int)
         log = Signal(str, str)
 
-    def __init__(self, mode: str, paths: list[Path] = None, link_map: dict[Path, Path] = None):
+    def __init__(self, mode: str, paths: list[Path] | None = None, link_map: dict[Path, Path] | None = None):
         super().__init__()
         self.mode = mode
         self.paths = paths or []
