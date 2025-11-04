@@ -355,9 +355,9 @@ class App(QMainWindow):
             return
 
         time_str = f"{int(duration // 60)}m {int(duration % 60)}s" if duration > 0 else "less than a second"
-
-        db_path = payload.get("db_path")
-        groups_data = payload.get("groups_data")
+        data_to_display = payload if isinstance(payload, dict) else {}
+        db_path = data_to_display.get("db_path")
+        groups_data = data_to_display.get("groups_data")
 
         log_msg = f"Finished! Found {num_found} {'similar items' if mode == ScanMode.DUPLICATES else 'results'} in {time_str}."
         app_logger.info(log_msg)

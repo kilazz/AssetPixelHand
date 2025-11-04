@@ -137,7 +137,7 @@ class AppSettings:
     folder_path: str = ""
     threshold: str = "95"
     exclude: str = ""
-    model_key: str = "Balanced (SigLIP Base)"
+    model_key: str = "Fastest (OpenCLIP ViT-B/32)"
     save_visuals: bool = False
     max_visuals: str = "100"
     visuals_columns: int = 6

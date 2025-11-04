@@ -71,6 +71,7 @@ def check_library_imports() -> bool:
         "Optional (for extended file format support and features)": {
             "directxtex_decoder": "directxtex-decoder",
             "zstandard": "zstandard",
+            "pyvips": "pyvips-binary",
         },
     }
     overall_ok = True

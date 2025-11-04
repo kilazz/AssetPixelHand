@@ -3,9 +3,10 @@
 
 This module provides a unified interface for handling a wide variety of image
 formats by using a prioritized chain of specialized libraries:
-1. DirectXTex (via directxtex_decoder) for DDS textures.
-2. OpenImageIO for professional formats and HDR images (EXR, DPX, etc.).
-3. Pillow (PIL) as a robust fallback for standard web and raster formats.
+1. pyvips for maximum format compatibility and performance.
+2. DirectXTex (via directxtex_decoder) for DDS textures.
+3. OpenImageIO for professional formats and HDR images (EXR, DPX, etc.).
+4. Pillow (PIL) as a robust fallback for standard web and raster formats.
 """
 
 import contextlib
@@ -20,6 +21,14 @@ from PIL import Image
 
 Image.MAX_IMAGE_PIXELS = None
 app_logger = logging.getLogger("AssetPixelHand.image_io")
+
+try:
+    import pyvips
+
+    PYVIPS_AVAILABLE = True
+except (ImportError, OSError):
+    pyvips = None
+    PYVIPS_AVAILABLE = False
 
 try:
     import OpenImageIO as oiio
@@ -54,7 +63,18 @@ def load_image(
     ext = path.suffix.lower()
 
     pil_image = None
-    if ext == ".dds" and DIRECTXTEX_AVAILABLE:
+
+    # --- Stage 1: PyVips (Highest Priority) ---
+    if PYVIPS_AVAILABLE:
+        app_logger.debug(f"Attempting to load '{filename}' with pyvips.")
+        try:
+            pil_image = _load_with_pyvips(path_or_buffer, tonemap_mode)
+            app_logger.debug(f"Successfully loaded '{filename}' with pyvips.")
+        except Exception as e:
+            app_logger.debug(f"pyvips failed for '{filename}': {e}. Falling back.")
+
+    # --- Stage 2: DirectXTex for DDS ---
+    if pil_image is None and ext == ".dds" and DIRECTXTEX_AVAILABLE:
         app_logger.debug(f"Attempting to load '{filename}' with DirectXTex.")
         try:
             pil_image = _load_with_directxtex(path, tonemap_mode)
@@ -62,14 +82,16 @@ def load_image(
         except Exception as e:
             app_logger.debug(f"DirectXTex failed for '{filename}': {e}. Falling back.")
 
+    # --- Stage 3: OpenImageIO ---
     if pil_image is None and OIIO_AVAILABLE:
         app_logger.debug(f"Attempting to load '{filename}' with OpenImageIO.")
         try:
             pil_image = _load_with_oiio(path_or_buffer, tonemap_mode)
             app_logger.debug(f"Successfully loaded '{filename}' with OpenImageIO.")
         except Exception as e:
-            app_logger.debug(f"OIIO failed for '{filename}': {e}. Falling back to Pillow.")
+            app_logger.debug(f"OIIO failed for '{filename}': {e}. Falling back.")
 
+    # --- Stage 4: Pillow (Fallback) ---
     if pil_image is None and PILLOW_AVAILABLE:
         app_logger.debug(f"Attempting to load '{filename}' with Pillow.")
         try:
@@ -88,8 +110,8 @@ def load_image(
             return pil_image.convert("RGBA")
         return pil_image
 
-    if not any([DIRECTXTEX_AVAILABLE, OIIO_AVAILABLE, PILLOW_AVAILABLE]):
-        app_logger.error("No image loading libraries (Pillow, OIIO, etc.) are installed.")
+    if not any([PYVIPS_AVAILABLE, DIRECTXTEX_AVAILABLE, OIIO_AVAILABLE, PILLOW_AVAILABLE]):
+        app_logger.error("No image loading libraries (Pillow, OIIO, pyvips, etc.) are installed.")
 
     return None
 
@@ -97,11 +119,52 @@ def load_image(
 def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | None:
     """Extracts image metadata using the best available library."""
     try:
-        # If a stat object isn't provided, get it. Otherwise, use the precomputed one.
         stat = precomputed_stat if precomputed_stat else path.stat()
         ext = path.suffix.lower()
         filename = path.name
 
+        # --- Stage 1: PyVips (Highest Priority) ---
+        if PYVIPS_AVAILABLE:
+            app_logger.debug(f"Getting metadata for '{filename}' with pyvips.")
+            try:
+                img = pyvips.Image.new_from_file(str(path), access="sequential")
+
+                format_map = {
+                    "uchar": 8,
+                    "char": 8,
+                    "ushort": 16,
+                    "short": 16,
+                    "uint": 32,
+                    "int": 32,
+                    "float": 32,
+                    "double": 64,
+                    "complex": 64,
+                    "dpcomplex": 128,
+                }
+                bit_depth = format_map.get(img.format, 8)
+                ch_str = {1: "Grayscale", 2: "GA", 3: "RGB", 4: "RGBA"}.get(img.bands, f"{img.bands}ch")
+                has_alpha = img.hasalpha()
+
+                capture_date = None
+                if "exif-ifd0-DateTime" in img.get_fields():
+                    dt_str = img.get("exif-ifd0-DateTime")
+                    with contextlib.suppress(ValueError, TypeError):
+                        capture_date = datetime.strptime(dt_str.split("\0", 1)[0], "%Y:%m:%d %H:%M:%S").timestamp()
+
+                return {
+                    "resolution": (img.width, img.height),
+                    "file_size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "format_str": img.get("vips-loader").upper() or ext.strip(".").upper(),
+                    "format_details": f"{bit_depth}-bit {ch_str}",
+                    "has_alpha": has_alpha,
+                    "capture_date": capture_date,
+                    "bit_depth": bit_depth,
+                }
+            except Exception as e:
+                app_logger.debug(f"pyvips metadata failed for '{filename}': {e}. Falling back.")
+
+        # --- Fallback stages ---
         if ext == ".dds" and DIRECTXTEX_AVAILABLE:
             app_logger.debug(f"Getting metadata for '{filename}' with DirectXTex.")
             try:
@@ -194,6 +257,27 @@ def is_dds_hdr(format_str: str) -> tuple[bool, int]:
     return False, 8
 
 
+def _load_with_pyvips(path_or_buffer: str | Path | io.BytesIO, tonemap_mode: str) -> Image.Image | None:
+    """Load an image using pyvips and convert to a Pillow Image."""
+    source = str(path_or_buffer) if isinstance(path_or_buffer, (str, Path)) else path_or_buffer
+    image = pyvips.Image.new_from_file(source, access="sequential")
+
+    is_float = "float" in image.format or "double" in image.format
+
+    if is_float and tonemap_mode != "none":
+        numpy_array = image.numpy()
+        tonemapped_array = _tonemap_float_array(numpy_array.astype(np.float32), tonemap_mode)
+        return Image.fromarray(tonemapped_array)
+
+    # For non-tonemapped float or integer types, convert to 8-bit uchar for Pillow compatibility
+    if image.format != "uchar":
+        image = image.cast("uchar")
+
+    # Convert pyvips image to numpy array, then to PIL image
+    numpy_array = image.numpy()
+    return Image.fromarray(numpy_array)
+
+
 def _load_with_directxtex(path: Path, tonemap_mode: str) -> Image.Image | None:
     with path.open("rb") as f:
         decoded = directxtex_decoder.decode_dds(f.read())
@@ -236,8 +320,17 @@ def _load_with_oiio(path_or_buffer: str | Path | io.BytesIO, tonemap_mode: str) 
 
 
 def _tonemap_float_array(float_array: np.ndarray, mode: str) -> np.ndarray:
-    rgb = np.copy(float_array[..., :3])
-    alpha = float_array[..., 3:4] if float_array.shape[-1] == 4 else None
+    if float_array.ndim == 2:
+        rgb = np.stack([float_array] * 3, axis=-1)
+    elif float_array.shape[-1] == 1:
+        rgb = np.concatenate([float_array] * 3, axis=-1)
+    elif float_array.shape[-1] > 3:
+        rgb = float_array[..., :3]
+    else:
+        rgb = float_array
+
+    alpha = float_array[..., 3:4] if float_array.ndim > 2 and float_array.shape[-1] > 3 else None
+
     rgb[rgb < 0.0] = 0.0
     if mode == "reinhard":
         gamma_corrected = np.power(rgb / (1.0 + rgb), 1.0 / 2.2)
@@ -246,7 +339,10 @@ def _tonemap_float_array(float_array: np.ndarray, mode: str) -> np.ndarray:
     else:
         gamma_corrected = np.clip(rgb, 0.0, 1.0)
     final_rgb = (gamma_corrected * 255).astype(np.uint8)
+
     if alpha is not None:
         final_alpha = (np.clip(alpha, 0.0, 1.0) * 255).astype(np.uint8)
-        return np.concatenate([final_rgb, final_alpha], axis=-1)
+        if final_rgb.ndim == 3:
+            return np.concatenate([final_rgb, final_alpha], axis=-1)
+
     return final_rgb

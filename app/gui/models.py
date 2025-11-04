@@ -77,9 +77,17 @@ class ResultsTreeModel(QAbstractItemModel):
         self.clear()
         self.beginResetModel()
         self.mode = mode
-        if isinstance(payload, Path) and payload.exists():
-            self.db_path = payload
+
+        db_path_from_payload = None
+        if isinstance(payload, (Path, str)):
+            db_path_from_payload = payload
+        elif isinstance(payload, dict):
+            db_path_from_payload = payload.get("db_path")
+
+        if db_path_from_payload and Path(db_path_from_payload).exists():
+            self.db_path = Path(db_path_from_payload)
             self._load_results_from_db()
+
         self.endResetModel()
 
     def _load_results_from_db(self):

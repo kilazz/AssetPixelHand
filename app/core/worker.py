@@ -159,22 +159,34 @@ def _process_batch_from_paths(
     oiio_cache = None
     cache_needs_destroy = False
     if oiio:
-        # Try the official, modern static method first
         if hasattr(oiio.ImageCache, "create"):
             with contextlib.suppress(Exception):
                 oiio_cache = oiio.ImageCache.create(shared=False)
                 cache_needs_destroy = True
-
-        # If that failed, try the simple constructor (for oiio-python)
-        if not oiio_cache and hasattr(oiio, "ImageCache"):
+        elif hasattr(oiio, "ImageCache"):
             with contextlib.suppress(Exception):
                 oiio_cache = oiio.ImageCache()
-                # This version does not need destroy(), so the flag remains False
-
         if not oiio_cache:
-            app_logger.warning(
-                "Could not create/get OIIO ImageCache. Performance may be reduced. Consider updating 'openimageio' library."
+            app_logger.warning("Could not create/get OIIO ImageCache. Performance may be reduced.")
+
+    def smart_convert_to_rgb(img: Image.Image) -> Image.Image:
+        """
+        Converts any image to a 3-channel RGB format, intelligently handling
+        alpha-only textures and different modes.
+        """
+        if img.mode == "RGB":
+            return img
+
+        if "A" in img.getbands() and "R" in img.getbands():
+            rgb_bands = img.getchannel("R"), img.getchannel("G"), img.getchannel("B")
+            is_rgb_blank = all(band.getextrema() == (0, 0) for band in rgb_bands) or all(
+                band.getextrema() == (255, 255) for band in rgb_bands
             )
+            if is_rgb_blank:
+                alpha = img.getchannel("A")
+                return Image.merge("RGB", (alpha, alpha, alpha))
+
+        return img.convert("RGB")
 
     try:
         for path in paths:
@@ -196,12 +208,11 @@ def _process_batch_from_paths(
                         buf = oiio.ImageBuf()
                         if oiio_cache:
                             oiio_cache.get_imagebuf(str(path), buf)
-                        else:  # Fallback if cache creation failed
+                        else:
                             buf.reset(str(path))
 
                         if not buf.has_error:
-                            numpy_array = buf.get_pixels()
-                            pil_image = Image.fromarray(numpy_array)
+                            pil_image = Image.fromarray(buf.get_pixels())
                         else:
                             raise RuntimeError(buf.geterror(autoclear=1))
 
@@ -216,9 +227,8 @@ def _process_batch_from_paths(
 
                 if pil_image:
                     pil_image.thumbnail(input_size, Image.Resampling.LANCZOS)
-                    if pil_image.mode != "RGBA":
-                        pil_image = pil_image.convert("RGBA")
-                    images.append(pil_image)
+                    processed_image = smart_convert_to_rgb(pil_image)
+                    images.append(processed_image)
                     fingerprints.append(ImageFingerprint(path=path, hashes=np.array([]), **metadata))
                 else:
                     skipped_tuples.append((str(path), "All image loaders failed"))
@@ -227,7 +237,6 @@ def _process_batch_from_paths(
                 app_logger.error(f"Error processing {path.name} in batch", exc_info=True)
                 skipped_tuples.append((str(path), f"{type(e).__name__}: {str(e).splitlines()[0]}"))
     finally:
-        # Only destroy the cache if it was created via the official factory method
         if oiio_cache and cache_needs_destroy:
             oiio_cache.destroy()
 
@@ -269,7 +278,6 @@ def worker_wrapper_from_paths_cpu_shared_mem(
         images, fps, skipped_tuples = _process_batch_from_paths(paths, input_size)
         if not images:
             return None, [], skipped_tuples
-
         pixel_values = g_preprocessor(images=images, return_tensors="np").pixel_values
 
         shm_name = g_free_buffers_q.get()

@@ -13,6 +13,7 @@ from PySide6.QtCore import QModelIndex, QObject, QRunnable, Signal
 
 from app.cache import get_thumbnail_cache_key, thumbnail_cache
 from app.constants import DEEP_LEARNING_AVAILABLE, DUCKDB_AVAILABLE, QuantizationMode
+from app.data_models import ScanMode
 from app.image_io import load_image
 from app.model_adapter import get_model_adapter
 
@@ -280,7 +281,7 @@ class GroupFetcherTask(QRunnable):
         finished = Signal(list, int, QModelIndex)
         error = Signal(str)
 
-    def __init__(self, db_path: Path, group_id: int, mode: str, parent: QModelIndex):
+    def __init__(self, db_path: Path, group_id: int, mode: ScanMode, parent: QModelIndex):
         super().__init__()
         self.setAutoDelete(True)
         self.db_path = db_path
@@ -306,7 +307,8 @@ class GroupFetcherTask(QRunnable):
                 for child in children:
                     child["distance"] = int(child.get("distance", -1) or -1)
 
-                is_search = self.mode in ["text_search", "sample_search"]
+                is_search = self.mode in [ScanMode.TEXT_SEARCH, ScanMode.SAMPLE_SEARCH]
+
                 if is_search and children and children[0].get("is_best"):
                     children.pop(0)
 

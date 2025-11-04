@@ -165,7 +165,12 @@ class CacheManager:
         ]
         try:
             self.conn.begin()
-            self.conn.executemany("INSERT OR REPLACE INTO fingerprints VALUES (?, ?, ?, ?)", data_to_insert)
+            sql = (
+                "INSERT INTO fingerprints (path, mtime, size, fingerprint) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(path) DO UPDATE SET "
+                "mtime = excluded.mtime, size = excluded.size, fingerprint = excluded.fingerprint"
+            )
+            self.conn.executemany(sql, data_to_insert)
             self.conn.commit()
         except duckdb.Error as e:
             app_logger.warning(f"File cache 'put_many' transaction failed: {e}")

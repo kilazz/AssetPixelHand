@@ -1,6 +1,5 @@
 # app/constants.py
 import importlib.util
-import json
 import os
 import sys
 from enum import Enum
@@ -99,29 +98,35 @@ ALL_SUPPORTED_EXTENSIONS = sorted(set(_all_ext))
 def _get_default_models() -> dict:
     """Returns the hardcoded default model configuration."""
     return {
-        "Fastest (OpenAI ViT-B/32)": {
-            "hf_name": "openai/clip-vit-base-patch32",
-            "onnx_name": "clip-vit-base-patch32",
+        "Fastest (OpenCLIP ViT-B/32)": {
+            "hf_name": "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
+            "onnx_name": "CLIP-ViT-B-32-laion2B-s34B-b79K",
             "dim": 512,
             "supports_text_search": True,
             "supports_image_search": True,
         },
-        "Balanced (SigLIP Base)": {
+        "Compact (SigLIP-B)": {
             "hf_name": "google/siglip-base-patch16-384",
             "onnx_name": "siglip-base-patch16-384",
             "dim": 768,
             "supports_text_search": True,
             "supports_image_search": True,
-            "logit_scale": 13.5661,
         },
-        "High Quality (OpenCLIP ViT-L/14)": {
+        "Balanced (OpenCLIP-ViT-L/14)": {
             "hf_name": "laion/CLIP-ViT-L-14-laion2B-s32B-b82K",
             "onnx_name": "ViT-L-14-laion2B-s32B-b82K",
             "dim": 768,
             "supports_text_search": True,
             "supports_image_search": True,
         },
-        "High Visual Accuracy (DINOv2-B)": {
+        "High Quality (SigLIP-L)": {
+            "hf_name": "google/siglip-large-patch16-384",
+            "onnx_name": "siglip-large-patch16-384",
+            "dim": 1024,
+            "supports_text_search": True,
+            "supports_image_search": True,
+        },
+        "Visual Structure (DINOv2-B)": {
             "hf_name": "facebook/dinov2-base",
             "onnx_name": "dinov2-base",
             "dim": 768,
@@ -132,23 +137,8 @@ def _get_default_models() -> dict:
 
 
 def _load_models_config() -> dict:
-    """Loads model configurations from models.json, with fallbacks."""
-    default_models = _get_default_models()
-
-    if MODELS_CONFIG_FILE.exists():
-        try:
-            with open(MODELS_CONFIG_FILE, encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"Warning: Could not load 'models.json': {e}. Falling back to default models.")
-            return default_models
-    else:
-        try:
-            with open(MODELS_CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(default_models, f, indent=4)
-        except OSError as e:
-            print(f"Warning: Could not create 'models.json': {e}. Using default models for this session.")
-        return default_models
+    """Loads model configurations directly from the hardcoded defaults."""
+    return _get_default_models()
 
 
 SUPPORTED_MODELS = _load_models_config()

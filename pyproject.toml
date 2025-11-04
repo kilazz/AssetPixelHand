@@ -15,7 +15,7 @@ dependencies = [
     # Core Application & GUI
     "PySide6>=6.10.0",
     "send2trash>=1.8.3",
-    "pywin32>=311; sys_platform == 'win32'",
+    "pywin32>=311",
     # AI & Machine Learning
     "torch>=2.9.0",
     "transformers>=4.57.1",
@@ -34,9 +34,11 @@ dependencies = [
     "ImageHash>=4.3.2",
     "zstandard>=0.25.0",
     # Image Processing
-    "Pillow>=12.0.0",
-    #"OpenImageIO>=3.0.11.0",
+    "pyvips>=3.0.0",
+    "pyvips-binary>=8.17.3",
+    #"OpenImageIO>=3.1.7.0",
     "oiio-python>=3.0.10.0.1", #replacement OpenImageIO
+    "Pillow>=12.0.0",
     #"directxtex-decoder", #For DDS
 ]
 
