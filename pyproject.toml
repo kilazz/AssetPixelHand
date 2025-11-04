@@ -14,32 +14,32 @@ authors = [{ name = "kilazz"}]
 dependencies = [
     # Core Application & GUI
     "PySide6>=6.10.0",
-    "send2trash>=1.8.3",
     "pywin32>=311",
+    "send2trash>=1.8.3",
     # AI & Machine Learning
     "torch>=2.9.0",
     "transformers>=4.57.1",
     "onnx>=1.19.1",
     "sentencepiece>=0.2.1",
-    "huggingface_hub[hf_xet]>=0.36.0", #transformers
+    "huggingface_hub[hf_xet]>=0.36.0",  #transformers
     # Databases
-    "duckdb>=1.4.1",
     "lancedb>=0.25.2",
-    # Image & Data Handling
-    "scipy>=1.16.3",
-    "pandas>=2.3.3",
-    "pyarrow>=22.0.0",
+    "duckdb>=1.4.1",
+    # Image Processing
+    "Pillow>=12.0.0",
+    #"OpenImageIO>=3.1.7.0",
+    "oiio-python>=3.0.10.0.1", #replacement OpenImageIO
+    "pyvips>=3.0.0",
+    "pyvips-binary>=8.17.3",
+    #"directxtex-decoder", #for DDS
+    # Low-Level Data Handling & Utilities
     "numpy>=2.2.6", #oiio-python
+    "scipy>=1.16.3",
+    "pyarrow>=22.0.0",
+    "pandas>=2.3.3",
     "xxhash>=3.6.0",
     "ImageHash>=4.3.2",
     "zstandard>=0.25.0",
-    # Image Processing
-    "pyvips>=3.0.0",
-    "pyvips-binary>=8.17.3",
-    #"OpenImageIO>=3.1.7.0",
-    "oiio-python>=3.0.10.0.1", #replacement OpenImageIO
-    "Pillow>=12.0.0",
-    #"directxtex-decoder", #For DDS
 ]
 
 [project.optional-dependencies]
