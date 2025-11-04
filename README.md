@@ -23,7 +23,6 @@
 
 ## Requirements
 *   Python 3.13 ~
-*   Windows (for GPU acceleration via DirectML)
 
 ## Quick Start
 1.  Clone the repository.
