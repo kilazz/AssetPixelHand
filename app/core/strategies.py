@@ -88,7 +88,7 @@ METHOD_PRIORITY = {
     EvidenceMethod.UNKNOWN.value: 0,
 }
 
-PHASH_THRESHOLD = 3
+PHASH_THRESHOLD = 8
 MAX_CLUSTER_SIZE = 500
 
 
@@ -647,9 +647,7 @@ class FindDuplicatesStrategy(ScanStrategy):
         super().__init__(*args)
         self.all_image_fps: dict[Path, ImageFingerprint] = {}
         self.cluster_manager = PrecisionClusterManager()
-        self.hashing_runner = HashingStageRunner(
-            self.config, self.state, self.signals, self.cluster_manager, self.all_image_fps
-        )
+        self.hashing_runner: HashingStageRunner | None = None
 
     def execute(self, stop_event: threading.Event, start_time: float):
         """Execute the duplicate finding strategy."""
@@ -658,8 +656,13 @@ class FindDuplicatesStrategy(ScanStrategy):
             self._report_and_cleanup({}, start_time)
             return
 
-        self.all_image_fps = metadata_result.fingerprints
+        self.all_image_fps.update(metadata_result.fingerprints)
         self.all_skipped_files.extend(metadata_result.skipped_files)
+
+        self.hashing_runner = HashingStageRunner(
+            self.config, self.state, self.signals, self.cluster_manager, self.all_image_fps
+        )
+
         app_logger.info(f"Loaded metadata for {len(self.all_image_fps)} images.")
 
         files_for_ai = self._stage2_run_hashing_pipeline(stop_event)
