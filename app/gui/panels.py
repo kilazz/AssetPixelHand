@@ -318,19 +318,36 @@ class ScanOptionsPanel(QGroupBox):
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
+
+        hashing_grid = QGridLayout()
+        hashing_grid.setColumnStretch(1, 1)
+
         self.exact_duplicates_check = QCheckBox("First find exact duplicates (xxHash)")
 
         self.simple_duplicates_check = QCheckBox("Also find simple duplicates (dHash)")
         self.simple_duplicates_check.setToolTip(
-            "Very fast check for resized, re-formatted, or slightly edited images.\n"
-            "Recommended to keep enabled for best performance."
+            "Finds resized or re-formatted images. Threshold controls sensitivity (lower is stricter)."
         )
+        self.dhash_threshold_spin = QSpinBox()
+        self.dhash_threshold_spin.setRange(0, 64)
+        self.dhash_threshold_spin.setToolTip("dHash Threshold (Hamming distance). Default: 8")
 
         self.perceptual_duplicates_check = QCheckBox("Also find near-identical images (pHash)")
         self.perceptual_duplicates_check.setToolTip(
-            "Finds images that look the same but have different formats, sizes, or compression levels.\n"
-            "Slightly slower, but significantly reduces the number of files for AI processing."
+            "Finds visually identical images. Threshold controls sensitivity (lower is stricter)."
         )
+        self.phash_threshold_spin = QSpinBox()
+        self.phash_threshold_spin.setRange(0, 64)
+        self.phash_threshold_spin.setToolTip("pHash Threshold (Hamming distance). Default: 8")
+
+        hashing_grid.addWidget(self.exact_duplicates_check, 0, 0, 1, 3)
+        hashing_grid.addWidget(self.simple_duplicates_check, 1, 0, 1, 2)
+        hashing_grid.addWidget(self.dhash_threshold_spin, 1, 2)
+        hashing_grid.addWidget(self.perceptual_duplicates_check, 2, 0, 1, 2)
+        hashing_grid.addWidget(self.phash_threshold_spin, 2, 2)
+
+        layout.addLayout(hashing_grid)
+
         self.lancedb_in_memory_check = QCheckBox("Use in-memory database (fastest)")
         self.lancedb_in_memory_check.setToolTip(
             "Stores caches and vector index in RAM. Fastest, but not persistent across runs."
@@ -340,18 +357,14 @@ class ScanOptionsPanel(QGroupBox):
 
         visuals_layout = QHBoxLayout()
         self.save_visuals_check = QCheckBox("Save visuals")
-
         self.visuals_tonemap_check = QCheckBox("TM HDR")
         self.visuals_tonemap_check.setToolTip("Apply tonemapping to HDR images (e.g., EXR) in the saved visuals.")
-
         self.max_visuals_entry = QLineEdit()
         self.max_visuals_entry.setValidator(QIntValidator(0, 9999))
         self.max_visuals_entry.setFixedWidth(UIConfig.Sizes.MAX_VISUALS_ENTRY_WIDTH)
-
         self.visuals_columns_spinbox = QSpinBox()
         self.visuals_columns_spinbox.setRange(2, 12)
         self.visuals_columns_spinbox.setFixedWidth(UIConfig.Sizes.VISUALS_COLUMNS_SPINBOX_WIDTH)
-
         self.open_visuals_folder_button = QPushButton("📂")
         self.open_visuals_folder_button.setToolTip("Open visualizations folder")
         self.open_visuals_folder_button.setFixedWidth(UIConfig.Sizes.BROWSE_BUTTON_WIDTH)
@@ -359,51 +372,56 @@ class ScanOptionsPanel(QGroupBox):
         visuals_layout.addWidget(self.save_visuals_check)
         visuals_layout.addWidget(self.visuals_tonemap_check)
         visuals_layout.addStretch()
-
         visuals_layout.addWidget(QLabel("Cols:"))
         visuals_layout.addWidget(self.visuals_columns_spinbox)
-
         visuals_layout.addSpacing(5)
-
         visuals_layout.addWidget(QLabel("Max:"))
         visuals_layout.addWidget(self.max_visuals_entry)
-
         visuals_layout.addWidget(self.open_visuals_folder_button)
 
-        layout.addWidget(self.exact_duplicates_check)
-        layout.addWidget(self.simple_duplicates_check)
-        layout.addWidget(self.perceptual_duplicates_check)
         layout.addWidget(self.lancedb_in_memory_check)
         layout.addWidget(self.low_priority_check)
         layout.addLayout(visuals_layout)
 
+    def _connect_signals(self):
         self.exact_duplicates_check.toggled.connect(self._update_hashing_options_state)
         self.simple_duplicates_check.toggled.connect(self._update_hashing_options_state)
-        self._update_hashing_options_state(self.exact_duplicates_check.isChecked())
-
-    def _connect_signals(self):
+        self.perceptual_duplicates_check.toggled.connect(self._update_hashing_options_state)
         self.save_visuals_check.toggled.connect(self.toggle_visuals_option)
         self.open_visuals_folder_button.clicked.connect(self._open_visuals_folder)
+        self._update_hashing_options_state()
 
-    @Slot(bool)
-    def _update_hashing_options_state(self, is_checked: bool):
+    @Slot()
+    def _update_hashing_options_state(self):
         exact_enabled = self.exact_duplicates_check.isChecked()
-
         self.simple_duplicates_check.setEnabled(exact_enabled)
         self.perceptual_duplicates_check.setEnabled(exact_enabled)
+
+        self.dhash_threshold_spin.setEnabled(exact_enabled and self.simple_duplicates_check.isChecked())
+        self.phash_threshold_spin.setEnabled(exact_enabled and self.perceptual_duplicates_check.isChecked())
 
         if not exact_enabled:
             self.simple_duplicates_check.setChecked(False)
             self.perceptual_duplicates_check.setChecked(False)
 
     def toggle_visuals_option(self, is_checked):
-        visuals_layout_item = self.layout().itemAt(5)
-        if visuals_layout_item is None:
-            return
-        for i in range(1, visuals_layout_item.layout().count()):
-            widget = visuals_layout_item.layout().itemAt(i).widget()
-            if widget:
-                widget.setVisible(is_checked)
+        for i in range(self.layout().count()):
+            item = self.layout().itemAt(i)
+            if (
+                item
+                and item.layout()
+                and self.open_visuals_folder_button
+                in [
+                    item.layout().itemAt(j).widget()
+                    for j in range(item.layout().count())
+                    if item.layout().itemAt(j).widget()
+                ]
+            ):
+                for j in range(1, item.layout().count()):
+                    widget = item.layout().itemAt(j).widget()
+                    if widget:
+                        widget.setVisible(is_checked)
+                break
 
     @Slot()
     def _open_visuals_folder(self):
@@ -417,9 +435,14 @@ class ScanOptionsPanel(QGroupBox):
 
     def load_settings(self, s: AppSettings):
         self.exact_duplicates_check.setChecked(s.find_exact_duplicates)
-        self.simple_duplicates_check.setChecked(getattr(s, "find_simple_duplicates", True))
+        self.simple_duplicates_check.setChecked(s.find_simple_duplicates)
         self.perceptual_duplicates_check.setChecked(s.find_perceptual_duplicates)
-        self._update_hashing_options_state(s.find_exact_duplicates)
+
+        self.dhash_threshold_spin.setValue(getattr(s, "dhash_threshold", 8))
+        self.phash_threshold_spin.setValue(getattr(s, "phash_threshold", 8))
+
+        self._update_hashing_options_state()
+
         self.lancedb_in_memory_check.setChecked(s.lancedb_in_memory)
         self.low_priority_check.setChecked(s.perf_low_priority)
         self.save_visuals_check.setChecked(s.save_visuals)

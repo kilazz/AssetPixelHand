@@ -88,7 +88,7 @@ METHOD_PRIORITY = {
     EvidenceMethod.UNKNOWN.value: 0,
 }
 
-PHASH_THRESHOLD = 8
+PHASH_THRESHOLD = 3
 MAX_CLUSTER_SIZE = 500
 
 
@@ -367,14 +367,17 @@ class HashingStageRunner:
 
         hash_map = self._run_hashing_worker(worker_func, files, stop_event, ctx, config)
         if not hash_map or stop_event.is_set():
-            return []
+            return [] if stage_name == "xxhash" else files
 
+        reps = []
         for paths in hash_map.values():
+            rep = paths[0]
+            reps.append(rep)
             if len(paths) > 1:
                 for other_path in paths[1:]:
-                    self.cluster_manager.add_evidence(paths[0], other_path, evidence_method, 0.0)
+                    self.cluster_manager.add_evidence(rep, other_path, evidence_method, 0.0)
 
-        return [paths[0] for paths in hash_map.values()]
+        return reps
 
     def _run_phash_stage(
         self, files: list[Path], stop_event: threading.Event, ctx, config: HashingConfig

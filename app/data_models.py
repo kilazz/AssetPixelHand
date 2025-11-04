@@ -121,7 +121,9 @@ class ScanConfig:
     device: str
     find_exact_duplicates: bool
     find_simple_duplicates: bool
+    dhash_threshold: int
     find_perceptual_duplicates: bool
+    phash_threshold: int
     lancedb_in_memory: bool
     visuals_columns: int
     tonemap_visuals: bool
@@ -147,7 +149,9 @@ class AppSettings:
     selected_extensions: list[str] = field(default_factory=list)
     find_exact_duplicates: bool = True
     find_simple_duplicates: bool = True
+    dhash_threshold: int = 8
     find_perceptual_duplicates: bool = True
+    phash_threshold: int = 8
     perf_num_workers: str = "4"
     perf_low_priority: bool = True
     perf_batch_size: str = "256"
@@ -209,7 +213,9 @@ class AppSettings:
         # Scan & Output Options
         self.find_exact_duplicates = scan_options_panel.exact_duplicates_check.isChecked()
         self.find_simple_duplicates = scan_options_panel.simple_duplicates_check.isChecked()
+        self.dhash_threshold = scan_options_panel.dhash_threshold_spin.value()
         self.find_perceptual_duplicates = scan_options_panel.perceptual_duplicates_check.isChecked()
+        self.phash_threshold = scan_options_panel.phash_threshold_spin.value()
         self.lancedb_in_memory = scan_options_panel.lancedb_in_memory_check.isChecked()
         self.perf_low_priority = scan_options_panel.low_priority_check.isChecked()
         self.save_visuals = scan_options_panel.save_visuals_check.isChecked()
