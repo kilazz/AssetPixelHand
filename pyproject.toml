@@ -21,7 +21,7 @@ dependencies = [
     "transformers>=4.57.1",
     "onnx>=1.19.1",
     "sentencepiece>=0.2.1",
-    "huggingface_hub[hf_xet]>=0.36.0",  #transformers
+    "huggingface_hub[hf_xet]>=0.36.0", #transformers
     # Databases
     "lancedb>=0.25.2",
     "duckdb>=1.4.1",
@@ -32,7 +32,7 @@ dependencies = [
     "pyvips>=3.0.0",
     "pyvips-binary>=8.17.3",
     #"directxtex-decoder", #for DDS
-    # Low-Level Data Handling & Utilities
+    # Data Handling & Utilities
     "numpy>=2.2.6", #oiio-python
     "scipy>=1.16.3",
     "pyarrow>=22.0.0",
