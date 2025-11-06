@@ -4,6 +4,7 @@ import os
 import sys
 from enum import Enum
 from pathlib import Path
+from typing import ClassVar
 
 from PIL import Image
 
@@ -169,6 +170,10 @@ class UIConfig:
         PREVIEW_MIN_SIZE = 100
         PREVIEW_MAX_SIZE = 500
 
+    class ResultsView:
+        HEADERS: ClassVar[list[str]] = ["File", "Score", "Path", "Metadata"]
+        SORT_OPTIONS: ClassVar[list[str]] = ["By Duplicate Count", "By Size on Disk", "By Filename"]
+
 
 # --- Search Configuration ---
 SEARCH_PRECISION_PRESETS = {
@@ -190,3 +195,16 @@ class CompareMode(Enum):
 class QuantizationMode(Enum):
     FP32 = "FP32 (Max Accuracy)"
     FP16 = "FP16 (Recommended)"
+
+
+# --- Data Model & UI Constants ---
+
+# Display names for evidence methods in the results view
+METHOD_DISPLAY_NAMES = {
+    "xxHash": "Exact Match",
+    "dHash": "Simple Match",
+    "pHash": "Near-Identical",
+}
+
+# Key used to identify group nodes in the results tree model
+NODE_TYPE_GROUP = "group"

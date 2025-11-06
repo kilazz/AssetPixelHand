@@ -27,6 +27,7 @@ class ScanConfigBuilder:
         self.opts = options_panel
         self.perf = performance_panel
         self.scan_opts = scan_options_panel
+        self.settings = options_panel.settings
 
     def build(self) -> ScanConfig:
         """Constructs and validates a ScanConfig object based on the current UI state."""
@@ -45,18 +46,18 @@ class ScanConfigBuilder:
             model_info=model_info,
             selected_extensions=self.opts.selected_extensions,
             scan_mode=self.opts.current_scan_mode,
-            device=self.perf.device_combo.currentData(),
-            find_exact_duplicates=self.scan_opts.exact_duplicates_check.isChecked(),
-            find_simple_duplicates=self.scan_opts.simple_duplicates_check.isChecked(),
-            dhash_threshold=self.scan_opts.dhash_threshold_spin.value(),
-            find_perceptual_duplicates=self.scan_opts.perceptual_duplicates_check.isChecked(),
-            phash_threshold=self.scan_opts.phash_threshold_spin.value(),
-            lancedb_in_memory=self.scan_opts.lancedb_in_memory_check.isChecked(),
-            save_visuals=self.scan_opts.save_visuals_check.isChecked(),
-            max_visuals=int(self.scan_opts.max_visuals_entry.text()),
-            visuals_columns=self.scan_opts.visuals_columns_spinbox.value(),
-            tonemap_visuals=self.scan_opts.visuals_tonemap_check.isChecked(),
-            search_precision=self.perf.search_precision_combo.currentText(),
+            device=self.settings.performance.device,
+            find_exact_duplicates=self.settings.hashing.find_exact,
+            find_simple_duplicates=self.settings.hashing.find_simple,
+            dhash_threshold=self.settings.hashing.dhash_threshold,
+            find_perceptual_duplicates=self.settings.hashing.find_perceptual,
+            phash_threshold=self.settings.hashing.phash_threshold,
+            lancedb_in_memory=self.settings.lancedb_in_memory,
+            save_visuals=self.settings.visuals.save,
+            max_visuals=int(self.settings.visuals.max_count),
+            visuals_columns=self.settings.visuals.columns,
+            tonemap_visuals=self.settings.visuals.tonemap_enabled,
+            search_precision=self.settings.performance.search_precision,
             search_query=self.opts.search_entry.text() if self.opts.current_scan_mode == ScanMode.TEXT_SEARCH else None,
             sample_path=self.opts._sample_path,
             perf=performance_config,
@@ -94,16 +95,16 @@ class ScanConfigBuilder:
     def _build_performance_config(self) -> PerformanceConfig:
         """Constructs the PerformanceConfig dataclass from UI settings."""
         try:
-            batch_size = int(self.perf.batch_size_spin.text())
+            batch_size = int(self.settings.performance.batch_size)
             if batch_size <= 0:
                 raise ValueError
         except ValueError:
             raise ValueError("Batch size must be a positive integer.") from None
 
-        num_workers = self.perf.num_workers_spin.value()
+        num_workers = int(self.settings.performance.num_workers)
 
         return PerformanceConfig(
             num_workers=num_workers,
-            run_at_low_priority=self.scan_opts.low_priority_check.isChecked(),
+            run_at_low_priority=self.settings.performance.low_priority,
             batch_size=batch_size,
         )

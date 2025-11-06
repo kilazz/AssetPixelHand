@@ -24,7 +24,7 @@ from app.constants import (
 )
 
 if TYPE_CHECKING:
-    from app.gui.panels import ImageViewerPanel, OptionsPanel, PerformancePanel, ScanOptionsPanel
+    pass
 
 
 class ScanMode(Enum):
@@ -133,6 +133,41 @@ class ScanConfig:
 
 
 @dataclass
+class HashingSettings:
+    find_exact: bool = True
+    find_simple: bool = True
+    dhash_threshold: int = 8
+    find_perceptual: bool = True
+    phash_threshold: int = 8
+
+
+@dataclass
+class PerformanceSettings:
+    num_workers: str = "4"
+    batch_size: str = "256"
+    low_priority: bool = True
+    search_precision: str = DEFAULT_SEARCH_PRECISION
+    device: str = "CPU"
+    quantization_mode: str = QuantizationMode.FP16.value
+
+
+@dataclass
+class VisualsSettings:
+    save: bool = False
+    max_count: str = "100"
+    columns: int = 6
+    tonemap_enabled: bool = False
+
+
+@dataclass
+class ViewerSettings:
+    preview_size: int = 250
+    show_transparency: bool = True
+    thumbnail_tonemap_enabled: bool = False
+    compare_tonemap_enabled: bool = False
+
+
+@dataclass
 class AppSettings:
     """Represents the application's user-configurable settings, persisted to a JSON file."""
 
@@ -140,28 +175,14 @@ class AppSettings:
     threshold: str = "95"
     exclude: str = ""
     model_key: str = "Fastest (OpenCLIP ViT-B/32)"
-    save_visuals: bool = False
-    max_visuals: str = "100"
-    visuals_columns: int = 6
-    visuals_tonemap_enabled: bool = False
-    preview_size: int = 250
-    show_transparency: bool = True
     selected_extensions: list[str] = field(default_factory=list)
-    find_exact_duplicates: bool = True
-    find_simple_duplicates: bool = True
-    dhash_threshold: int = 8
-    find_perceptual_duplicates: bool = True
-    phash_threshold: int = 8
-    perf_num_workers: str = "4"
-    perf_low_priority: bool = True
-    perf_batch_size: str = "256"
     lancedb_in_memory: bool = True
-    search_precision: str = DEFAULT_SEARCH_PRECISION
-    device: str = "CPU"
-    quantization_mode: str = QuantizationMode.FP16.value
     theme: str = "Dark"
-    thumbnail_tonemap_enabled: bool = False
-    compare_tonemap_enabled: bool = False
+
+    hashing: HashingSettings = field(default_factory=HashingSettings)
+    performance: PerformanceSettings = field(default_factory=PerformanceSettings)
+    visuals: VisualsSettings = field(default_factory=VisualsSettings)
+    viewer: ViewerSettings = field(default_factory=ViewerSettings)
 
     @classmethod
     def load(cls) -> "AppSettings":
@@ -171,18 +192,54 @@ class AppSettings:
         try:
             with open(CONFIG_FILE, encoding="utf-8") as f:
                 data = json.load(f)
-            settings = cls()
-            if "perf_model_workers" in data or "perf_gpu_preproc_workers" in data:
-                num_workers = data.get("perf_model_workers", data.get("perf_gpu_preproc_workers", "4"))
-                data["perf_num_workers"] = num_workers
-                if "perf_model_workers" in data:
-                    del data["perf_model_workers"]
-                if "perf_gpu_preproc_workers" in data:
-                    del data["perf_gpu_preproc_workers"]
 
+            # --- Backward Compatibility: Handle old flat format ---
+            if "find_exact_duplicates" in data:
+                data["hashing"] = {
+                    "find_exact": data.pop("find_exact_duplicates", True),
+                    "find_simple": data.pop("find_simple_duplicates", True),
+                    "dhash_threshold": data.pop("dhash_threshold", 8),
+                    "find_perceptual": data.pop("find_perceptual_duplicates", True),
+                    "phash_threshold": data.pop("phash_threshold", 8),
+                }
+            if "perf_num_workers" in data:
+                data["performance"] = {
+                    "num_workers": data.pop("perf_num_workers", "4"),
+                    "batch_size": data.pop("perf_batch_size", "256"),
+                    "low_priority": data.pop("perf_low_priority", True),
+                    "search_precision": data.pop("search_precision", DEFAULT_SEARCH_PRECISION),
+                    "device": data.pop("device", "CPU"),
+                    "quantization_mode": data.pop("quantization_mode", QuantizationMode.FP16.value),
+                }
+            if "save_visuals" in data:
+                data["visuals"] = {
+                    "save": data.pop("save_visuals", False),
+                    "max_count": data.pop("max_visuals", "100"),
+                    "columns": data.pop("visuals_columns", 6),
+                    "tonemap_enabled": data.pop("visuals_tonemap_enabled", False),
+                }
+            if "preview_size" in data:
+                data["viewer"] = {
+                    "preview_size": data.pop("preview_size", 250),
+                    "show_transparency": data.pop("show_transparency", True),
+                    "thumbnail_tonemap_enabled": data.pop("thumbnail_tonemap_enabled", False),
+                    "compare_tonemap_enabled": data.pop("compare_tonemap_enabled", False),
+                }
+
+            # --- Load into nested structure ---
+            settings = cls()
             for key, value in data.items():
                 if hasattr(settings, key):
-                    setattr(settings, key, value)
+                    # If the attribute is a dataclass, update its fields from the dict
+                    if isinstance(
+                        getattr(settings, key), (HashingSettings, PerformanceSettings, VisualsSettings, ViewerSettings)
+                    ):
+                        nested_obj = getattr(settings, key)
+                        for nested_key, nested_value in value.items():
+                            if hasattr(nested_obj, nested_key):
+                                setattr(nested_obj, nested_key, nested_value)
+                    else:
+                        setattr(settings, key, value)
 
             if not settings.selected_extensions:
                 settings.selected_extensions = list(ALL_SUPPORTED_EXTENSIONS)
@@ -195,53 +252,13 @@ class AppSettings:
             print(f"Warning: Could not load settings file, using defaults. Error: {e}")
             return cls(selected_extensions=list(ALL_SUPPORTED_EXTENSIONS), folder_path=str(SCRIPT_DIR))
 
-    def save(
-        self,
-        options_panel: "OptionsPanel",
-        performance_panel: "PerformancePanel",
-        scan_options_panel: "ScanOptionsPanel",
-        viewer_panel: "ImageViewerPanel",
-    ):
-        """Updates settings directly from the UI panels and serializes them to JSON."""
-        # Main Options
-        self.folder_path = options_panel.folder_path_entry.text()
-        self.threshold = str(options_panel.threshold_spinbox.value())
-        self.exclude = options_panel.exclude_entry.text()
-        self.model_key = options_panel.model_combo.currentText()
-        self.selected_extensions = options_panel.selected_extensions
-
-        # Scan & Output Options
-        self.find_exact_duplicates = scan_options_panel.exact_duplicates_check.isChecked()
-        self.find_simple_duplicates = scan_options_panel.simple_duplicates_check.isChecked()
-        self.dhash_threshold = scan_options_panel.dhash_threshold_spin.value()
-        self.find_perceptual_duplicates = scan_options_panel.perceptual_duplicates_check.isChecked()
-        self.phash_threshold = scan_options_panel.phash_threshold_spin.value()
-        self.lancedb_in_memory = scan_options_panel.lancedb_in_memory_check.isChecked()
-        self.perf_low_priority = scan_options_panel.low_priority_check.isChecked()
-        self.save_visuals = scan_options_panel.save_visuals_check.isChecked()
-        self.visuals_tonemap_enabled = scan_options_panel.visuals_tonemap_check.isChecked()
-        self.max_visuals = scan_options_panel.max_visuals_entry.text()
-        self.visuals_columns = scan_options_panel.visuals_columns_spinbox.value()
-
-        # Performance & AI Model
-        self.perf_num_workers = performance_panel.num_workers_spin.text()
-        self.perf_batch_size = performance_panel.batch_size_spin.text()
-        self.search_precision = performance_panel.search_precision_combo.currentText()
-        self.device = performance_panel.device_combo.currentText()
-        self.quantization_mode = performance_panel.quant_combo.currentText()
-
-        # Viewer Panel
-        self.preview_size = viewer_panel.preview_size_slider.value()
-        self.show_transparency = viewer_panel.bg_alpha_check.isChecked()
-        self.thumbnail_tonemap_enabled = viewer_panel.thumbnail_tonemap_check.isChecked()
-        self.compare_tonemap_enabled = viewer_panel.compare_tonemap_check.isChecked()
-
-        # The theme is set separately in the main window
-        # self.theme is already up-to-date.
-
+    def save(self):
+        """Serializes the current settings state to a JSON file."""
         try:
+            # Create a dictionary representation of the dataclass, including nested ones
+            data_to_save = {k: v.__dict__ if hasattr(v, "__dict__") else v for k, v in self.__dict__.items()}
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.__dict__, f, indent=4)
+                json.dump(data_to_save, f, indent=4)
         except OSError as e:
             print(f"Error: Could not save settings to {CONFIG_FILE}: {e}")
 

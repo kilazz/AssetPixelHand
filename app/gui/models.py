@@ -22,7 +22,12 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QImage, QPen, QPixmap
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate
 
-from app.constants import DUCKDB_AVAILABLE, UIConfig
+from app.constants import (
+    DUCKDB_AVAILABLE,
+    METHOD_DISPLAY_NAMES,
+    NODE_TYPE_GROUP,
+    UIConfig,
+)
 from app.data_models import ScanMode
 from app.utils import find_common_base_name
 
@@ -123,7 +128,7 @@ class ResultsTreeModel(QAbstractItemModel):
                         elif search_context.startswith("query:"):
                             group_name = f"Query: '{search_context.split(':', 1)[1]}'"
                     self.groups_data[group_id] = {
-                        "type": "group",
+                        "type": NODE_TYPE_GROUP,
                         "name": group_name,
                         "count": count,
                         "total_size": total_size,
@@ -140,7 +145,7 @@ class ResultsTreeModel(QAbstractItemModel):
         if not parent.isValid():
             return len(self.sorted_group_ids)
         node = parent.internalPointer()
-        return len(node.get("children", [])) if node and node.get("type") == "group" else 0
+        return len(node.get("children", [])) if node and node.get("type") == NODE_TYPE_GROUP else 0
 
     def columnCount(self, parent: QModelIndex | None = None) -> int:
         return 4
@@ -149,7 +154,7 @@ class ResultsTreeModel(QAbstractItemModel):
         if not index.isValid():
             return QModelIndex()
         node = index.internalPointer()
-        if not node or node.get("type") == "group":
+        if not node or node.get("type") == NODE_TYPE_GROUP:
             return QModelIndex()
         if (group_id := node.get("group_id")) and group_id in self.sorted_group_ids:
             return self.createIndex(self.sorted_group_ids.index(group_id), 0, self.groups_data[group_id])
@@ -173,13 +178,13 @@ class ResultsTreeModel(QAbstractItemModel):
         if not parent.isValid():
             return bool(self.groups_data)
         node = parent.internalPointer()
-        return node and node.get("type") == "group" and node.get("count", 0) > 0
+        return node and node.get("type") == NODE_TYPE_GROUP and node.get("count", 0) > 0
 
     def canFetchMore(self, parent):
         if not parent.isValid():
             return False
         node = parent.internalPointer()
-        if not node or node.get("type") != "group":
+        if not node or node.get("type") != NODE_TYPE_GROUP:
             return False
         return not node.get("fetched") and node.get("group_id") not in self.running_tasks
 
@@ -236,18 +241,32 @@ class ResultsTreeModel(QAbstractItemModel):
         if role == Qt.ItemDataRole.DisplayRole:
             return self._get_display_data(index, node)
 
-        if (
-            role == Qt.ItemDataRole.CheckStateRole
-            and index.column() == 0
-            and self.hasChildren()
-            and node.get("type") != "group"
-        ):
-            return self.check_states.get(node["path"], Qt.CheckState.Unchecked)
+        if role == Qt.ItemDataRole.CheckStateRole and index.column() == 0 and self.hasChildren():
+            if node.get("type") == NODE_TYPE_GROUP:
+                if not node.get("fetched"):
+                    return Qt.CheckState.Unchecked
+
+                children = node.get("children", [])
+                if not children:
+                    return Qt.CheckState.Unchecked
+
+                checked_count = sum(
+                    1 for child in children if self.check_states.get(child["path"]) == Qt.CheckState.Checked
+                )
+
+                if checked_count == 0:
+                    return Qt.CheckState.Unchecked
+                elif checked_count == len(children):
+                    return Qt.CheckState.Checked
+                else:
+                    return Qt.CheckState.PartiallyChecked
+            else:
+                return self.check_states.get(node["path"], Qt.CheckState.Unchecked)
 
         if (
             role == Qt.ItemDataRole.FontRole
             and index.column() == 0
-            and (node.get("type") == "group" or node.get("is_best"))
+            and (node.get("type") == NODE_TYPE_GROUP or node.get("is_best"))
         ):
             font = QFont()
             font.setBold(True)
@@ -259,7 +278,7 @@ class ResultsTreeModel(QAbstractItemModel):
         return None
 
     def _get_display_data(self, index, node):
-        if node.get("type") == "group":
+        if node.get("type") == NODE_TYPE_GROUP:
             name, count = node["name"], node["count"]
             is_search = self.mode in [ScanMode.TEXT_SEARCH, ScanMode.SAMPLE_SEARCH]
             display_text = f"{name} ({count} results)" if is_search else f"Group: {name} ({count} duplicates)"
@@ -271,11 +290,10 @@ class ResultsTreeModel(QAbstractItemModel):
         if col == 0:
             return path.name
         elif col == 1:
-            method_map = {"xxHash": "Exact Match", "dHash": "Simple Match", "pHash": "Near-Identical"}
+            method_map = METHOD_DISPLAY_NAMES
             method = node.get("found_by")
             if display_text := method_map.get(method):
                 return display_text
-
             dist = node.get("distance", -1)
             return f"{dist}%" if dist >= 0 else ""
         elif col == 2:
@@ -284,36 +302,63 @@ class ResultsTreeModel(QAbstractItemModel):
             res = f"{node.get('resolution_w', 0)}x{node.get('resolution_h', 0)}"
             size_mb = node.get("file_size", 0) / (1024**2)
             return f"{res} | {node.get('bit_depth', 8)}-bit | {size_mb:.2f} MB | {node.get('format_details', '')}"
-
         return ""
 
     def setData(self, index, value, role):
-        if (
-            role == Qt.ItemDataRole.CheckStateRole
-            and index.column() == 0
-            and self.hasChildren()
-            and (node := index.internalPointer())
-            and node.get("type") != "group"
-        ):
-            self.check_states[node["path"]] = Qt.CheckState(value)
-            self.dataChanged.emit(index, index, [role])
-            return True
-        return False
+        if not (role == Qt.ItemDataRole.CheckStateRole and index.column() == 0):
+            return super().setData(index, value, role)
+
+        node = index.internalPointer()
+        if not node:
+            return False
+
+        new_check_state = Qt.CheckState(value)
+
+        if node.get("type") == NODE_TYPE_GROUP:
+            state_to_apply = new_check_state
+            if state_to_apply == Qt.CheckState.PartiallyChecked:
+                state_to_apply = Qt.CheckState.Checked
+
+            if node.get("fetched"):
+                # Group is expanded, apply state directly to existing children
+                children = node.get("children", [])
+                for child in children:
+                    self.check_states[child["path"]] = state_to_apply
+                if children:
+                    first_child_idx = self.index(0, 0, index)
+                    last_child_idx = self.index(len(children) - 1, 0, index)
+                    self.dataChanged.emit(first_child_idx, last_child_idx, [Qt.ItemDataRole.CheckStateRole])
+            else:
+
+                def apply_state_after_fetch(parent_index: QModelIndex):
+                    if parent_index == index:
+                        # Re-call setData now that children are fetched. It will enter the "fetched" branch.
+                        self.setData(index, value, role)
+                        self.fetch_completed.disconnect(apply_state_after_fetch)
+
+                self.fetch_completed.connect(apply_state_after_fetch)
+                self.fetchMore(index)
+
+        else:
+            self.check_states[node["path"]] = new_check_state
+            parent_index = self.parent(index)
+            if parent_index.isValid():
+                self.dataChanged.emit(parent_index, parent_index, [Qt.ItemDataRole.CheckStateRole])
+
+        self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole])
+        return True
 
     def flags(self, index):
         flags = super().flags(index)
-        if (
-            index.isValid()
-            and index.column() == 0
-            and self.hasChildren()
-            and index.internalPointer().get("type") != "group"
-        ):
-            flags |= Qt.ItemFlag.ItemIsUserCheckable
+        if index.isValid() and index.column() == 0 and self.hasChildren():
+            node = index.internalPointer()
+            if node:
+                flags |= Qt.ItemFlag.ItemIsUserCheckable
         return flags
 
     def headerData(self, section, orientation, role):
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return ["File", "Score", "Path", "Metadata"][section]
+            return UIConfig.ResultsView.HEADERS[section]
         return None
 
     def sort_results(self, sort_key: str):
@@ -698,7 +743,7 @@ class SimilarityFilterProxyModel(QSortFilterProxyModel):
             return False
 
         node = source_index.internalPointer()
-        if not node or node.get("type") == "group":
+        if not node or node.get("type") == NODE_TYPE_GROUP:
             return True
 
         method = node.get("found_by")

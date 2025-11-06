@@ -229,7 +229,7 @@ class App(QMainWindow):
         self.performance_panel.device_changed.connect(self._update_low_priority_option)
 
         # Results and Viewer Panel Signals
-        self.results_panel.selection_in_group_changed.connect(self.viewer_panel.show_image_group)
+        self.results_panel.results_view.selectionModel().selectionChanged.connect(self._on_results_selection_changed)
         self.results_panel.visible_results_changed.connect(self.viewer_panel.display_results)
         self.results_panel.results_view.customContextMenuRequested.connect(self._show_results_context_menu)
         self.viewer_panel.list_view.customContextMenuRequested.connect(self._show_viewer_context_menu)
@@ -287,6 +287,30 @@ class App(QMainWindow):
         viewer.bg_alpha_check.toggled.connect(self._request_settings_save)
         viewer.thumbnail_tonemap_check.toggled.connect(self._request_settings_save)
         viewer.compare_tonemap_check.toggled.connect(self._request_settings_save)
+
+    @Slot()
+    def _on_results_selection_changed(self):
+        proxy_indexes = self.results_panel.results_view.selectionModel().selectedRows()
+        if not proxy_indexes:
+            return
+
+        results_model = self.results_panel.results_model
+        if not results_model.db_path:
+            return
+
+        source_index = self.results_panel.proxy_model.mapToSource(proxy_indexes[0])
+        if not source_index.isValid():
+            return
+
+        node = source_index.internalPointer()
+        if not node:
+            return
+
+        if results_model.mode == ScanMode.DUPLICATES:
+            group_id = node.get("group_id", -1)
+            scroll_to_path = Path(node["path"]) if node.get("type") != "group" else None
+            if group_id != -1:
+                self.viewer_panel.show_image_group(results_model.db_path, group_id, scroll_to_path)
 
     @Slot()
     def _request_settings_save(self):
@@ -572,7 +596,13 @@ class App(QMainWindow):
                 app_logger.error(f"Could not open path '{path}': {e}")
 
     def _save_settings(self):
-        self.settings.save(self.options_panel, self.performance_panel, self.scan_options_panel, self.viewer_panel)
+        # 1. Update the settings object with the current state of all UI panels
+        self.options_panel.update_settings(self.settings)
+        self.scan_options_panel.update_settings(self.settings)
+        self.performance_panel.update_settings(self.settings)
+        self.viewer_panel.update_settings(self.settings)
+        # 2. Save the updated object to the file
+        self.settings.save()
 
     @Slot(bool)
     def _update_low_priority_option(self, is_cpu: bool):

@@ -305,6 +305,13 @@ class OptionsPanel(QGroupBox):
         self.exclude_entry.setText(s.exclude)
         self.model_combo.setCurrentText(s.model_key)
 
+    def update_settings(self, s: AppSettings):
+        s.folder_path = self.folder_path_entry.text()
+        s.threshold = str(self.threshold_spinbox.value())
+        s.exclude = self.exclude_entry.text()
+        s.model_key = self.model_combo.currentText()
+        s.selected_extensions = self.selected_extensions
+
 
 class ScanOptionsPanel(QGroupBox):
     """Panel for secondary scan options and output settings."""
@@ -434,22 +441,36 @@ class ScanOptionsPanel(QGroupBox):
             QMessageBox.warning(self, "Error", f"Could not open folder: {e}")
 
     def load_settings(self, s: AppSettings):
-        self.exact_duplicates_check.setChecked(s.find_exact_duplicates)
-        self.simple_duplicates_check.setChecked(s.find_simple_duplicates)
-        self.perceptual_duplicates_check.setChecked(s.find_perceptual_duplicates)
-
-        self.dhash_threshold_spin.setValue(getattr(s, "dhash_threshold", 8))
-        self.phash_threshold_spin.setValue(getattr(s, "phash_threshold", 8))
-
+        self.exact_duplicates_check.setChecked(s.hashing.find_exact)
+        self.simple_duplicates_check.setChecked(s.hashing.find_simple)
+        self.perceptual_duplicates_check.setChecked(s.hashing.find_perceptual)
+        self.dhash_threshold_spin.setValue(s.hashing.dhash_threshold)
+        self.phash_threshold_spin.setValue(s.hashing.phash_threshold)
         self._update_hashing_options_state()
 
         self.lancedb_in_memory_check.setChecked(s.lancedb_in_memory)
-        self.low_priority_check.setChecked(s.perf_low_priority)
-        self.save_visuals_check.setChecked(s.save_visuals)
-        self.visuals_tonemap_check.setChecked(getattr(s, "visuals_tonemap_enabled", False))
-        self.max_visuals_entry.setText(s.max_visuals)
-        self.visuals_columns_spinbox.setValue(s.visuals_columns)
-        self.toggle_visuals_option(s.save_visuals)
+        self.low_priority_check.setChecked(s.performance.low_priority)
+
+        self.save_visuals_check.setChecked(s.visuals.save)
+        self.visuals_tonemap_check.setChecked(s.visuals.tonemap_enabled)
+        self.max_visuals_entry.setText(s.visuals.max_count)
+        self.visuals_columns_spinbox.setValue(s.visuals.columns)
+        self.toggle_visuals_option(s.visuals.save)
+
+    def update_settings(self, s: AppSettings):
+        s.hashing.find_exact = self.exact_duplicates_check.isChecked()
+        s.hashing.find_simple = self.simple_duplicates_check.isChecked()
+        s.hashing.find_perceptual = self.perceptual_duplicates_check.isChecked()
+        s.hashing.dhash_threshold = self.dhash_threshold_spin.value()
+        s.hashing.phash_threshold = self.phash_threshold_spin.value()
+
+        s.lancedb_in_memory = self.lancedb_in_memory_check.isChecked()
+        s.performance.low_priority = self.low_priority_check.isChecked()
+
+        s.visuals.save = self.save_visuals_check.isChecked()
+        s.visuals.tonemap_enabled = self.visuals_tonemap_check.isChecked()
+        s.visuals.max_count = self.max_visuals_entry.text()
+        s.visuals.columns = self.visuals_columns_spinbox.value()
 
 
 class PerformancePanel(QGroupBox):
@@ -519,7 +540,7 @@ class PerformancePanel(QGroupBox):
         presets = list(SEARCH_PRECISION_PRESETS.keys())
         self.search_precision_combo.addItems(presets)
 
-        current_setting = self.settings.search_precision
+        current_setting = self.settings.performance.search_precision
         if current_setting in presets:
             self.search_precision_combo.setCurrentText(current_setting)
         else:
@@ -534,10 +555,18 @@ class PerformancePanel(QGroupBox):
         )
 
     def load_settings(self, s: AppSettings):
-        self.quant_combo.setCurrentText(s.quantization_mode)
-        self.batch_size_spin.setValue(int(s.perf_batch_size))
-        self.search_precision_combo.setCurrentText(s.search_precision)
-        self.num_workers_spin.setValue(int(s.perf_num_workers))
+        self.device_combo.setCurrentText(s.performance.device)
+        self.quant_combo.setCurrentText(s.performance.quantization_mode)
+        self.batch_size_spin.setValue(int(s.performance.batch_size))
+        self.search_precision_combo.setCurrentText(s.performance.search_precision)
+        self.num_workers_spin.setValue(int(s.performance.num_workers))
+
+    def update_settings(self, s: AppSettings):
+        s.performance.device = self.device_combo.currentText()
+        s.performance.quantization_mode = self.quant_combo.currentText()
+        s.performance.batch_size = self.batch_size_spin.text()
+        s.performance.search_precision = self.search_precision_combo.currentText()
+        s.performance.num_workers = self.num_workers_spin.text()
 
 
 class SystemStatusPanel(QGroupBox):
@@ -601,14 +630,10 @@ class ResultsPanel(QGroupBox):
     deletion_requested = Signal(list)
     hardlink_requested = Signal(list)
     reflink_requested = Signal(list)
-    selection_in_group_changed = Signal(Path, int, object)
     visible_results_changed = Signal(list)
 
     def __init__(self):
         super().__init__("Results")
-        self.selection_timer = QTimer(self)
-        self.selection_timer.setSingleShot(True)
-        self.selection_timer.setInterval(150)
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
         self.search_timer.setInterval(300)
@@ -659,7 +684,7 @@ class ResultsPanel(QGroupBox):
         self.expand_button = QPushButton("Expand All")
         self.collapse_button = QPushButton("Collapse All")
         self.sort_combo = QComboBox()
-        self.sort_combo.addItems(["By Duplicate Count", "By Size on Disk", "By Filename"])
+        self.sort_combo.addItems(UIConfig.ResultsView.SORT_OPTIONS)
         top_controls_layout.addWidget(self.expand_button)
         top_controls_layout.addWidget(self.collapse_button)
         top_controls_layout.addWidget(self.sort_combo)
@@ -701,8 +726,6 @@ class ResultsPanel(QGroupBox):
         self.delete_button.clicked.connect(self._request_deletion)
         self.hardlink_button.clicked.connect(self._request_hardlink)
         self.reflink_button.clicked.connect(self._request_reflink)
-        self.results_view.selectionModel().selectionChanged.connect(self.selection_timer.start)
-        self.selection_timer.timeout.connect(self._process_selection)
         self.expand_button.clicked.connect(self.results_view.expandAll)
         self.collapse_button.clicked.connect(self.results_view.collapseAll)
         self.search_entry.textChanged.connect(self.search_timer.start)
@@ -833,35 +856,22 @@ class ResultsPanel(QGroupBox):
         else:
             self.visible_results_changed.emit([])
 
-    @Slot()
-    def _process_selection(self):
-        proxy_indexes = self.results_view.selectionModel().selectedRows()
-        if not (proxy_indexes and self.results_model.db_path):
-            return
-
-        source_index = self.proxy_model.mapToSource(proxy_indexes[0])
-        if not source_index.isValid():
-            return
-
-        node = source_index.internalPointer()
-        if not node:
-            return
-
-        if self.results_model.mode == ScanMode.DUPLICATES:
-            group_id = node.get("group_id", -1)
-            scroll_to_path = Path(node["path"]) if node.get("type") != "group" else None
-            if group_id != -1:
-                self.selection_in_group_changed.emit(self.results_model.db_path, group_id, scroll_to_path)
-
     def _request_deletion(self):
         to_move = self.results_model.get_checked_paths()
         if not to_move:
             QMessageBox.warning(self, "No Selection", "No files selected to move.")
             return
-        if (
-            QMessageBox.question(self, "Confirm Move", f"Move {len(to_move)} files to the system trash?")
-            == QMessageBox.StandardButton.Yes
-        ):
+
+        affected_group_ids = {self.results_model.path_to_group_id.get(str(p)) for p in to_move}
+        affected_group_ids.discard(None)
+
+        group_count = len(affected_group_ids)
+        file_count = len(to_move)
+
+        group_str = "group" if group_count == 1 else "groups"
+        msg = f"Move {file_count} files from {group_count} {group_str} to the system trash?"
+
+        if QMessageBox.question(self, "Confirm Move", msg) == QMessageBox.StandardButton.Yes:
             self.set_operation_in_progress(FileOperation.DELETING)
             self.deletion_requested.emit(to_move)
 
@@ -958,7 +968,7 @@ class ImageViewerPanel(QGroupBox):
         self.settings = settings
         self.thread_pool = thread_pool
         self.state = ImageComparerState(thread_pool)
-        self.is_transparency_enabled = settings.show_transparency
+        self.is_transparency_enabled = settings.viewer.show_transparency
         self.update_timer = QTimer(self)
         self.update_timer.setSingleShot(True)
         self.update_timer.setInterval(150)
@@ -1006,7 +1016,7 @@ class ImageViewerPanel(QGroupBox):
         self.compare_button = QPushButton("Compare (0)")
         parent_layout.addWidget(self.compare_button)
         self.model = ImagePreviewModel(self.thread_pool, self)
-        self.delegate = ImageItemDelegate(self.settings.preview_size, self.state, self)
+        self.delegate = ImageItemDelegate(self.settings.viewer.preview_size, self.state, self)
         self.list_view = ResizedListView(self)
         self.list_view.setModel(self.model)
         self.list_view.setItemDelegate(self.delegate)
@@ -1111,11 +1121,17 @@ class ImageViewerPanel(QGroupBox):
             self._show_comparison_view()
 
     def load_settings(self, settings: AppSettings):
-        self.preview_size_slider.setValue(settings.preview_size)
-        self.bg_alpha_check.setChecked(settings.show_transparency)
-        self.thumbnail_tonemap_check.setChecked(settings.thumbnail_tonemap_enabled)
-        self.compare_tonemap_check.setChecked(settings.compare_tonemap_enabled)
-        self._on_transparency_toggled(settings.show_transparency)
+        self.preview_size_slider.setValue(settings.viewer.preview_size)
+        self.bg_alpha_check.setChecked(settings.viewer.show_transparency)
+        self.thumbnail_tonemap_check.setChecked(settings.viewer.thumbnail_tonemap_enabled)
+        self.compare_tonemap_check.setChecked(settings.viewer.compare_tonemap_enabled)
+        self._on_transparency_toggled(settings.viewer.show_transparency)
+
+    def update_settings(self, s: AppSettings):
+        s.viewer.preview_size = self.preview_size_slider.value()
+        s.viewer.show_transparency = self.bg_alpha_check.isChecked()
+        s.viewer.thumbnail_tonemap_enabled = self.thumbnail_tonemap_check.isChecked()
+        s.viewer.compare_tonemap_enabled = self.compare_tonemap_check.isChecked()
 
     def clear_viewer(self):
         self.update_timer.stop()
