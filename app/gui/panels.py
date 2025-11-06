@@ -1186,13 +1186,14 @@ class ImageViewerPanel(QGroupBox):
         self.state.image_loaded.connect(self._on_full_res_image_loaded)
         self.state.load_complete.connect(self._on_load_complete)
         self.state.load_error.connect(self.log_message.emit)
-        self.preview_size_slider.sliderReleased.connect(
-            lambda: self.settings_manager.set_preview_size(self.preview_size_slider.value())
-        )
-        self.bg_alpha_check.toggled.connect(self.settings_manager.set_show_transparency)
+
+        self.preview_size_slider.sliderReleased.connect(self._update_preview_sizes)
+        self.bg_alpha_check.toggled.connect(self._on_transparency_toggled)
+        self.compare_bg_alpha_check.toggled.connect(self._on_transparency_toggled)
+
         self.thumbnail_tonemap_check.toggled.connect(self.settings_manager.set_thumbnail_tonemap_enabled)
         self.compare_tonemap_check.toggled.connect(self.settings_manager.set_compare_tonemap_enabled)
-        self.compare_bg_alpha_check.toggled.connect(self._on_transparency_toggled)
+
         self.thumbnail_tonemap_check.toggled.connect(self._on_thumbnail_tonemap_toggled)
         self.compare_tonemap_check.toggled.connect(self._on_compare_tonemap_changed)
         self.list_view.customContextMenuRequested.connect(self._show_context_menu)
@@ -1209,7 +1210,7 @@ class ImageViewerPanel(QGroupBox):
 
     @Slot(QPoint)
     def _show_context_menu(self, pos):
-        if (item := self.get_item_at_pos(pos)) and (path_str := item.get("path")):
+        if (item := self.get_item_at_pos(pos)) and (path_str := item.path):
             self.context_menu_path = Path(path_str)
             self.context_menu.exec(QCursor.pos())
 
@@ -1280,10 +1281,12 @@ class ImageViewerPanel(QGroupBox):
         if (row := self.model.get_row_for_path(file_path)) is not None:
             self.list_view.scrollTo(self.model.index(row, 0), QAbstractItemView.ScrollHint.PositionAtCenter)
 
+    @Slot()
     def _update_preview_sizes(self):
         new_size = self.preview_size_slider.value()
         self.delegate.set_preview_size(new_size)
         self.model.set_target_size(new_size)
+        self.settings_manager.set_preview_size(new_size)
         self.list_view.viewport().update()
 
     @Slot()
@@ -1381,13 +1384,12 @@ class ImageViewerPanel(QGroupBox):
     @Slot(bool)
     def _on_transparency_toggled(self, state: bool):
         self.is_transparency_enabled = state
-        for w in [self.bg_alpha_check, self.compare_bg_alpha_check]:
-            w.setChecked(state)
+        self.bg_alpha_check.setChecked(state)
+        self.compare_bg_alpha_check.setChecked(state)
         for w in [self.alpha_slider, self.alpha_label, self.compare_bg_alpha_slider]:
             w.setEnabled(state)
         self.delegate.set_transparency_enabled(state)
-        for view in [self.compare_view_1, self.compare_view_2, self.compare_widget, self.diff_view]:
-            view.set_transparency_enabled(state)
+        self.settings_manager.set_show_transparency(state)
         self.list_view.viewport().update()
         self.compare_container.update()
 
