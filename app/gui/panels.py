@@ -305,6 +305,7 @@ class OptionsPanel(QGroupBox):
         self.threshold_spinbox.setValue(int(s.threshold))
         self.exclude_entry.setText(s.exclude)
         self.model_combo.setCurrentText(s.model_key)
+        self.selected_extensions = list(s.selected_extensions)
 
     def update_settings(self, s: AppSettings):
         s.folder_path = self.folder_path_entry.text()
@@ -503,7 +504,7 @@ class PerformancePanel(QGroupBox):
         self.search_precision_combo = QComboBox()
         layout.addRow("Search Precision:", self.search_precision_combo)
 
-        self.num_workers_label = QLabel()
+        self.num_workers_label = QLabel("Preprocessing Workers:")
         self.num_workers_spin = QSpinBox()
         self.num_workers_spin.setRange(1, (multiprocessing.cpu_count() or 1) * 2)
         layout.addRow(self.num_workers_label, self.num_workers_spin)
@@ -525,12 +526,6 @@ class PerformancePanel(QGroupBox):
     @Slot(str)
     def _on_device_change(self, device_key: str):
         is_cpu = device_key == "cpu"
-
-        if is_cpu:
-            self.num_workers_label.setText("CPU Workers:")
-        else:
-            self.num_workers_label.setText("CPU Preproc Workers:")
-
         self.device_changed.emit(is_cpu)
 
     @Slot(str)
