@@ -21,6 +21,7 @@ from PySide6.QtCore import QObject
 
 from app.cache import CacheManager
 from app.constants import DB_WRITE_BATCH_SIZE, FP16_MODEL_SUFFIX, LANCEDB_AVAILABLE, MODELS_DIR
+from app.data_models import ImageFingerprint
 
 from . import worker
 
@@ -88,6 +89,7 @@ class PipelineManager(QObject):
             self.db_executor.shutdown(wait=True)
 
     def _get_model_and_buffer_config(self) -> tuple[tuple[int, int], tuple, Any]:
+        """Determines model input size and required buffer configuration."""
         from transformers import AutoProcessor
 
         try:
@@ -105,6 +107,7 @@ class PipelineManager(QObject):
         return input_size, buffer_shape, dtype
 
     def _setup_communication(self, buffer_size: int) -> tuple:
+        """Creates shared memory buffers and multiprocessing queues."""
         num_buffers = max(8, self.num_workers * 2)
         self.shared_mem_buffers = [
             shared_memory.SharedMemory(create=True, size=buffer_size) for _ in range(num_buffers)
@@ -117,6 +120,7 @@ class PipelineManager(QObject):
         return free_buffers_q, tensor_q, results_q
 
     def _start_inference_process(self, tensor_q, results_q, free_buffers_q) -> "multiprocessing.Process":
+        """Initializes and starts the single inference worker process."""
         infer_cfg = {
             "model_name": self.config.model_name,
             "low_priority": self.config.perf.run_at_low_priority,
@@ -136,6 +140,7 @@ class PipelineManager(QObject):
     def _run_preprocessing_pool(
         self, input_size, buffer_shape, dtype, free_buffers_q, tensor_q, results_q, cache
     ) -> list[str]:
+        """Runs the main pipeline loop, processing data through the worker pool."""
         preproc_init_cfg = {
             "model_name": self.config.model_name,
             "low_priority": self.config.perf.run_at_low_priority,
@@ -159,12 +164,14 @@ class PipelineManager(QObject):
         return all_skipped
 
     def _data_generator(self, batch_size: int):
+        """Generator that yields batches of file paths."""
         for i in range(0, len(self.files), batch_size):
             if self.stop_event.is_set():
                 return
             yield self.files[i : i + batch_size]
 
     def _pipeline_loop(self, preproc_results, tensor_q, results_q, cache) -> tuple[int, list[str]]:
+        """The core loop that orchestrates the data flow between workers."""
         total_files, processed_count, fps_to_cache, all_skipped = len(self.files), 0, [], []
         feeding_complete = False
 
@@ -210,6 +217,7 @@ class PipelineManager(QObject):
         return processed_count, all_skipped
 
     def _handle_batch_results(self, batch_fps, skipped_items, cache, fps_to_cache):
+        """Processes a batch of results from the inference worker."""
         for path_str, reason in skipped_items:
             self.signals.log.emit(f"Skipped {Path(path_str).name}: {reason}", "warning")
         if batch_fps:
@@ -219,7 +227,8 @@ class PipelineManager(QObject):
                 cache.put_many(fps_to_cache)
                 fps_to_cache.clear()
 
-    def _add_to_lancedb(self, fingerprints):
+    def _add_to_lancedb(self, fingerprints: list[ImageFingerprint]):
+        """Adds a list of fingerprints to the LanceDB table in a separate thread."""
         if not fingerprints or not LANCEDB_AVAILABLE:
             return
         data_to_convert = [
@@ -250,6 +259,7 @@ class PipelineManager(QObject):
             self.signals.log.emit(f"Critical error preparing data for database: {e}", "error")
 
     def _cleanup(self):
+        """Terminates processes and cleans up shared memory."""
         if self.infer_proc and self.infer_proc.is_alive():
             self.infer_proc.terminate()
             self.infer_proc.join(timeout=5)

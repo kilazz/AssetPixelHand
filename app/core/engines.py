@@ -1,6 +1,7 @@
 # app/core/engines.py
 """Contains the core processing engines for similarity search.
-The fingerprinting pipeline is managed by the PipelineManager."""
+The fingerprinting pipeline is managed by the PipelineManager in pipeline.py.
+"""
 
 import importlib.util
 import logging
@@ -13,12 +14,15 @@ from app.constants import (
     DEFAULT_SEARCH_PRECISION,
     LANCEDB_AVAILABLE,
     SEARCH_PRECISION_PRESETS,
+    SIMILARITY_SEARCH_K_NEIGHBORS,
 )
+from app.data_models import ScanConfig, ScannerSignals, ScanState
 
 if LANCEDB_AVAILABLE:
     import lancedb
 
 SCIPY_AVAILABLE = bool(importlib.util.find_spec("scipy"))
+
 
 # --- Global variables and initializer for the search worker pool ---
 g_lancedb_table = None
@@ -33,6 +37,7 @@ def init_search_worker(db_path: str, table_name: str, params: dict):
         g_lancedb_table = db.open_table(table_name)
         g_search_params = params
     except Exception as e:
+        # This log won't be visible in the main process, but is useful for debugging
         print(f"Search worker initialization failed: {e}")
 
 
@@ -44,6 +49,8 @@ def search_worker(item: dict) -> set:
 
     source_path = item["path"]
     source_vector = item["vector"]
+
+    # Perform the search for a single vector
     hits = (
         g_lancedb_table.search(source_vector)
         .limit(g_search_params["k_neighbors"])
@@ -56,6 +63,7 @@ def search_worker(item: dict) -> set:
         target_path = hit["path"]
         distance = hit["_distance"]
         if source_path != target_path and distance < g_search_params["distance_threshold"]:
+            # Sort to create a canonical representation and avoid duplicate (A,B) and (B,A) pairs
             link = tuple(sorted((source_path, target_path)))
             found_links.add((*link, distance))
 
@@ -68,13 +76,11 @@ app_logger = logging.getLogger("AssetPixelHand.engines")
 class LanceDBSimilarityEngine(QObject):
     """Finds pairs of similar images using an ANN index."""
 
-    K_NEIGHBORS = 100
-
     def __init__(
         self,
-        config,
-        state,
-        signals,
+        config: ScanConfig,
+        state: ScanState,
+        signals: ScannerSignals,
         lancedb_db: "lancedb.DB",
         lancedb_table: "lancedb.table.Table",
     ):
@@ -90,7 +96,10 @@ class LanceDBSimilarityEngine(QObject):
         )
         self.nprobes = preset_settings["nprobes"]
         self.refine_factor = preset_settings["refine_factor"]
-        log_msg = f"AI similarity search with precision '{config.search_precision}' (k={self.K_NEIGHBORS}, nprobes={self.nprobes})"
+        log_msg = (
+            f"AI similarity search with precision '{config.search_precision}' "
+            f"(k={SIMILARITY_SEARCH_K_NEIGHBORS}, nprobes={self.nprobes})"
+        )
         self.signals.log.emit(log_msg, "info")
 
     def find_similar_pairs(self, stop_event: threading.Event) -> list[tuple[str, str, float]]:
@@ -112,13 +121,16 @@ class LanceDBSimilarityEngine(QObject):
         self.state.update_progress(0, num_points, "Finding nearest neighbors (AI)...")
 
         all_links = set()
+
         ctx = multiprocessing.get_context("spawn")
         num_workers = self.config.perf.num_workers
+
         search_params = {
             "distance_threshold": self.distance_threshold,
-            "k_neighbors": self.K_NEIGHBORS,
+            "k_neighbors": SIMILARITY_SEARCH_K_NEIGHBORS,
             "nprobes": self.nprobes,
         }
+
         db_path = self.db.uri
         table_name = self.table.name
         init_args = (db_path, table_name, search_params)
@@ -127,15 +139,20 @@ class LanceDBSimilarityEngine(QObject):
         try:
             with ctx.Pool(processes=num_workers, initializer=init_search_worker, initargs=init_args) as pool:
                 results_iterator = pool.imap_unordered(search_worker, all_data, chunksize=10)
+
                 for found_links in results_iterator:
                     if stop_event.is_set():
                         pool.terminate()
                         return []
+
                     all_links.update(found_links)
                     processed_count += 1
-                    if processed_count % 100 == 0:
-                        self.state.update_progress(processed_count, num_points)
-            self.state.update_progress(num_points, num_points)
+
+                    # Update progress frequently for better user feedback
+                    if processed_count % 20 == 0 or processed_count == num_points:
+                        details = f"{processed_count}/{num_points}"
+                        self.state.update_progress(processed_count, num_points, details=details)
+
         except Exception as e:
             self.signals.log.emit(f"Error during parallel neighbor search: {e}", "error")
             app_logger.error("Parallel neighbor search failed", exc_info=True)

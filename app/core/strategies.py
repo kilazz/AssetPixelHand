@@ -72,27 +72,6 @@ class ScanStrategy(ABC):
         files.sort()
         return files
 
-    def _generate_fingerprints(
-        self, files: list[Path], stop_event: threading.Event, phase_count: int, current_phase: int, weight: float
-    ) -> tuple[bool, list[str]]:
-        """Generate AI fingerprints for a list of files using the unified pipeline."""
-        self.state.set_phase(f"Phase {current_phase}/{phase_count}: Creating AI fingerprints...", weight)
-        if not files:
-            self.signals.log.emit("No new unique images found for AI processing.", "info")
-            return True, []
-
-        pipeline_manager = PipelineManager(
-            config=self.config,
-            state=self.state,
-            signals=self.signals,
-            lancedb_table=self.table,
-            files_to_process=files,
-            stop_event=stop_event,
-        )
-        success, skipped = pipeline_manager.run()
-        self.all_skipped_files.extend(skipped)
-        return success, skipped
-
     def _create_dummy_fp(self, path: Path) -> ImageFingerprint | None:
         """Create a dummy fingerprint for search queries."""
         with suppress(Exception):
@@ -178,6 +157,7 @@ class FindDuplicatesStrategy(ScanStrategy):
 
     def __init__(self, *args):
         super().__init__(*args)
+        # The entire scan pipeline is defined centrally here.
         self.pipeline = [
             (MetadataReadStage(), 0.15),
             (HashingExecutionStage(), 0.30),
@@ -236,7 +216,19 @@ class SearchStrategy(ScanStrategy):
         if self._should_abort(stop_event, all_files, start_time):
             return
 
-        success, _ = self._generate_fingerprints(all_files, stop_event, 2, 2, 0.8)
+        # Use the unified, high-performance pipeline to generate fingerprints
+        self.state.set_phase("Phase 2/2: Creating AI fingerprints...", 0.8)
+        pipeline_manager = PipelineManager(
+            config=self.config,
+            state=self.state,
+            signals=self.signals,
+            lancedb_table=self.table,
+            files_to_process=all_files,
+            stop_event=stop_event,
+        )
+        success, skipped = pipeline_manager.run()
+        self.all_skipped_files.extend(skipped)
+
         if not success and not stop_event.is_set():
             self.signals.error.emit("Failed to generate fingerprints.")
             return

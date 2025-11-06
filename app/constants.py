@@ -160,14 +160,10 @@ class UIConfig:
         HIGHLIGHT = "#4A90E2"
 
     class Sizes:
-        # General
         BROWSE_BUTTON_WIDTH = 35
-        # Scan Options Panel
         MAX_VISUALS_ENTRY_WIDTH = 45
         VISUALS_COLUMNS_SPINBOX_WIDTH = 40
-        # Results Panel
         SIMILARITY_LABEL_WIDTH = 40
-        # Viewer Panel
         ALPHA_LABEL_WIDTH = 30
         CHANNEL_BUTTON_SIZE = 28
         PREVIEW_MIN_SIZE = 100
@@ -186,6 +182,7 @@ SEARCH_PRECISION_PRESETS = {
     "Exhaustive (Slow)": {"nprobes": 256, "refine_factor": 20},
 }
 DEFAULT_SEARCH_PRECISION = "Balanced (Default)"
+SIMILARITY_SEARCH_K_NEIGHBORS = 100
 
 
 class CompareMode(Enum):

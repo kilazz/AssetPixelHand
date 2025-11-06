@@ -368,7 +368,7 @@ class HashingStageRunner:
         else:
             results = defaultdict(list)
 
-        files_list = list(files)  # Create a list for indexed access
+        files_list = list(files)
         with ctx.Pool(processes=self.config.perf.num_workers) as pool:
             for i, result in enumerate(pool.imap_unordered(worker_func, files_list, config.batch_size), 1):
                 if stop_event.is_set():
