@@ -22,12 +22,12 @@ if sys.platform == "win32":
 
     pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
 
-from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QApplication
 
 from app.constants import CRASH_LOG_DIR
 from app.gui.main_window import App
 from app.logging_config import setup_logging
+from app.services.signal_bus import APP_SIGNAL_BUS
 
 IS_DEBUG_MODE = "--debug" in sys.argv
 
@@ -59,21 +59,17 @@ def log_global_crash(exc_type, exc_value, exc_traceback):
 def run_application():
     """Initializes and runs the Qt application."""
 
-    class LogSignalEmitter(QObject):
-        log_signal = Signal(str, str)
-
     sys.excepthook = log_global_crash
 
     app = QApplication(sys.argv)
 
-    log_emitter = LogSignalEmitter()
-    setup_logging(log_emitter, force_debug=IS_DEBUG_MODE)
+    # We now pass the global signal bus directly to the logging setup.
+    setup_logging(APP_SIGNAL_BUS, force_debug=IS_DEBUG_MODE)
 
     app_logger = logging.getLogger("AssetPixelHand.main")
     app_logger.info("Starting AssetPixelHand application...")
 
-    main_window = App(log_emitter=log_emitter)
-    log_emitter.log_signal.connect(main_window.log_panel.log_message)
+    main_window = App()
 
     main_window.show()
     app_logger.info("Main window displayed.")

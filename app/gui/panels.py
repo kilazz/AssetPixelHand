@@ -7,6 +7,7 @@ import logging
 import multiprocessing
 import webbrowser
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import duckdb
 from PIL import Image, ImageChops
@@ -52,6 +53,7 @@ from app.constants import (
     UIConfig,
 )
 from app.data_models import AppSettings, FileOperation, ScanMode
+from app.services.settings_manager import SettingsManager
 from app.view_models import ImageComparerState
 
 from .dialogs import FileTypesDialog
@@ -62,6 +64,10 @@ from .models import (
     ResultsTreeModel,
 )
 from .widgets import AlphaBackgroundWidget, ImageCompareWidget, ResizedListView
+
+if TYPE_CHECKING:
+    from app.services.file_operation_manager import FileOperationManager
+
 
 app_logger = logging.getLogger("AssetPixelHand.gui.panels")
 
@@ -76,9 +82,11 @@ class OptionsPanel(QGroupBox):
     log_message = Signal(str, str)
     scan_context_changed = Signal(str)
 
-    def __init__(self, settings: AppSettings):
+    def __init__(self, settings_manager: SettingsManager):
         super().__init__("Scan Configuration")
-        self.settings = settings
+        self.settings_manager = settings_manager
+        settings = settings_manager.settings
+
         self.selected_extensions = list(settings.selected_extensions)
         self.current_scan_mode = ScanMode.DUPLICATES
         self._sample_path: Path | None = None
@@ -168,6 +176,13 @@ class OptionsPanel(QGroupBox):
         main_layout.addWidget(self.scan_button)
 
     def _connect_signals(self):
+        # Connect UI widgets directly to SettingsManager slots
+        self.folder_path_entry.textChanged.connect(self.settings_manager.set_folder_path)
+        self.threshold_spinbox.valueChanged.connect(self.settings_manager.set_threshold)
+        self.exclude_entry.textChanged.connect(self.settings_manager.set_exclude_folders)
+        self.model_combo.currentTextChanged.connect(self.settings_manager.set_model_key)
+
+        # Connect other signals for UI logic and actions
         self.browse_folder_button.clicked.connect(self._browse_for_folder)
         self.browse_sample_button.clicked.connect(self._browse_for_sample)
         self.clear_sample_button.clicked.connect(self._clear_sample)
@@ -194,7 +209,7 @@ class OptionsPanel(QGroupBox):
                     action.triggered.connect(lambda checked, t_id=theme_id: self.window().load_theme(theme_id=t_id))
                     theme_menu.addAction(action)
                     theme_action_group.addAction(action)
-        current_theme = getattr(self.settings, "theme", "Dark")
+        current_theme = getattr(self.settings_manager.settings, "theme", "Dark")
         for action in theme_action_group.actions():
             if action.text() == current_theme:
                 action.setChecked(True)
@@ -293,8 +308,7 @@ class OptionsPanel(QGroupBox):
         if dialog.exec():
             self.selected_extensions = dialog.get_selected_extensions()
             self.log_message.emit(f"Selected {len(self.selected_extensions)} file type(s).", "info")
-            if self.window():
-                self.window()._request_settings_save()
+            self.settings_manager.set_selected_extensions(self.selected_extensions)
 
     def get_selected_model_info(self) -> dict:
         return SUPPORTED_MODELS.get(self.model_combo.currentText(), next(iter(SUPPORTED_MODELS.values())))
@@ -306,22 +320,15 @@ class OptionsPanel(QGroupBox):
         self.model_combo.setCurrentText(s.model_key)
         self.selected_extensions = list(s.selected_extensions)
 
-    def update_settings(self, s: AppSettings):
-        s.folder_path = self.folder_path_entry.text()
-        s.threshold = str(self.threshold_spinbox.value())
-        s.exclude = self.exclude_entry.text()
-        s.model_key = self.model_combo.currentText()
-        s.selected_extensions = self.selected_extensions
-
 
 class ScanOptionsPanel(QGroupBox):
     """Panel for secondary scan options and output settings."""
 
-    def __init__(self, settings: AppSettings):
+    def __init__(self, settings_manager: SettingsManager):
         super().__init__("Scan & Output Options")
-        self.settings = settings
+        self.settings_manager = settings_manager
         self._init_ui()
-        self.load_settings(settings)
+        self.load_settings(settings_manager.settings)
         self._connect_signals()
 
     def _init_ui(self):
@@ -392,6 +399,20 @@ class ScanOptionsPanel(QGroupBox):
         layout.addLayout(visuals_layout)
 
     def _connect_signals(self):
+        # Connect settings widgets to manager slots
+        self.exact_duplicates_check.toggled.connect(self.settings_manager.set_find_exact)
+        self.simple_duplicates_check.toggled.connect(self.settings_manager.set_find_simple)
+        self.dhash_threshold_spin.valueChanged.connect(self.settings_manager.set_dhash_threshold)
+        self.perceptual_duplicates_check.toggled.connect(self.settings_manager.set_find_perceptual)
+        self.phash_threshold_spin.valueChanged.connect(self.settings_manager.set_phash_threshold)
+        self.lancedb_in_memory_check.toggled.connect(self.settings_manager.set_lancedb_in_memory)
+        self.low_priority_check.toggled.connect(self.settings_manager.set_low_priority)
+        self.save_visuals_check.toggled.connect(self.settings_manager.set_save_visuals)
+        self.visuals_tonemap_check.toggled.connect(self.settings_manager.set_visuals_tonemap)
+        self.max_visuals_entry.textChanged.connect(self.settings_manager.set_max_visuals)
+        self.visuals_columns_spinbox.valueChanged.connect(self.settings_manager.set_visuals_columns)
+
+        # Connect signals for internal UI logic
         self.exact_duplicates_check.toggled.connect(self._update_hashing_options_state)
         self.simple_duplicates_check.toggled.connect(self._update_hashing_options_state)
         self.perceptual_duplicates_check.toggled.connect(self._update_hashing_options_state)
@@ -458,21 +479,6 @@ class ScanOptionsPanel(QGroupBox):
         self.visuals_columns_spinbox.setValue(s.visuals.columns)
         self.toggle_visuals_option(s.visuals.save)
 
-    def update_settings(self, s: AppSettings):
-        s.hashing.find_exact = self.exact_duplicates_check.isChecked()
-        s.hashing.find_simple = self.simple_duplicates_check.isChecked()
-        s.hashing.find_perceptual = self.perceptual_duplicates_check.isChecked()
-        s.hashing.dhash_threshold = self.dhash_threshold_spin.value()
-        s.hashing.phash_threshold = self.phash_threshold_spin.value()
-
-        s.lancedb_in_memory = self.lancedb_in_memory_check.isChecked()
-        s.performance.low_priority = self.low_priority_check.isChecked()
-
-        s.visuals.save = self.save_visuals_check.isChecked()
-        s.visuals.tonemap_enabled = self.visuals_tonemap_check.isChecked()
-        s.visuals.max_count = self.max_visuals_entry.text()
-        s.visuals.columns = self.visuals_columns_spinbox.value()
-
 
 class PerformancePanel(QGroupBox):
     """Panel for performance-related settings and AI model selection."""
@@ -480,13 +486,13 @@ class PerformancePanel(QGroupBox):
     log_message = Signal(str, str)
     device_changed = Signal(bool)
 
-    def __init__(self, settings: AppSettings):
+    def __init__(self, settings_manager: SettingsManager):
         super().__init__("Performance & AI Model")
-        self.settings = settings
+        self.settings_manager = settings_manager
         self._init_ui()
         self._detect_and_setup_devices()
-        self.device_combo.currentTextChanged.connect(lambda: self._on_device_change(self.device_combo.currentData()))
-        self.load_settings(settings)
+        self._connect_signals()
+        self.load_settings(settings_manager.settings)
 
     def _init_ui(self):
         layout = QFormLayout(self)
@@ -507,6 +513,14 @@ class PerformancePanel(QGroupBox):
         self.num_workers_spin = QSpinBox()
         self.num_workers_spin.setRange(1, (multiprocessing.cpu_count() or 1) * 2)
         layout.addRow(self.num_workers_label, self.num_workers_spin)
+
+    def _connect_signals(self):
+        self.device_combo.currentTextChanged.connect(self.settings_manager.set_device)
+        self.quant_combo.currentTextChanged.connect(self.settings_manager.set_quantization_mode)
+        self.batch_size_spin.valueChanged.connect(self.settings_manager.set_batch_size)
+        self.search_precision_combo.currentTextChanged.connect(self.settings_manager.set_search_precision)
+        self.num_workers_spin.valueChanged.connect(self.settings_manager.set_num_workers)
+        self.device_combo.currentTextChanged.connect(lambda: self._on_device_change(self.device_combo.currentData()))
 
     def _detect_and_setup_devices(self):
         self.device_combo.addItem("CPU", "cpu")
@@ -535,7 +549,7 @@ class PerformancePanel(QGroupBox):
         presets = list(SEARCH_PRECISION_PRESETS.keys())
         self.search_precision_combo.addItems(presets)
 
-        current_setting = self.settings.performance.search_precision
+        current_setting = self.settings_manager.settings.performance.search_precision
         if current_setting in presets:
             self.search_precision_combo.setCurrentText(current_setting)
         else:
@@ -555,13 +569,6 @@ class PerformancePanel(QGroupBox):
         self.batch_size_spin.setValue(int(s.performance.batch_size))
         self.search_precision_combo.setCurrentText(s.performance.search_precision)
         self.num_workers_spin.setValue(int(s.performance.num_workers))
-
-    def update_settings(self, s: AppSettings):
-        s.performance.device = self.device_combo.currentText()
-        s.performance.quantization_mode = self.quant_combo.currentText()
-        s.performance.batch_size = self.batch_size_spin.text()
-        s.performance.search_precision = self.search_precision_combo.currentText()
-        s.performance.num_workers = self.num_workers_spin.text()
 
 
 class SystemStatusPanel(QGroupBox):
@@ -616,13 +623,11 @@ class LogPanel(QGroupBox):
 class ResultsPanel(QGroupBox):
     """Displays scan results in a tree view and provides actions for them."""
 
-    deletion_requested = Signal(list)
-    hardlink_requested = Signal(list)
-    reflink_requested = Signal(list)
     visible_results_changed = Signal(list)
 
-    def __init__(self):
+    def __init__(self, file_op_manager: "FileOperationManager"):
         super().__init__("Results")
+        self.file_op_manager = file_op_manager
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
         self.search_timer.setInterval(300)
@@ -861,22 +866,26 @@ class ResultsPanel(QGroupBox):
         msg = f"Move {file_count} files from {group_count} {group_str} to the system trash?"
 
         if QMessageBox.question(self, "Confirm Move", msg) == QMessageBox.StandardButton.Yes:
-            self.set_operation_in_progress(FileOperation.DELETING)
-            self.deletion_requested.emit(to_move)
+            self.file_op_manager.request_deletion(to_move)
 
     def _request_hardlink(self):
         to_link = self.results_model.get_checked_paths()
         if not to_link:
             QMessageBox.warning(self, "No Selection", "No duplicate files selected to replace.")
             return
+
+        link_map = self.results_model.get_link_map_for_paths(to_link)
+        if not link_map:
+            QMessageBox.information(self, "No Action", "Selected files did not contain any duplicates to replace.")
+            return
+
         msg = (
-            f"This will replace {len(to_link)} duplicate files with hardlinks to the best file.\n\n"
+            f"This will replace {len(link_map)} duplicate files with hardlinks to the best file.\n\n"
             "⚠️ IMPORTANT:\n• The original file data will be preserved.\n• Duplicate files will become pointers to the same data.\n"
             "• If you edit any linked file, ALL linked copies will change.\n• This operation cannot be undone.\n\nAre you sure you want to continue?"
         )
         if QMessageBox.question(self, "Confirm Hardlink Replacement", msg) == QMessageBox.StandardButton.Yes:
-            self.set_operation_in_progress(FileOperation.HARDLINKING)
-            self.hardlink_requested.emit(to_link)
+            self.file_op_manager.request_hardlink(link_map)
 
     @Slot()
     def _request_reflink(self):
@@ -884,15 +893,20 @@ class ResultsPanel(QGroupBox):
         if not to_link:
             QMessageBox.warning(self, "No Selection", "No duplicate files selected to replace.")
             return
+
+        link_map = self.results_model.get_link_map_for_paths(to_link)
+        if not link_map:
+            QMessageBox.information(self, "No Action", "Selected files did not contain any duplicates to replace.")
+            return
+
         msg = (
-            f"This will replace {len(to_link)} duplicate files with reflinks (Copy-on-Write).\n\n"
+            f"This will replace {len(link_map)} duplicate files with reflinks (Copy-on-Write).\n\n"
             "INFO:\n• Creates space-saving copies that share data blocks.\n"
             "• When you edit a file, only the changed blocks are duplicated.\n"
             "• Safer than hardlinks but requires filesystem support (APFS, Btrfs, XFS, ReFS).\n• This operation cannot be undone.\n\nAre you sure you want to continue?"
         )
         if QMessageBox.question(self, "Confirm Reflink Replacement", msg) == QMessageBox.StandardButton.Yes:
-            self.set_operation_in_progress(FileOperation.REFLINKING)
-            self.reflink_requested.emit(to_link)
+            self.file_op_manager.request_reflink(link_map)
 
     def remove_items_from_results_db(self, paths_to_delete: list[Path]):
         """Physically removes rows from the results.duckdb file."""
@@ -956,19 +970,19 @@ class ImageViewerPanel(QGroupBox):
 
     log_message = Signal(str, str)
 
-    def __init__(self, settings: AppSettings, thread_pool: QThreadPool):
+    def __init__(self, settings_manager: SettingsManager, thread_pool: QThreadPool):
         super().__init__("Image Viewer")
-        self.settings = settings
+        self.settings_manager = settings_manager
         self.thread_pool = thread_pool
         self.state = ImageComparerState(thread_pool)
-        self.is_transparency_enabled = settings.viewer.show_transparency
+        self.is_transparency_enabled = settings_manager.settings.viewer.show_transparency
         self.update_timer = QTimer(self)
         self.update_timer.setSingleShot(True)
         self.update_timer.setInterval(150)
         self._init_state()
         self._init_ui()
         self._connect_signals()
-        self.load_settings(settings)
+        self.load_settings(settings_manager.settings)
         self.clear_viewer()
 
     def _init_state(self):
@@ -1009,7 +1023,7 @@ class ImageViewerPanel(QGroupBox):
         self.compare_button = QPushButton("Compare (0)")
         parent_layout.addWidget(self.compare_button)
         self.model = ImagePreviewModel(self.thread_pool, self)
-        self.delegate = ImageItemDelegate(self.settings.viewer.preview_size, self.state, self)
+        self.delegate = ImageItemDelegate(self.settings_manager.settings.viewer.preview_size, self.state, self)
         self.list_view = ResizedListView(self)
         self.list_view.setModel(self.model)
         self.list_view.setItemDelegate(self.delegate)
@@ -1077,7 +1091,7 @@ class ImageViewerPanel(QGroupBox):
         parent_layout.addWidget(self.compare_stack, 1)
 
     def _connect_signals(self):
-        self.preview_size_slider.sliderReleased.connect(self._update_preview_sizes)
+        # Connect signals for UI logic
         self.alpha_slider.valueChanged.connect(self._on_alpha_change)
         self.compare_button.clicked.connect(self._show_comparison_view)
         self.back_button.clicked.connect(self._back_to_list_view)
@@ -1086,10 +1100,6 @@ class ImageViewerPanel(QGroupBox):
         self.list_view.resized.connect(self.update_timer.start)
         self.update_timer.timeout.connect(self._update_visible_previews)
         self.list_view.clicked.connect(self._on_item_clicked)
-        self.thumbnail_tonemap_check.toggled.connect(self._on_thumbnail_tonemap_toggled)
-        self.compare_tonemap_check.toggled.connect(self._on_compare_tonemap_changed)
-        self.bg_alpha_check.toggled.connect(self._on_transparency_toggled)
-        self.compare_bg_alpha_check.toggled.connect(self._on_transparency_toggled)
         self.overlay_alpha_slider.valueChanged.connect(self._on_overlay_alpha_change)
         self.compare_bg_alpha_slider.valueChanged.connect(self._on_alpha_change)
         self.state.candidates_changed.connect(self._update_compare_button)
@@ -1097,6 +1107,19 @@ class ImageViewerPanel(QGroupBox):
         self.state.image_loaded.connect(self._on_full_res_image_loaded)
         self.state.load_complete.connect(self._on_load_complete)
         self.state.load_error.connect(self.log_message.emit)
+
+        # Connect settings widgets to SettingsManager slots
+        self.preview_size_slider.sliderReleased.connect(
+            lambda: self.settings_manager.set_preview_size(self.preview_size_slider.value())
+        )
+        self.bg_alpha_check.toggled.connect(self.settings_manager.set_show_transparency)
+        self.thumbnail_tonemap_check.toggled.connect(self.settings_manager.set_thumbnail_tonemap_enabled)
+        self.compare_tonemap_check.toggled.connect(self.settings_manager.set_compare_tonemap_enabled)
+
+        # Connect internal slots for UI updates
+        self.compare_bg_alpha_check.toggled.connect(self._on_transparency_toggled)
+        self.thumbnail_tonemap_check.toggled.connect(self._on_thumbnail_tonemap_toggled)
+        self.compare_tonemap_check.toggled.connect(self._on_compare_tonemap_changed)
 
     @Slot(list)
     def display_results(self, items: list):
@@ -1120,12 +1143,6 @@ class ImageViewerPanel(QGroupBox):
         self.thumbnail_tonemap_check.setChecked(settings.viewer.thumbnail_tonemap_enabled)
         self.compare_tonemap_check.setChecked(settings.viewer.compare_tonemap_enabled)
         self._on_transparency_toggled(settings.viewer.show_transparency)
-
-    def update_settings(self, s: AppSettings):
-        s.viewer.preview_size = self.preview_size_slider.value()
-        s.viewer.show_transparency = self.bg_alpha_check.isChecked()
-        s.viewer.thumbnail_tonemap_enabled = self.thumbnail_tonemap_check.isChecked()
-        s.viewer.compare_tonemap_enabled = self.compare_tonemap_check.isChecked()
 
     def clear_viewer(self):
         self.update_timer.stop()

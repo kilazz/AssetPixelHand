@@ -15,7 +15,8 @@ from PySide6.QtCore import QObject, QThread, Slot
 
 from app.constants import CACHE_DIR, DB_TABLE_NAME, DUCKDB_AVAILABLE, LANCEDB_AVAILABLE, WIN32_AVAILABLE
 from app.core.strategies import FindDuplicatesStrategy, SearchStrategy
-from app.data_models import ScanConfig, ScanMode, ScannerSignals, ScanState
+from app.data_models import ScanConfig, ScanMode, ScanState
+from app.services.signal_bus import APP_SIGNAL_BUS
 
 if LANCEDB_AVAILABLE:
     import lancedb
@@ -32,9 +33,9 @@ app_logger = logging.getLogger("AssetPixelHand.scanner")
 class ScannerCore(QObject):
     """The main business logic orchestrator for the entire scanning process."""
 
-    def __init__(self, config: ScanConfig, state: ScanState, signals: ScannerSignals):
+    def __init__(self, config: ScanConfig, state: ScanState):
         super().__init__()
-        self.config, self.state, self.signals = config, state, signals
+        self.config, self.state = config, state
         self.db: lancedb.DB | None = None
         self.table: lancedb.table.Table | None = None
         self.scan_has_finished = False
@@ -50,7 +51,6 @@ class ScannerCore(QObject):
         self._set_process_priority()
 
         try:
-            # Initialize caches based on the current scan's configuration
             setup_caches(self.config)
 
             if not self._setup_lancedb():
@@ -64,27 +64,24 @@ class ScannerCore(QObject):
             strategy_class = strategy_map.get(self.config.scan_mode)
 
             if strategy_class:
-                strategy = strategy_class(self.config, self.state, self.signals, self.table, self)
+                strategy = strategy_class(self.config, self.state, APP_SIGNAL_BUS, self.table, self)
                 strategy.execute(stop_event, start_time)
             else:
-                self.signals.log.emit(f"Unknown scan mode: {self.config.scan_mode}", "error")
+                APP_SIGNAL_BUS.log_message.emit(f"Unknown scan mode: {self.config.scan_mode}", "error")
                 self._finalize_scan(None, 0, None, 0, [])
 
         except Exception as e:
             if not stop_event.is_set():
                 app_logger.error(f"Critical scan error: {e}", exc_info=True)
-                self.signals.error.emit(f"Scan aborted due to critical error: {e}")
+                APP_SIGNAL_BUS.scan_error.emit(f"Scan aborted due to critical error: {e}")
         finally:
-            # Ensure caches are closed and cleaned up at the end of the scan
             teardown_caches()
-
             total_duration = time.time() - start_time
             app_logger.info("Scan process finished.")
             if stop_event.is_set() and not self.scan_has_finished:
                 self._finalize_scan(None, 0, None, total_duration, self.all_skipped_files)
 
     def _set_process_priority(self):
-        """Lowers the process priority to improve UI responsiveness, if enabled."""
         if not self.config.perf.run_at_low_priority:
             return
         try:
@@ -93,15 +90,14 @@ class ScannerCore(QObject):
                 handle = win32api.OpenProcess(win32con.PROCESS_ALL_ACCESS, True, pid)
                 win32process.SetPriorityClass(handle, win32process.BELOW_NORMAL_PRIORITY_CLASS)
                 win32api.CloseHandle(handle)
-                self.signals.log.emit("Process priority lowered.", "info")
+                APP_SIGNAL_BUS.log_message.emit("Process priority lowered.", "info")
             elif hasattr(os, "nice"):
                 os.nice(10)
-                self.signals.log.emit("Process priority lowered via nice().", "info")
+                APP_SIGNAL_BUS.log_message.emit("Process priority lowered via nice().", "info")
         except Exception as e:
-            self.signals.log.emit(f"Could not set process priority: {e}", "warning")
+            APP_SIGNAL_BUS.log_message.emit(f"Could not set process priority: {e}", "warning")
 
     def _setup_lancedb(self) -> bool:
-        """Initializes the LanceDB database and table."""
         try:
             folder_hash = hashlib.md5(str(self.config.folder_path).encode()).hexdigest()
             sanitized_model = self.config.model_name.replace("/", "_").replace("-", "_")
@@ -109,11 +105,11 @@ class ScannerCore(QObject):
             db_path = CACHE_DIR / db_name
 
             if self.config.lancedb_in_memory:
-                self.signals.log.emit("Using in-memory vector database.", "info")
+                APP_SIGNAL_BUS.log_message.emit("Using in-memory vector database.", "info")
                 if db_path.exists():
                     shutil.rmtree(db_path)
             else:
-                self.signals.log.emit("Using on-disk vector database.", "info")
+                APP_SIGNAL_BUS.log_message.emit("Using on-disk vector database.", "info")
 
             db_path.mkdir(parents=True, exist_ok=True)
             self.db = lancedb.connect(str(db_path))
@@ -143,7 +139,7 @@ class ScannerCore(QObject):
             return True
         except Exception as e:
             app_logger.error(f"Failed to initialize LanceDB: {e}", exc_info=True)
-            self.signals.error.emit(f"Failed to initialize vector database: {e}")
+            APP_SIGNAL_BUS.scan_error.emit(f"Failed to initialize vector database: {e}")
             return False
 
     def _check_stop_or_empty(
@@ -177,7 +173,7 @@ class ScannerCore(QObject):
                 else f"Scan finished. Found {num_found} items in {time_str}."
             )
             app_logger.info(log_msg)
-            self.signals.finished.emit(payload, num_found, mode, duration, skipped_files)
+            APP_SIGNAL_BUS.scan_finished.emit(payload, num_found, mode, duration, skipped_files)
             self.scan_has_finished = True
 
 
@@ -186,32 +182,37 @@ class ScannerController(QObject):
 
     def __init__(self):
         super().__init__()
-        self.signals = ScannerSignals()
         self.scan_thread: QThread | None = None
         self.scanner_core: ScannerCore | None = None
-        self.scan_state: ScanState | None = None
+
+        self.scan_state: ScanState = ScanState()
+
         self.stop_event = threading.Event()
         self.config: ScanConfig | None = None
+
+        # Connect to the global signal bus
+        APP_SIGNAL_BUS.scan_requested.connect(self.start_scan)
+        APP_SIGNAL_BUS.scan_cancellation_requested.connect(self.cancel_scan)
 
     def is_running(self) -> bool:
         return self.scan_thread is not None and self.scan_thread.isRunning()
 
+    @Slot(object)
     def start_scan(self, config: ScanConfig):
         if self.is_running():
             return
+
         self.config = config
-        self.scan_state = ScanState()
+
+        self.scan_state.reset()
+
         self.stop_event = threading.Event()
         self.scan_thread = QThread()
-        self.scanner_core = ScannerCore(config, self.scan_state, self.signals)
+        self.scanner_core = ScannerCore(config, self.scan_state)
         self.scanner_core.moveToThread(self.scan_thread)
 
-        # When the scanner_core task is finished, it emits a 'finished' signal.
-        # This connection tells the containing QThread ('scan_thread') to quit its event loop.
-        # This allows the thread to terminate naturally, so is_running() will correctly
-        # return False, enabling the UI for the next scan.
-        self.scanner_core.signals.finished.connect(self.scan_thread.quit)
-        self.scanner_core.signals.error.connect(self.scan_thread.quit)  # Also quit on error
+        APP_SIGNAL_BUS.scan_finished.connect(self.scan_thread.quit)
+        APP_SIGNAL_BUS.scan_error.connect(self.scan_thread.quit)
 
         self.scan_thread.started.connect(lambda: self.scanner_core.run(self.stop_event))
         self.scan_thread.finished.connect(self._on_scan_thread_finished)
@@ -220,9 +221,8 @@ class ScannerController(QObject):
 
     def cancel_scan(self):
         if self.is_running():
-            self.signals.log.emit("Cancellation requested...", "warning")
+            APP_SIGNAL_BUS.log_message.emit("Cancellation requested...", "warning")
             self.stop_event.set()
-            # On cancellation, we also need to ensure the thread quits if the task gets stuck
             if self.scan_thread:
                 self.scan_thread.quit()
 
@@ -232,12 +232,11 @@ class ScannerController(QObject):
         self.cancel_scan()
         if self.scan_thread:
             self.scan_thread.quit()
-            self.scan_thread.wait(5000)  # Wait for thread to finish
+            self.scan_thread.wait(5000)
         self._on_scan_thread_finished()
 
     @Slot()
     def _on_scan_thread_finished(self):
-        # This method is now correctly called after EVERY scan (successful or cancelled).
         if self.scanner_core:
             self.scanner_core.deleteLater()
         if self.scan_thread:

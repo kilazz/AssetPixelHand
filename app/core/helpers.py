@@ -14,8 +14,9 @@ from PIL import Image, ImageDraw, ImageFont
 from PySide6.QtCore import QObject, QRunnable, Signal
 
 from app.constants import VISUALS_DIR, TonemapMode
-from app.data_models import DuplicateResults, ScanConfig, ScannerSignals, ScanState
+from app.data_models import DuplicateResults, ScanConfig, ScanState
 from app.image_io import load_image
+from app.services.signal_bus import SignalBus
 
 app_logger = logging.getLogger("AssetPixelHand.scanner_helpers")
 
@@ -33,7 +34,7 @@ class FileFinder:
         folder_path: Path,
         excluded: list[str],
         extensions: list[str],
-        signals: ScannerSignals,
+        signals: SignalBus,  # Type hint the actual object
     ):
         self.state = state
         self.folder_path = folder_path
@@ -45,7 +46,7 @@ class FileFinder:
 
     def stream_files(self, stop_event: threading.Event):
         """Scans the directory and yields batches of files."""
-        self.signals.log.emit("Using standard Python file scanner.", "info")
+        self.signals.log_message.emit("Using standard Python file scanner.", "info")
 
         batch = []
         try:
@@ -91,10 +92,10 @@ class FileFinder:
                                     self.state.update_progress(self.found_count, -1, f"Found: {self.found_count}")
                                 yield entry_path, entry.stat()
                     except OSError as e:
-                        self.signals.log.emit(f"Skipping unreadable entry '{entry.name}': {e}", "warning")
+                        self.signals.log_message.emit(f"Skipping unreadable entry '{entry.name}': {e}", "warning")
 
         except (OSError, PermissionError) as e:
-            self.signals.log.emit(f"Could not scan directory, skipping: {current_path}. Error: {e}", "warning")
+            self.signals.log_message.emit(f"Could not scan directory, skipping: {current_path}. Error: {e}", "warning")
             app_logger.warning(f"Could not scan directory {current_path}: {e}")
 
 

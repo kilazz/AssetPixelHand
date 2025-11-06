@@ -188,8 +188,8 @@ class ScanStatisticsDialog(QDialog):
         layout.addWidget(self.close_button, 0, Qt.AlignmentFlag.AlignRight)
 
     def _connect_signals(self):
-        self.signals.finished.connect(self.scan_finished)
-        self.signals.error.connect(self.scan_error)
+        self.signals.scan_finished.connect(self.scan_finished)
+        self.signals.scan_error.connect(self.scan_error)
         self.close_button.clicked.connect(self.accept)
 
     def update_display(self):

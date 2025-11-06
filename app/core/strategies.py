@@ -21,10 +21,10 @@ from app.data_models import (
     ImageFingerprint,
     ScanConfig,
     ScanMode,
-    ScannerSignals,
     ScanState,
 )
 from app.image_io import get_image_metadata
+from app.services.signal_bus import SignalBus
 
 from .engines import LanceDBSimilarityEngine
 from .helpers import FileFinder
@@ -45,7 +45,7 @@ app_logger = logging.getLogger("AssetPixelHand.strategies")
 class ScanStrategy(ABC):
     """Abstract base class for a scanning strategy."""
 
-    def __init__(self, config: ScanConfig, state: ScanState, signals: ScannerSignals, table, scanner_core):
+    def __init__(self, config: ScanConfig, state: ScanState, signals: SignalBus, table, scanner_core):
         self.config = config
         self.state = state
         self.signals = signals
@@ -98,7 +98,7 @@ class ScanStrategy(ABC):
                 self._persist_database(conn)
                 app_logger.info(f"Results saved to '{RESULTS_DB_FILE.name}'.")
         except duckdb.Error as e:
-            self.signals.log.emit(f"Failed to write results to DuckDB: {e}", "error")
+            self.signals.log_message.emit(f"Failed to write results to DuckDB: {e}", "error")
             app_logger.error(f"Failed to write results DB: {e}", exc_info=True)
 
     @staticmethod
@@ -230,14 +230,14 @@ class SearchStrategy(ScanStrategy):
         self.all_skipped_files.extend(skipped)
 
         if not success and not stop_event.is_set():
-            self.signals.error.emit("Failed to generate fingerprints.")
+            self.signals.scan_error.emit("Failed to generate fingerprints.")
             return
 
         num_found, db_path = self._perform_similarity_search()
         if num_found is None:
             return
 
-        self.signals.log.emit(f"Found {num_found} results.", "info")
+        self.signals.log_message.emit(f"Found {num_found} results.", "info")
         self.scanner_core._finalize_scan(
             {"db_path": db_path, "groups_data": None},
             num_found,
@@ -258,7 +258,7 @@ class SearchStrategy(ScanStrategy):
 
         query_vector = self._get_query_vector()
         if query_vector is None:
-            self.signals.error.emit("Could not generate a vector for the search query.")
+            self.signals.scan_error.emit("Could not generate a vector for the search query.")
             return None, None
 
         from .scan_stages import EvidenceMethod
@@ -323,10 +323,10 @@ class SearchStrategy(ScanStrategy):
 
         with ctx.Pool(1, initializer=init_worker, initargs=(pool_config,)) as pool:
             if self.config.scan_mode == ScanMode.TEXT_SEARCH and self.config.search_query:
-                self.signals.log.emit(f"Generating vector for query: '{self.config.search_query}'", "info")
+                self.signals.log_message.emit(f"Generating vector for query: '{self.config.search_query}'", "info")
                 vec_list = pool.map(worker_get_text_vector, [self.config.search_query])
             elif self.config.scan_mode == ScanMode.SAMPLE_SEARCH and self.config.sample_path:
-                self.signals.log.emit(f"Generating vector for sample: {self.config.sample_path.name}", "info")
+                self.signals.log_message.emit(f"Generating vector for sample: {self.config.sample_path.name}", "info")
                 vec_list = pool.map(worker_get_single_vector, [self.config.sample_path])
             else:
                 return None

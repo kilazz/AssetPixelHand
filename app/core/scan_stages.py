@@ -20,8 +20,9 @@ from typing import Any, NamedTuple
 
 import numpy as np
 
-from app.data_models import ImageFingerprint, ScanConfig, ScannerSignals, ScanState
+from app.data_models import ImageFingerprint, ScanConfig, ScanState
 from app.image_io import get_image_metadata
+from app.services.signal_bus import SignalBus
 from app.utils import find_best_in_group
 
 from .engines import LanceDBSimilarityEngine
@@ -390,16 +391,11 @@ class HashingStageRunner:
 
 @dataclass
 class ScanContext:
-    """A data container passed between scan stages.
-
-    This object acts as a central repository for all data related to a single
-    scan run. Each stage can read from and write to this context, allowing
-    for a flow of data through the pipeline.
-    """
+    """A data container passed between scan stages."""
 
     config: ScanConfig
     state: ScanState
-    signals: ScannerSignals
+    signals: SignalBus
     stop_event: threading.Event
     scanner_core: Any
     all_image_fps: dict[Path, ImageFingerprint] = field(default_factory=dict)
@@ -409,11 +405,7 @@ class ScanContext:
 
 
 class ScanStage(ABC):
-    """Abstract base class for a single stage in the scanning pipeline.
-
-    Each concrete stage must implement the `run` method, which performs a specific
-    part of the scan process (e.g., reading metadata, generating fingerprints).
-    """
+    """Abstract base class for a single stage in the scanning pipeline."""
 
     @property
     @abstractmethod
@@ -460,7 +452,7 @@ class MetadataReadStage(ScanStage):
         context.files_to_process = list(fingerprints.keys())
 
         if not context.files_to_process:
-            context.signals.log.emit("No image files found to process.", "info")
+            context.signals.log_message.emit("No image files found to process.", "info")
             return False
         return True
 
@@ -530,7 +522,7 @@ class HashingExecutionStage(ScanStage):
             if context.stop_event.is_set():
                 return False
         context.files_to_process = reps
-        context.signals.log.emit(f"Found {len(reps)} unique candidates for AI processing.", "info")
+        context.signals.log_message.emit(f"Found {len(reps)} unique candidates for AI processing.", "info")
         return True
 
 
@@ -543,7 +535,7 @@ class FingerprintGenerationStage(ScanStage):
 
     def run(self, context: ScanContext) -> bool:
         if not context.files_to_process:
-            context.signals.log.emit("No new unique images found for AI processing.", "info")
+            context.signals.log_message.emit("No new unique images found for AI processing.", "info")
             return True
 
         pipeline_manager = PipelineManager(
@@ -573,7 +565,7 @@ class DatabaseIndexStage(ScanStage):
             if num_rows < 5000:
                 app_logger.info(f"Skipping index creation for a small dataset ({num_rows} items).")
                 return True
-            context.signals.log.emit(
+            context.signals.log_message.emit(
                 f"Large collection detected ({num_rows} items). Creating optimized index...", "info"
             )
             num_partitions = min(2048, max(128, int(num_rows**0.5)))
@@ -582,10 +574,10 @@ class DatabaseIndexStage(ScanStage):
                 metric="cosine", num_partitions=num_partitions, num_sub_vectors=num_sub_vectors, replace=True
             )
             app_logger.info(f"Successfully created IVFPQ index with {num_partitions} partitions.")
-            context.signals.log.emit("Database optimization complete.", "success")
+            context.signals.log_message.emit("Database optimization complete.", "success")
         except Exception as e:
             app_logger.error(f"Failed to create LanceDB index: {e}", exc_info=True)
-            context.signals.log.emit(f"Could not create database index: {e}", "warning")
+            context.signals.log_message.emit(f"Could not create database index: {e}", "warning")
         return True
 
 
@@ -603,5 +595,5 @@ class AILinkingStage(ScanStage):
         for path1, path2, dist in sim_engine.find_similar_pairs(context.stop_event):
             if context.stop_event.is_set():
                 return False
-            context.cluster_manager.add_evidence(Path(path1), Path(path2), "AI", dist)
+            context.cluster_manager.add_evidence(Path(path1), Path(path2), EvidenceMethod.AI.value, dist)
         return not context.stop_event.is_set()

@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from PySide6.QtCore import QObject, Signal
 
 from app.constants import (
     ALL_SUPPORTED_EXTENSIONS,
@@ -321,9 +320,23 @@ class ScanState:
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.phase_name, self.phase_details = "", ""
-        self.phase_current, self.phase_total = 0, 0
-        self.base_progress, self.phase_weight = 0.0, 0.0
+        # Initialize all attributes in the constructor
+        self.phase_name: str = ""
+        self.phase_details: str = ""
+        self.phase_current: int = 0
+        self.phase_total: int = 0
+        self.base_progress: float = 0.0
+        self.phase_weight: float = 0.0
+
+    def reset(self):
+        """Resets the state to its initial values for a new scan."""
+        with self.lock:
+            self.phase_name = ""
+            self.phase_details = ""
+            self.phase_current = 0
+            self.phase_total = 0
+            self.base_progress = 0.0
+            self.phase_weight = 0.0
 
     def set_phase(self, name: str, weight: float):
         """Transitions to a new scan phase and updates the base progress."""
@@ -342,13 +355,12 @@ class ScanState:
     def get_snapshot(self) -> dict[str, Any]:
         """Returns a thread-safe copy of the current state for UI updates."""
         with self.lock:
-            return self.__dict__.copy()
-
-
-class ScannerSignals(QObject):
-    """A collection of signals used by the scanner to communicate with the GUI."""
-
-    finished = Signal(object, int, object, float, list)
-    error = Signal(str)
-    log = Signal(str, str)
-    deletion_finished = Signal(list, int, int)
+            # Create a copy of attributes that don't include the lock object
+            return {
+                "phase_name": self.phase_name,
+                "phase_details": self.phase_details,
+                "phase_current": self.phase_current,
+                "phase_total": self.phase_total,
+                "base_progress": self.base_progress,
+                "phase_weight": self.phase_weight,
+            }

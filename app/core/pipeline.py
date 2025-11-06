@@ -22,13 +22,14 @@ from PySide6.QtCore import QObject
 from app.cache import CacheManager
 from app.constants import DB_WRITE_BATCH_SIZE, FP16_MODEL_SUFFIX, LANCEDB_AVAILABLE, MODELS_DIR
 from app.data_models import ImageFingerprint
+from app.services.signal_bus import SignalBus
 
 from . import worker
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from app.data_models import ScanConfig, ScannerSignals, ScanState
+    from app.data_models import ScanConfig, ScanState
 
 if LANCEDB_AVAILABLE:
     import lancedb
@@ -43,7 +44,7 @@ class PipelineManager(QObject):
         self,
         config: "ScanConfig",
         state: "ScanState",
-        signals: "ScannerSignals",
+        signals: SignalBus,
         lancedb_table: "lancedb.table.Table",
         files_to_process: list["Path"],
         stop_event: "threading.Event",
@@ -219,7 +220,7 @@ class PipelineManager(QObject):
     def _handle_batch_results(self, batch_fps, skipped_items, cache, fps_to_cache):
         """Processes a batch of results from the inference worker."""
         for path_str, reason in skipped_items:
-            self.signals.log.emit(f"Skipped {Path(path_str).name}: {reason}", "warning")
+            self.signals.log_message.emit(f"Skipped {Path(path_str).name}: {reason}", "warning")
         if batch_fps:
             self._add_to_lancedb(batch_fps)
             fps_to_cache.extend(batch_fps)
@@ -256,7 +257,7 @@ class PipelineManager(QObject):
             self.db_executor.submit(self.lancedb_table.add, data=arrow_table)
         except Exception as e:
             app_logger.error(f"Failed to create PyArrow table for LanceDB: {e}", exc_info=True)
-            self.signals.log.emit(f"Critical error preparing data for database: {e}", "error")
+            self.signals.log_message.emit(f"Critical error preparing data for database: {e}", "error")
 
     def _cleanup(self):
         """Terminates processes and cleans up shared memory."""

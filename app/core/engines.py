@@ -16,7 +16,8 @@ from app.constants import (
     SEARCH_PRECISION_PRESETS,
     SIMILARITY_SEARCH_K_NEIGHBORS,
 )
-from app.data_models import ScanConfig, ScannerSignals, ScanState
+from app.data_models import ScanConfig, ScanState
+from app.services.signal_bus import SignalBus
 
 if LANCEDB_AVAILABLE:
     import lancedb
@@ -80,7 +81,7 @@ class LanceDBSimilarityEngine(QObject):
         self,
         config: ScanConfig,
         state: ScanState,
-        signals: ScannerSignals,
+        signals: SignalBus,
         lancedb_db: "lancedb.DB",
         lancedb_table: "lancedb.table.Table",
     ):
@@ -100,7 +101,7 @@ class LanceDBSimilarityEngine(QObject):
             f"AI similarity search with precision '{config.search_precision}' "
             f"(k={SIMILARITY_SEARCH_K_NEIGHBORS}, nprobes={self.nprobes})"
         )
-        self.signals.log.emit(log_msg, "info")
+        self.signals.log_message.emit(log_msg, "info")
 
     def find_similar_pairs(self, stop_event: threading.Event) -> list[tuple[str, str, float]]:
         """Finds all pairs of similar images that are below the distance threshold IN PARALLEL."""
@@ -113,7 +114,7 @@ class LanceDBSimilarityEngine(QObject):
             if stop_event.is_set():
                 return []
         except Exception as e:
-            self.signals.log.emit(f"Failed to fetch data: {e}", "error")
+            self.signals.log_message.emit(f"Failed to fetch data: {e}", "error")
             return []
 
         all_data = arrow_table.to_pylist()
@@ -154,7 +155,7 @@ class LanceDBSimilarityEngine(QObject):
                         self.state.update_progress(processed_count, num_points, details=details)
 
         except Exception as e:
-            self.signals.log.emit(f"Error during parallel neighbor search: {e}", "error")
+            self.signals.log_message.emit(f"Error during parallel neighbor search: {e}", "error")
             app_logger.error("Parallel neighbor search failed", exc_info=True)
             return []
 

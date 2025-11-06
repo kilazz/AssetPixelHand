@@ -32,10 +32,8 @@ class QtHandler(logging.Handler):
     def emit(self, record):
         log_level = record.levelname.lower()
         message = self.format(record)
-        if hasattr(self.signals_emitter, "log_signal"):
-            self.signals_emitter.log_signal.emit(message, log_level)
-        elif hasattr(self.signals_emitter, "log"):  # Fallback for ScannerSignals
-            self.signals_emitter.log.emit(message, log_level)
+        if hasattr(self.signals_emitter, "log_message"):
+            self.signals_emitter.log_message.emit(message, log_level)
 
 
 def setup_logging(ui_signals_emitter: QObject | None = None, force_debug: bool = False):

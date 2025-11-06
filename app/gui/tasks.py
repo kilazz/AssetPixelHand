@@ -336,6 +336,7 @@ class FileOperationTask(QRunnable):
     class Signals(QObject):
         finished = Signal(list, int, int)
         log = Signal(str, str)
+        progress_updated = Signal(str, int, int)
 
     def __init__(
         self, operation: FileOperation, paths: list[Path] | None = None, link_map: dict[Path, Path] | None = None
@@ -360,7 +361,9 @@ class FileOperationTask(QRunnable):
     def _delete_worker(self, paths: list[Path]):
         """Moves a list of files to the system's trash."""
         moved, failed = [], 0
-        for path in paths:
+        total = len(paths)
+        for i, path in enumerate(paths, 1):
+            self.signals.progress_updated.emit(f"Deleting: {path.name}", i, total)
             try:
                 if path.exists():
                     send2trash.send2trash(str(path))
@@ -375,9 +378,11 @@ class FileOperationTask(QRunnable):
         """Replaces files with hardlinks or reflinks."""
         replaced, failed, failed_list = 0, 0, []
         affected = list(link_map.keys())
+        total = len(affected)
         can_reflink = hasattr(os, "reflink")
 
-        for link_path, source_path in link_map.items():
+        for i, (link_path, source_path) in enumerate(link_map.items(), 1):
+            self.signals.progress_updated.emit(f"Linking: {link_path.name}", i, total)
             try:
                 if not (link_path.exists() and source_path.exists()):
                     raise FileNotFoundError(f"Source or destination not found for {link_path.name}")
