@@ -24,13 +24,14 @@ from app.data_models import ImageFingerprint, ScanConfig, ScannerSignals, ScanSt
 from app.image_io import get_image_metadata
 from app.utils import find_best_in_group
 
-from .engines import FingerprintEngine, LanceDBSimilarityEngine
+from .engines import LanceDBSimilarityEngine
 from .hashing_worker import (
     worker_get_dhash,
     worker_get_phash,
     worker_get_xxhash,
 )
 from .helpers import FileFinder
+from .pipeline import PipelineManager
 
 IMAGEHASH_AVAILABLE = bool(importlib.util.find_spec("imagehash"))
 try:
@@ -42,229 +43,6 @@ except ImportError:
     SCIPY_AVAILABLE = False
 
 app_logger = logging.getLogger("AssetPixelHand.scan_stages")
-
-
-@dataclass
-class ScanContext:
-    """A data container passed between scan stages.
-
-    This object acts as a central repository for all data related to a single
-    scan run. Each stage can read from and write to this context, allowing
-    for a flow of data through the pipeline.
-    """
-
-    config: ScanConfig
-    state: ScanState
-    signals: ScannerSignals
-    stop_event: threading.Event
-    scanner_core: Any
-    all_image_fps: dict[Path, ImageFingerprint] = field(default_factory=dict)
-    files_to_process: list[Path] = field(default_factory=list)
-    cluster_manager: "PrecisionClusterManager" = field(default_factory=lambda: PrecisionClusterManager())
-    all_skipped_files: list[str] = field(default_factory=list)
-
-
-class ScanStage(ABC):
-    """Abstract base class for a single stage in the scanning pipeline.
-
-    Each concrete stage must implement the `run` method, which performs a specific
-    part of the scan process (e.g., reading metadata, generating fingerprints).
-    """
-
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """The name of the stage, used for logging and UI updates."""
-        pass
-
-    @abstractmethod
-    def run(self, context: ScanContext) -> bool:
-        """
-        Executes the stage.
-        Returns True to continue to the next stage, False to abort the scan.
-        """
-        pass
-
-
-class MetadataReadStage(ScanStage):
-    """Stage 1: Finds all files and reads their metadata in parallel."""
-
-    @property
-    def name(self) -> str:
-        return "Phase 1/6: Finding files and reading metadata..."
-
-    def run(self, context: ScanContext) -> bool:
-        finder = FileFinder(
-            context.state,
-            context.config.folder_path,
-            context.config.excluded_folders,
-            context.config.selected_extensions,
-            context.signals,
-        )
-        files_with_stats = [
-            entry
-            for batch in finder.stream_files(context.stop_event)
-            if not context.stop_event.is_set()
-            for entry in batch
-        ]
-        if context.stop_event.is_set():
-            return False
-
-        fingerprints, skipped = self._process_metadata_parallel(files_with_stats, context)
-        context.all_image_fps = fingerprints
-        context.all_skipped_files.extend(skipped)
-        context.files_to_process = list(fingerprints.keys())
-
-        if not context.files_to_process:
-            context.signals.log.emit("No image files found to process.", "info")
-            return False
-        return True
-
-    def _process_metadata_parallel(
-        self, files_with_stats: list[tuple[Path, Any]], context: ScanContext
-    ) -> tuple[dict[Path, ImageFingerprint], list[str]]:
-        fingerprints: dict[Path, ImageFingerprint] = {}
-        skipped_files: list[str] = []
-        with ThreadPoolExecutor(max_workers=context.config.perf.num_workers * 2) as executor:
-            future_to_path = {
-                executor.submit(self._process_single_metadata, entry): entry[0] for entry in files_with_stats
-            }
-            for i, future in enumerate(as_completed(future_to_path)):
-                if context.stop_event.is_set():
-                    for f in future_to_path:
-                        f.cancel()
-                    break
-
-                path = future_to_path[future]
-                try:
-                    if fp := future.result():
-                        fingerprints[fp.path] = fp
-                except Exception as e:
-                    app_logger.warning(f"Metadata processing failed for {path}: {e}")
-                    skipped_files.append(str(path))
-
-                if (i + 1) % 100 == 0:
-                    details = f"Reading: {path.name}"
-                    context.state.update_progress(i + 1, len(files_with_stats), details=details)
-
-        return fingerprints, skipped_files
-
-    @staticmethod
-    def _process_single_metadata(entry: tuple[Path, Any]) -> ImageFingerprint | None:
-        path, stat_result = entry
-        try:
-            meta = get_image_metadata(path, precomputed_stat=stat_result)
-            return ImageFingerprint(path=path, hashes=np.array([]), **meta) if meta else None
-        except Exception as e:
-            app_logger.debug(f"Failed to process metadata for {path}: {e}")
-            return None
-
-
-class HashingExecutionStage(ScanStage):
-    """Stage 2: Runs the multi-level hashing pipeline (xxHash, dHash, pHash)."""
-
-    @property
-    def name(self) -> str:
-        # The runner class sets more specific phase names internally
-        return "Phase 2-4/6: Finding duplicates with hashing..."
-
-    def run(self, context: ScanContext) -> bool:
-        runner = HashingStageRunner(
-            context.config, context.state, context.signals, context.cluster_manager, context.all_image_fps
-        )
-        reps = context.files_to_process
-        ctx = multiprocessing.get_context("spawn")
-
-        if context.config.find_exact_duplicates:
-            reps = runner.run_stage("xxhash", reps, context.stop_event, ctx)
-            if context.stop_event.is_set():
-                return False
-
-        if context.config.find_simple_duplicates:
-            reps = runner.run_stage("dhash", reps, context.stop_event, ctx)
-            if context.stop_event.is_set():
-                return False
-
-        if context.config.find_perceptual_duplicates:
-            reps = runner.run_stage("phash", reps, context.stop_event, ctx)
-            if context.stop_event.is_set():
-                return False
-
-        context.files_to_process = reps
-        context.signals.log.emit(f"Found {len(reps)} unique candidates for AI processing.", "info")
-        return True
-
-
-class FingerprintGenerationStage(ScanStage):
-    """Stage 3: Generates AI fingerprints for the remaining unique images."""
-
-    @property
-    def name(self) -> str:
-        return "Phase 5/6: Creating AI fingerprints..."
-
-    def run(self, context: ScanContext) -> bool:
-        if not context.files_to_process:
-            context.signals.log.emit("No new unique images found for AI processing.", "info")
-            return True
-
-        fp_engine = FingerprintEngine(context.config, context.state, context.signals, context.scanner_core.table)
-        success, skipped = fp_engine.process_all(context.files_to_process, context.stop_event)
-        context.all_skipped_files.extend(skipped)
-        return success
-
-
-class DatabaseIndexStage(ScanStage):
-    """Stage 4: Creates an optimized index in LanceDB for large datasets."""
-
-    @property
-    def name(self) -> str:
-        return "Optimizing database for fast search..."
-
-    def run(self, context: ScanContext) -> bool:
-        try:
-            table = context.scanner_core.table
-            num_rows = table.to_lance().count_rows()
-            if num_rows < 5000:
-                app_logger.info(f"Skipping index creation for a small dataset ({num_rows} items).")
-                return True
-
-            context.signals.log.emit(
-                f"Large collection detected ({num_rows} items). Creating optimized index...", "info"
-            )
-
-            num_partitions = min(2048, max(128, int(num_rows**0.5)))
-            num_sub_vectors = 96 if context.config.model_dim >= 768 else 64
-
-            table.create_index(
-                metric="cosine", num_partitions=num_partitions, num_sub_vectors=num_sub_vectors, replace=True
-            )
-            app_logger.info(f"Successfully created IVFPQ index with {num_partitions} partitions.")
-            context.signals.log.emit("Database optimization complete.", "success")
-        except Exception as e:
-            app_logger.error(f"Failed to create LanceDB index: {e}", exc_info=True)
-            context.signals.log.emit(f"Could not create database index: {e}", "warning")
-
-        return True
-
-
-class AILinkingStage(ScanStage):
-    """Stage 5: Runs AI similarity search to find the final links between images."""
-
-    @property
-    def name(self) -> str:
-        return "Phase 6/6: Finding similar images (AI)..."
-
-    def run(self, context: ScanContext) -> bool:
-        sim_engine = LanceDBSimilarityEngine(
-            context.config, context.state, context.signals, context.scanner_core.db, context.scanner_core.table
-        )
-
-        for path1, path2, dist in sim_engine.find_similar_pairs(context.stop_event):
-            if context.stop_event.is_set():
-                return False
-            context.cluster_manager.add_evidence(Path(path1), Path(path2), "AI", dist)
-
-        return not context.stop_event.is_set()
 
 
 class EvidenceMethod(Enum):
@@ -589,12 +367,18 @@ class HashingStageRunner:
             results: list[tuple] = []
         else:
             results = defaultdict(list)
+
+        files_list = list(files)  # Create a list for indexed access
         with ctx.Pool(processes=self.config.perf.num_workers) as pool:
-            for i, result in enumerate(pool.imap_unordered(worker_func, files, config.batch_size), 1):
+            for i, result in enumerate(pool.imap_unordered(worker_func, files_list, config.batch_size), 1):
                 if stop_event.is_set():
                     return [] if return_pairs else {}
+
                 if i % config.update_interval == 0:
-                    self.state.update_progress(i, len(files))
+                    path = result[1]
+                    details_text = f"Hashing: {path.name}"
+                    self.state.update_progress(i, len(files_list), details=details_text)
+
                 if result and result[0] is not None:
                     if return_pairs:
                         results.append(result)
@@ -602,3 +386,222 @@ class HashingStageRunner:
                         file_hash, path = result
                         results[file_hash].append(path)
         return results
+
+
+@dataclass
+class ScanContext:
+    """A data container passed between scan stages.
+
+    This object acts as a central repository for all data related to a single
+    scan run. Each stage can read from and write to this context, allowing
+    for a flow of data through the pipeline.
+    """
+
+    config: ScanConfig
+    state: ScanState
+    signals: ScannerSignals
+    stop_event: threading.Event
+    scanner_core: Any
+    all_image_fps: dict[Path, ImageFingerprint] = field(default_factory=dict)
+    files_to_process: list[Path] = field(default_factory=list)
+    cluster_manager: PrecisionClusterManager = field(default_factory=PrecisionClusterManager)
+    all_skipped_files: list[str] = field(default_factory=list)
+
+
+class ScanStage(ABC):
+    """Abstract base class for a single stage in the scanning pipeline.
+
+    Each concrete stage must implement the `run` method, which performs a specific
+    part of the scan process (e.g., reading metadata, generating fingerprints).
+    """
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """The name of the stage, used for logging and UI updates."""
+        pass
+
+    @abstractmethod
+    def run(self, context: ScanContext) -> bool:
+        """
+        Executes the stage.
+        Returns True to continue to the next stage, False to abort the scan.
+        """
+        pass
+
+
+class MetadataReadStage(ScanStage):
+    """Stage 1: Finds all files and reads their metadata in parallel."""
+
+    @property
+    def name(self) -> str:
+        return "Phase 1/6: Finding files and reading metadata..."
+
+    def run(self, context: ScanContext) -> bool:
+        finder = FileFinder(
+            context.state,
+            context.config.folder_path,
+            context.config.excluded_folders,
+            context.config.selected_extensions,
+            context.signals,
+        )
+        files_with_stats = [
+            entry
+            for batch in finder.stream_files(context.stop_event)
+            if not context.stop_event.is_set()
+            for entry in batch
+        ]
+        if context.stop_event.is_set():
+            return False
+
+        fingerprints, skipped = self._process_metadata_parallel(files_with_stats, context)
+        context.all_image_fps = fingerprints
+        context.all_skipped_files.extend(skipped)
+        context.files_to_process = list(fingerprints.keys())
+
+        if not context.files_to_process:
+            context.signals.log.emit("No image files found to process.", "info")
+            return False
+        return True
+
+    def _process_metadata_parallel(
+        self, files_with_stats: list[tuple[Path, Any]], context: ScanContext
+    ) -> tuple[dict[Path, ImageFingerprint], list[str]]:
+        fingerprints: dict[Path, ImageFingerprint] = {}
+        skipped_files: list[str] = []
+        with ThreadPoolExecutor(max_workers=context.config.perf.num_workers * 2) as executor:
+            future_to_path = {
+                executor.submit(self._process_single_metadata, entry): entry[0] for entry in files_with_stats
+            }
+            for i, future in enumerate(as_completed(future_to_path)):
+                if context.stop_event.is_set():
+                    for f in future_to_path:
+                        f.cancel()
+                    break
+
+                path = future_to_path[future]
+                try:
+                    if fp := future.result():
+                        fingerprints[fp.path] = fp
+                except Exception as e:
+                    app_logger.warning(f"Metadata processing failed for {path}: {e}")
+                    skipped_files.append(str(path))
+
+                if (i + 1) % 100 == 0:
+                    details = f"Reading: {path.name}"
+                    context.state.update_progress(i + 1, len(files_with_stats), details=details)
+
+        return fingerprints, skipped_files
+
+    @staticmethod
+    def _process_single_metadata(entry: tuple[Path, Any]) -> ImageFingerprint | None:
+        path, stat_result = entry
+        try:
+            meta = get_image_metadata(path, precomputed_stat=stat_result)
+            return ImageFingerprint(path=path, hashes=np.array([]), **meta) if meta else None
+        except Exception as e:
+            app_logger.debug(f"Failed to process metadata for {path}: {e}")
+            return None
+
+
+class HashingExecutionStage(ScanStage):
+    """Stage 2: Runs the multi-level hashing pipeline (xxHash, dHash, pHash)."""
+
+    @property
+    def name(self) -> str:
+        return "Phase 2-4/6: Finding duplicates with hashing..."
+
+    def run(self, context: ScanContext) -> bool:
+        runner = HashingStageRunner(
+            context.config, context.state, context.signals, context.cluster_manager, context.all_image_fps
+        )
+        reps = context.files_to_process
+        ctx = multiprocessing.get_context("spawn")
+        if context.config.find_exact_duplicates:
+            reps = runner.run_stage("xxhash", reps, context.stop_event, ctx)
+            if context.stop_event.is_set():
+                return False
+        if context.config.find_simple_duplicates:
+            reps = runner.run_stage("dhash", reps, context.stop_event, ctx)
+            if context.stop_event.is_set():
+                return False
+        if context.config.find_perceptual_duplicates:
+            reps = runner.run_stage("phash", reps, context.stop_event, ctx)
+            if context.stop_event.is_set():
+                return False
+        context.files_to_process = reps
+        context.signals.log.emit(f"Found {len(reps)} unique candidates for AI processing.", "info")
+        return True
+
+
+class FingerprintGenerationStage(ScanStage):
+    """Stage 3: Generates AI fingerprints for the remaining unique images."""
+
+    @property
+    def name(self) -> str:
+        return "Phase 5/6: Creating AI fingerprints..."
+
+    def run(self, context: ScanContext) -> bool:
+        if not context.files_to_process:
+            context.signals.log.emit("No new unique images found for AI processing.", "info")
+            return True
+
+        pipeline_manager = PipelineManager(
+            config=context.config,
+            state=context.state,
+            signals=context.signals,
+            lancedb_table=context.scanner_core.table,
+            files_to_process=context.files_to_process,
+            stop_event=context.stop_event,
+        )
+        success, skipped = pipeline_manager.run()
+        context.all_skipped_files.extend(skipped)
+        return success
+
+
+class DatabaseIndexStage(ScanStage):
+    """Stage 4: Creates an optimized index in LanceDB for large datasets."""
+
+    @property
+    def name(self) -> str:
+        return "Optimizing database for fast search..."
+
+    def run(self, context: ScanContext) -> bool:
+        try:
+            table = context.scanner_core.table
+            num_rows = table.to_lance().count_rows()
+            if num_rows < 5000:
+                app_logger.info(f"Skipping index creation for a small dataset ({num_rows} items).")
+                return True
+            context.signals.log.emit(
+                f"Large collection detected ({num_rows} items). Creating optimized index...", "info"
+            )
+            num_partitions = min(2048, max(128, int(num_rows**0.5)))
+            num_sub_vectors = 96 if context.config.model_dim >= 768 else 64
+            table.create_index(
+                metric="cosine", num_partitions=num_partitions, num_sub_vectors=num_sub_vectors, replace=True
+            )
+            app_logger.info(f"Successfully created IVFPQ index with {num_partitions} partitions.")
+            context.signals.log.emit("Database optimization complete.", "success")
+        except Exception as e:
+            app_logger.error(f"Failed to create LanceDB index: {e}", exc_info=True)
+            context.signals.log.emit(f"Could not create database index: {e}", "warning")
+        return True
+
+
+class AILinkingStage(ScanStage):
+    """Stage 5: Runs AI similarity search to find the final links between images."""
+
+    @property
+    def name(self) -> str:
+        return "Phase 6/6: Finding similar images (AI)..."
+
+    def run(self, context: ScanContext) -> bool:
+        sim_engine = LanceDBSimilarityEngine(
+            context.config, context.state, context.signals, context.scanner_core.db, context.scanner_core.table
+        )
+        for path1, path2, dist in sim_engine.find_similar_pairs(context.stop_event):
+            if context.stop_event.is_set():
+                return False
+            context.cluster_manager.add_evidence(Path(path1), Path(path2), "AI", dist)
+        return not context.stop_event.is_set()

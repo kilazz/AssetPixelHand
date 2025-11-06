@@ -19,7 +19,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-from app.constants import APP_DATA_DIR, DEEP_LEARNING_AVAILABLE, MODELS_DIR, WIN32_AVAILABLE
+from app.constants import APP_DATA_DIR, DEEP_LEARNING_AVAILABLE, FP16_MODEL_SUFFIX, MODELS_DIR, WIN32_AVAILABLE
 from app.data_models import ImageFingerprint
 from app.image_io import (
     DIRECTXTEX_AVAILABLE,
@@ -53,36 +53,47 @@ def normalize_vectors_numpy(embeddings: np.ndarray) -> np.ndarray:
 class InferenceEngine:
     """A heavyweight class that loads ONNX models for actual inference."""
 
-    def __init__(self, model_name: str, device: str = "cpu"):
+    def __init__(self, model_name: str, device: str = "cpu", threads_per_worker: int = 2):
         if not DEEP_LEARNING_AVAILABLE:
             raise ImportError("Required deep learning libraries not found.")
         from transformers import AutoProcessor
 
         model_dir = MODELS_DIR / model_name
         self.processor = AutoProcessor.from_pretrained(model_dir)
-        self.is_fp16 = "_fp16" in model_name.lower()
+        self.is_fp16 = FP16_MODEL_SUFFIX in model_name.lower()
         self.text_session, self.text_input_names = None, set()
         image_proc = getattr(self.processor, "image_processor", self.processor)
         size_cfg = getattr(image_proc, "size", {}) or getattr(image_proc, "crop_size", {})
         self.input_size = (size_cfg["height"], size_cfg["width"]) if "height" in size_cfg else (224, 224)
-        self._load_onnx_model(model_dir, device)
+        self._load_onnx_model(model_dir, device, threads_per_worker)
 
-    def _load_onnx_model(self, model_dir: Path, device: str):
+    def _load_onnx_model(self, model_dir: Path, device: str, threads_per_worker: int):
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
         providers = ["CPUExecutionProvider"]
+        provider_options = None
+
         if device == "gpu":
             providers.insert(0, "DmlExecutionProvider")
             if self.is_fp16 and hasattr(opts, "enable_float16_for_dml"):
                 opts.enable_float16_for_dml = True
+        else:  # CPU-specific optimizations
+            opts.inter_op_num_threads = 1
+            opts.intra_op_num_threads = threads_per_worker
 
-        self.visual_session = ort.InferenceSession(str(model_dir / "visual.onnx"), opts, providers=providers)
+        self.visual_session = ort.InferenceSession(
+            str(model_dir / "visual.onnx"), opts, providers=providers, provider_options=provider_options
+        )
         if (text_model_path := model_dir / "text.onnx").exists():
-            self.text_session = ort.InferenceSession(str(text_model_path), opts, providers=providers)
+            self.text_session = ort.InferenceSession(
+                str(text_model_path), opts, providers=providers, provider_options=provider_options
+            )
             self.text_input_names = {i.name for i in self.text_session.get_inputs()}
 
-        app_logger.info(f"Worker PID {os.getpid()}: ONNX models loaded on '{self.visual_session.get_providers()[0]}'")
+        provider_name = self.visual_session.get_providers()[0]
+        thread_info = f"({threads_per_worker} threads/worker)" if device == "cpu" else ""
+        app_logger.info(f"Worker PID {os.getpid()}: ONNX models loaded on '{provider_name}' {thread_info}")
 
     def get_text_features(self, text: str) -> np.ndarray:
         if not self.text_session:
@@ -122,7 +133,10 @@ def init_worker(config: dict):
     global g_inference_engine
     _init_worker_process(config)
     try:
-        g_inference_engine = InferenceEngine(config["model_name"], device=config.get("device", "cpu"))
+        threads = config.get("threads_per_worker", 2)
+        g_inference_engine = InferenceEngine(
+            model_name=config["model_name"], device=config.get("device", "cpu"), threads_per_worker=threads
+        )
     except Exception as e:
         _log_worker_crash(e, "init_worker")
 

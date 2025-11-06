@@ -26,8 +26,9 @@ from app.data_models import (
 )
 from app.image_io import get_image_metadata
 
-from .engines import FingerprintEngine, LanceDBSimilarityEngine
+from .engines import LanceDBSimilarityEngine
 from .helpers import FileFinder
+from .pipeline import PipelineManager
 from .scan_stages import (
     AILinkingStage,
     DatabaseIndexStage,
@@ -74,14 +75,21 @@ class ScanStrategy(ABC):
     def _generate_fingerprints(
         self, files: list[Path], stop_event: threading.Event, phase_count: int, current_phase: int, weight: float
     ) -> tuple[bool, list[str]]:
-        """Generate AI fingerprints for a list of files."""
+        """Generate AI fingerprints for a list of files using the unified pipeline."""
         self.state.set_phase(f"Phase {current_phase}/{phase_count}: Creating AI fingerprints...", weight)
         if not files:
             self.signals.log.emit("No new unique images found for AI processing.", "info")
             return True, []
 
-        fp_engine = FingerprintEngine(self.config, self.state, self.signals, self.table)
-        success, skipped = fp_engine.process_all(files, stop_event)
+        pipeline_manager = PipelineManager(
+            config=self.config,
+            state=self.state,
+            signals=self.signals,
+            lancedb_table=self.table,
+            files_to_process=files,
+            stop_event=stop_event,
+        )
+        success, skipped = pipeline_manager.run()
         self.all_skipped_files.extend(skipped)
         return success, skipped
 
@@ -170,7 +178,6 @@ class FindDuplicatesStrategy(ScanStrategy):
 
     def __init__(self, *args):
         super().__init__(*args)
-        # The entire scan pipeline is now defined centrally here.
         self.pipeline = [
             (MetadataReadStage(), 0.15),
             (HashingExecutionStage(), 0.30),
