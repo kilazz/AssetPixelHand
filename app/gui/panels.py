@@ -524,12 +524,19 @@ class PerformancePanel(QGroupBox):
         layout.addRow(self.num_workers_label, self.num_workers_spin)
 
     def _connect_signals(self):
-        self.device_combo.currentTextChanged.connect(self.settings_manager.set_device)
+        self.device_combo.currentIndexChanged.connect(self._on_device_selection_changed)
         self.quant_combo.currentTextChanged.connect(self.settings_manager.set_quantization_mode)
         self.batch_size_spin.valueChanged.connect(self.settings_manager.set_batch_size)
         self.search_precision_combo.currentTextChanged.connect(self.settings_manager.set_search_precision)
         self.num_workers_spin.valueChanged.connect(self.settings_manager.set_num_workers)
         self.device_combo.currentTextChanged.connect(lambda: self._on_device_change(self.device_combo.currentData()))
+
+    @Slot(int)
+    def _on_device_selection_changed(self, index: int):
+        """Gets the internal data ('gpu' or 'cpu') and sends it to the settings manager."""
+        device_data = self.device_combo.itemData(index)
+        if device_data:
+            self.settings_manager.set_device(device_data)
 
     def _detect_and_setup_devices(self):
         self.device_combo.addItem("CPU", "cpu")
@@ -573,7 +580,10 @@ class PerformancePanel(QGroupBox):
         )
 
     def load_settings(self, s: AppSettings):
-        self.device_combo.setCurrentText(s.performance.device)
+        device_value = s.performance.device
+        index = self.device_combo.findData(device_value)
+        if index != -1:
+            self.device_combo.setCurrentIndex(index)
         self.quant_combo.setCurrentText(s.performance.quantization_mode)
         self.batch_size_spin.setValue(int(s.performance.batch_size))
         self.search_precision_combo.setCurrentText(s.performance.search_precision)
