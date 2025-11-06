@@ -6,7 +6,6 @@ of the application's main window, organizing all user-facing controls and views.
 import logging
 import multiprocessing
 import webbrowser
-from enum import Enum, auto
 from pathlib import Path
 
 import duckdb
@@ -52,7 +51,7 @@ from app.constants import (
     TonemapMode,
     UIConfig,
 )
-from app.data_models import AppSettings, ScanMode
+from app.data_models import AppSettings, FileOperation, ScanMode
 from app.view_models import ImageComparerState
 
 from .dialogs import FileTypesDialog
@@ -614,12 +613,6 @@ class LogPanel(QGroupBox):
         self.log_edit.clear()
 
 
-class FileOperation(Enum):
-    """Enum to track the current file operation in progress."""
-
-    NONE, DELETING, HARDLINKING, REFLINKING = auto(), auto(), auto(), auto()
-
-
 class ResultsPanel(QGroupBox):
     """Displays scan results in a tree view and provides actions for them."""
 
@@ -936,15 +929,19 @@ class ResultsPanel(QGroupBox):
             if self.results_view.isExpanded(proxy_index):
                 source_index = self.proxy_model.mapToSource(proxy_index)
                 node = source_index.internalPointer()
-                if node and "group_id" in node:
-                    expanded_ids.add(node["group_id"])
+                if node and hasattr(node, "group_id"):
+                    expanded_ids.add(node.group_id)
         return expanded_ids
 
     def _restore_expanded_group_ids(self, gids: set[int]):
         for i in range(self.proxy_model.rowCount()):
             proxy_index = self.proxy_model.index(i, 0)
             source_index = self.proxy_model.mapToSource(proxy_index)
-            if source_index.isValid() and source_index.internalPointer().get("group_id") in gids:
+            if (
+                source_index.isValid()
+                and hasattr(source_index.internalPointer(), "group_id")
+                and source_index.internalPointer().group_id in gids
+            ):
                 self.results_view.expand(proxy_index)
 
     @Slot(str)

@@ -6,7 +6,7 @@ consistency and avoids circular import dependencies.
 
 import json
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -31,6 +31,15 @@ class ScanMode(Enum):
     DUPLICATES = auto()
     TEXT_SEARCH = auto()
     SAMPLE_SEARCH = auto()
+
+
+class FileOperation(Enum):
+    """Enum to track the current file operation in progress."""
+
+    NONE = auto()
+    DELETING = auto()
+    HARDLINKING = auto()
+    REFLINKING = auto()
 
 
 @dataclass
@@ -92,6 +101,50 @@ DuplicateInfo = tuple[ImageFingerprint, int]
 DuplicateGroup = set[DuplicateInfo]
 DuplicateResults = dict[ImageFingerprint, Any]
 SearchResult = list[tuple[ImageFingerprint, float]]
+
+
+# --- Type-safe nodes for the results tree view model ---
+
+
+@dataclass
+class ResultNode:
+    """Represents a single file (result) in the results tree view."""
+
+    path: str
+    is_best: bool
+    group_id: int
+    resolution_w: int
+    resolution_h: int
+    file_size: int
+    mtime: float
+    capture_date: float | None
+    distance: int
+    format_str: str
+    format_details: str
+    has_alpha: bool
+    bit_depth: int
+    found_by: str
+    type: str = "result"  # Field for type checking within the model logic
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ResultNode":
+        """Creates an instance from a dictionary, safely ignoring extra keys."""
+        class_fields = {f.name for f in fields(cls)}
+        filtered_data = {k: v for k, v in data.items() if k in class_fields}
+        return cls(**filtered_data)
+
+
+@dataclass
+class GroupNode:
+    """Represents a group of duplicates in the results tree view."""
+
+    name: str
+    count: int
+    total_size: int
+    group_id: int
+    children: list[ResultNode] = field(default_factory=list)
+    fetched: bool = False
+    type: str = "group"
 
 
 @dataclass

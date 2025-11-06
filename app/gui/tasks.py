@@ -19,7 +19,7 @@ from app.constants import (
     QuantizationMode,
     TonemapMode,
 )
-from app.data_models import ScanMode
+from app.data_models import FileOperation, ScanMode
 from app.image_io import load_image
 from app.model_adapter import get_model_adapter
 
@@ -337,22 +337,25 @@ class FileOperationTask(QRunnable):
         finished = Signal(list, int, int)
         log = Signal(str, str)
 
-    def __init__(self, mode: str, paths: list[Path] | None = None, link_map: dict[Path, Path] | None = None):
+    def __init__(
+        self, operation: FileOperation, paths: list[Path] | None = None, link_map: dict[Path, Path] | None = None
+    ):
         super().__init__()
         self.setAutoDelete(True)
-        self.mode = mode
+        self.operation = operation
         self.paths = paths or []
         self.link_map = link_map or {}
         self.signals = self.Signals()
 
     def run(self):
         """Executes the file operation based on the specified mode."""
-        if self.mode == "delete":
+        if self.operation == FileOperation.DELETING:
             self._delete_worker(self.paths)
-        elif self.mode in ["hardlink", "reflink"]:
-            self._link_worker(self.link_map, self.mode)
+        elif self.operation in [FileOperation.HARDLINKING, FileOperation.REFLINKING]:
+            method = "reflink" if self.operation == FileOperation.REFLINKING else "hardlink"
+            self._link_worker(self.link_map, method)
         else:
-            self.signals.log.emit(f"Unknown file operation mode: {self.mode}", "error")
+            self.signals.log.emit(f"Unknown file operation mode: {self.operation.name}", "error")
 
     def _delete_worker(self, paths: list[Path]):
         """Moves a list of files to the system's trash."""

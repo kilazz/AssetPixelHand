@@ -26,10 +26,9 @@ from app.constants import (
     BEST_FILE_METHOD_NAME,
     DUCKDB_AVAILABLE,
     METHOD_DISPLAY_NAMES,
-    NODE_TYPE_GROUP,
     UIConfig,
 )
-from app.data_models import ScanMode
+from app.data_models import GroupNode, ResultNode, ScanMode
 from app.utils import find_common_base_name
 
 if TYPE_CHECKING:
@@ -56,7 +55,7 @@ class ResultsTreeModel(QAbstractItemModel):
         super().__init__(parent)
         self.db_path: Path | None = None
         self.mode: ScanMode | str = ""
-        self.groups_data: dict[int, dict] = {}
+        self.groups_data: dict[int, GroupNode] = {}
         self.sorted_group_ids: list[int] = []
         self.check_states: dict[str, Qt.CheckState] = {}
         self.filter_text = ""
@@ -131,15 +130,9 @@ class ResultsTreeModel(QAbstractItemModel):
                             group_name = f"Sample: {search_context.split(':', 1)[1]}"
                         elif search_context.startswith("query:"):
                             group_name = f"Query: '{search_context.split(':', 1)[1]}'"
-                    self.groups_data[group_id] = {
-                        "type": NODE_TYPE_GROUP,
-                        "name": group_name,
-                        "count": count,
-                        "total_size": total_size,
-                        "children": [],
-                        "group_id": group_id,
-                        "fetched": False,
-                    }
+                    self.groups_data[group_id] = GroupNode(
+                        name=group_name, count=count, total_size=total_size, group_id=group_id
+                    )
                 self.sorted_group_ids = list(self.groups_data.keys())
         except duckdb.Error as e:
             app_logger.error(f"Failed to read results from DuckDB: {e}", exc_info=True)
@@ -148,8 +141,8 @@ class ResultsTreeModel(QAbstractItemModel):
         parent = parent or QModelIndex()
         if not parent.isValid():
             return len(self.sorted_group_ids)
-        node = parent.internalPointer()
-        return len(node.get("children", [])) if node and node.get("type") == NODE_TYPE_GROUP else 0
+        node: GroupNode | ResultNode = parent.internalPointer()
+        return len(node.children) if isinstance(node, GroupNode) else 0
 
     def columnCount(self, parent: QModelIndex | None = None) -> int:
         return 4
@@ -157,11 +150,11 @@ class ResultsTreeModel(QAbstractItemModel):
     def parent(self, index):
         if not index.isValid():
             return QModelIndex()
-        node = index.internalPointer()
-        if not node or node.get("type") == NODE_TYPE_GROUP:
+        node: ResultNode | GroupNode = index.internalPointer()
+        if not node or isinstance(node, GroupNode):
             return QModelIndex()
-        if (group_id := node.get("group_id")) and group_id in self.sorted_group_ids:
-            return self.createIndex(self.sorted_group_ids.index(group_id), 0, self.groups_data[group_id])
+        if node.group_id in self.sorted_group_ids:
+            return self.createIndex(self.sorted_group_ids.index(node.group_id), 0, self.groups_data[node.group_id])
         return QModelIndex()
 
     def index(self, row, col, parent: QModelIndex | None = None):
@@ -172,32 +165,32 @@ class ResultsTreeModel(QAbstractItemModel):
             if row < len(self.sorted_group_ids):
                 return self.createIndex(row, col, self.groups_data[self.sorted_group_ids[row]])
         else:
-            parent_node = parent.internalPointer()
-            if parent_node and row < len(parent_node.get("children", [])):
-                return self.createIndex(row, col, parent_node["children"][row])
+            parent_node: GroupNode = parent.internalPointer()
+            if parent_node and row < len(parent_node.children):
+                return self.createIndex(row, col, parent_node.children[row])
         return QModelIndex()
 
     def hasChildren(self, parent: QModelIndex | None = None) -> bool:
         parent = parent or QModelIndex()
         if not parent.isValid():
             return bool(self.groups_data)
-        node = parent.internalPointer()
-        return node and node.get("type") == NODE_TYPE_GROUP and node.get("count", 0) > 0
+        node: GroupNode = parent.internalPointer()
+        return node and isinstance(node, GroupNode) and node.count > 0
 
     def canFetchMore(self, parent):
         if not parent.isValid():
             return False
-        node = parent.internalPointer()
-        if not node or node.get("type") != NODE_TYPE_GROUP:
+        node: GroupNode = parent.internalPointer()
+        if not node or not isinstance(node, GroupNode):
             return False
-        return not node.get("fetched") and node.get("group_id") not in self.running_tasks
+        return not node.fetched and node.group_id not in self.running_tasks
 
     def fetchMore(self, parent):
         if not self.canFetchMore(parent):
             return
 
-        node = parent.internalPointer()
-        group_id = node.get("group_id")
+        node: GroupNode = parent.internalPointer()
+        group_id = node.group_id
 
         task = GroupFetcherTask(self.db_path, group_id, self.mode, parent)
         task.signals.finished.connect(self._on_fetch_finished)
@@ -207,22 +200,21 @@ class ResultsTreeModel(QAbstractItemModel):
         QThreadPool.globalInstance().start(task)
 
     @Slot(list, int, QModelIndex)
-    def _on_fetch_finished(self, children: list, group_id: int, parent_index: QModelIndex):
+    def _on_fetch_finished(self, children_dicts: list[dict], group_id: int, parent_index: QModelIndex):
         if group_id not in self.running_tasks or group_id not in self.groups_data:
             return
 
         node = self.groups_data[group_id]
+        children = [ResultNode.from_dict(c) for c in children_dicts]
 
         for child in children:
-            child["group_id"] = group_id
-            path_str = child["path"]
-            self.path_to_group_id[path_str] = group_id
-            if child.get("is_best"):
-                self.group_id_to_best_path[group_id] = path_str
+            self.path_to_group_id[child.path] = group_id
+            if child.is_best:
+                self.group_id_to_best_path[group_id] = child.path
 
         self.beginInsertRows(parent_index, 0, len(children) - 1)
-        node["children"] = children
-        node["fetched"] = True
+        node.children = children
+        node.fetched = True
         self.endInsertRows()
 
         del self.running_tasks[group_id]
@@ -240,16 +232,16 @@ class ResultsTreeModel(QAbstractItemModel):
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
-        node = index.internalPointer()
+        node: GroupNode | ResultNode = index.internalPointer()
 
         if role == SortRole:
-            if node.get("type") == NODE_TYPE_GROUP:
+            if isinstance(node, GroupNode):
                 return -1  # Groups should not be sorted with children
 
-            if node.get("is_best"):
+            if node.is_best:
                 return 102  # Highest value for "Best"
 
-            method = node.get("found_by")
+            method = node.found_by
             if method == "xxHash":
                 return 101  # Exact Match
             if method == "dHash":
@@ -257,100 +249,96 @@ class ResultsTreeModel(QAbstractItemModel):
             if method == "pHash":
                 return 99  # Near-Identical (Lower)
 
-            return node.get("distance", -1)
+            return node.distance
 
         if role == Qt.ItemDataRole.DisplayRole:
             return self._get_display_data(index, node)
 
         if role == Qt.ItemDataRole.CheckStateRole and index.column() == 0 and self.hasChildren():
-            if node.get("type") == NODE_TYPE_GROUP:
-                if not node.get("fetched"):
+            if isinstance(node, GroupNode):
+                if not node.fetched:
                     return Qt.CheckState.Unchecked
 
-                children = node.get("children", [])
-                if not children:
+                if not node.children:
                     return Qt.CheckState.Unchecked
 
                 checked_count = sum(
-                    1 for child in children if self.check_states.get(child["path"]) == Qt.CheckState.Checked
+                    1 for child in node.children if self.check_states.get(child.path) == Qt.CheckState.Checked
                 )
 
                 if checked_count == 0:
                     return Qt.CheckState.Unchecked
-                elif checked_count == len(children):
+                elif checked_count == len(node.children):
                     return Qt.CheckState.Checked
                 else:
                     return Qt.CheckState.PartiallyChecked
-            else:
-                return self.check_states.get(node["path"], Qt.CheckState.Unchecked)
+            else:  # ResultNode
+                return self.check_states.get(node.path, Qt.CheckState.Unchecked)
 
-        if (
-            role == Qt.ItemDataRole.FontRole
-            and index.column() == 0
-            and (node.get("type") == NODE_TYPE_GROUP or node.get("is_best"))
+        if (role == Qt.ItemDataRole.FontRole and index.column() == 0) and (
+            isinstance(node, GroupNode) or (isinstance(node, ResultNode) and node.is_best)
         ):
             font = QFont()
             font.setBold(True)
             return font
 
-        if role == Qt.ItemDataRole.BackgroundRole and node.get("is_best"):
+        if role == Qt.ItemDataRole.BackgroundRole and isinstance(node, ResultNode) and node.is_best:
             return QBrush(QColor(UIConfig.Colors.BEST_FILE_BG))
 
         return None
 
-    def _get_display_data(self, index, node):
-        if node.get("type") == NODE_TYPE_GROUP:
-            name, count = node["name"], node["count"]
+    def _get_display_data(self, index, node: GroupNode | ResultNode):
+        if isinstance(node, GroupNode):
             is_search = self.mode in [ScanMode.TEXT_SEARCH, ScanMode.SAMPLE_SEARCH]
-            display_text = f"{name} ({count} results)" if is_search else f"Group: {name} ({count} duplicates)"
+            display_text = (
+                f"{node.name} ({node.count} results)" if is_search else f"Group: {node.name} ({node.count} duplicates)"
+            )
             return display_text if index.column() == 0 else ""
 
-        path = Path(node["path"])
+        # Here, node is a ResultNode
+        path = Path(node.path)
         col = index.column()
 
         if col == 0:
             return path.name
         elif col == 1:
-            if node.get("is_best"):
+            if node.is_best:
                 return f"[{BEST_FILE_METHOD_NAME}]"
 
             method_map = METHOD_DISPLAY_NAMES
-            method = node.get("found_by")
-            if display_text := method_map.get(method):
+            if display_text := method_map.get(node.found_by):
                 return display_text
 
-            dist = node.get("distance", -1)
-            return f"{dist}%" if dist >= 0 else ""
+            return f"{node.distance}%" if node.distance >= 0 else ""
         elif col == 2:
             return str(path.parent)
         elif col == 3:
-            res = f"{node.get('resolution_w', 0)}x{node.get('resolution_h', 0)}"
-            size_mb = node.get("file_size", 0) / (1024**2)
-            return f"{res} | {node.get('bit_depth', 8)}-bit | {size_mb:.2f} MB | {node.get('format_details', '')}"
+            res = f"{node.resolution_w}x{node.resolution_h}"
+            size_mb = node.file_size / (1024**2)
+            return f"{res} | {node.bit_depth}-bit | {size_mb:.2f} MB | {node.format_details}"
         return ""
 
     def setData(self, index, value, role):
         if not (role == Qt.ItemDataRole.CheckStateRole and index.column() == 0):
             return super().setData(index, value, role)
 
-        node = index.internalPointer()
+        node: GroupNode | ResultNode = index.internalPointer()
         if not node:
             return False
 
         new_check_state = Qt.CheckState(value)
 
-        if node.get("type") == NODE_TYPE_GROUP:
+        if isinstance(node, GroupNode):
             state_to_apply = new_check_state
             if state_to_apply == Qt.CheckState.PartiallyChecked:
                 state_to_apply = Qt.CheckState.Checked
 
-            if node.get("fetched"):
-                children = node.get("children", [])
-                for child in children:
-                    self.check_states[child["path"]] = state_to_apply
-                if children:
+            if node.fetched:
+                for child in node.children:
+                    self.check_states[child.path] = state_to_apply
+                if node.children:
                     first_child_idx = self.index(0, 0, index)
-                    last_child_idx = self.index(len(children) - 1, 0, index)
+                    last_child_idx = self.index(len(node.children) - 1, 0, index)
                     self.dataChanged.emit(first_child_idx, last_child_idx, [Qt.ItemDataRole.CheckStateRole])
             else:
 
@@ -361,8 +349,8 @@ class ResultsTreeModel(QAbstractItemModel):
 
                 self.fetch_completed.connect(apply_state_after_fetch)
                 self.fetchMore(index)
-        else:
-            self.check_states[node["path"]] = new_check_state
+        else:  # ResultNode
+            self.check_states[node.path] = new_check_state
             parent_index = self.parent(index)
             if parent_index.isValid():
                 self.dataChanged.emit(parent_index, parent_index, [Qt.ItemDataRole.CheckStateRole])
@@ -388,25 +376,23 @@ class ResultsTreeModel(QAbstractItemModel):
             return
         self.beginResetModel()
         if sort_key == UIConfig.ResultsView.SORT_OPTIONS[0]:  # "By Duplicate Count"
-            self.sorted_group_ids.sort(key=lambda gid: self.groups_data[gid]["count"], reverse=True)
+            self.sorted_group_ids.sort(key=lambda gid: self.groups_data[gid].count, reverse=True)
         elif sort_key == UIConfig.ResultsView.SORT_OPTIONS[1]:  # "By Size on Disk"
-            self.sorted_group_ids.sort(key=lambda gid: self.groups_data[gid].get("total_size", 0), reverse=True)
+            self.sorted_group_ids.sort(key=lambda gid: self.groups_data[gid].total_size, reverse=True)
         else:  # "By Filename"
-            self.sorted_group_ids.sort(key=lambda gid: self.groups_data[gid]["name"])
+            self.sorted_group_ids.sort(key=lambda gid: self.groups_data[gid].name)
         self.endResetModel()
 
     def set_all_checks(self, state: Qt.CheckState):
         self._set_check_state_for_all(lambda node: state)
 
     def select_all_except_best(self):
-        self._set_check_state_for_all(
-            lambda n: Qt.CheckState.Checked if not n.get("is_best") else Qt.CheckState.Unchecked
-        )
+        self._set_check_state_for_all(lambda n: Qt.CheckState.Checked if not n.is_best else Qt.CheckState.Unchecked)
 
     def invert_selection(self):
         self._set_check_state_for_all(
             lambda n: Qt.CheckState.Unchecked
-            if self.check_states.get(n["path"]) == Qt.CheckState.Checked
+            if self.check_states.get(n.path) == Qt.CheckState.Checked
             else Qt.CheckState.Checked
         )
 
@@ -414,9 +400,9 @@ class ResultsTreeModel(QAbstractItemModel):
         if not self.groups_data:
             return
         for gid in self.sorted_group_ids:
-            if self.groups_data[gid].get("fetched"):
-                for node in self.groups_data[gid]["children"]:
-                    self.check_states[node["path"]] = state_logic_func(node)
+            if self.groups_data[gid].fetched:
+                for node in self.groups_data[gid].children:
+                    self.check_states[node.path] = state_logic_func(node)
         self.dataChanged.emit(self.index(0, 0), self.index(self.rowCount() - 1, self.columnCount() - 1))
 
     def get_link_map_for_paths(self, paths_to_replace: list[Path]) -> dict[Path, Path]:
@@ -437,7 +423,7 @@ class ResultsTreeModel(QAbstractItemModel):
     def get_summary_text(self) -> str:
         num_groups, total_items = (
             len(self.sorted_group_ids),
-            sum(d.get("count", 0) for d in self.groups_data.values()),
+            sum(d.count for d in self.groups_data.values()),
         )
         if self.filter_text and self.db_path:
             try:
@@ -457,20 +443,20 @@ class ResultsTreeModel(QAbstractItemModel):
         deleted_set = {str(p) for p in deleted_paths}
         groups_to_remove = []
         for gid, data in self.groups_data.items():
-            if data.get("fetched"):
-                data["children"] = [f for f in data["children"] if f["path"] not in deleted_set]
-                data["count"] = len(data.get("children", []))
+            if data.fetched:
+                data.children = [f for f in data.children if f.path not in deleted_set]
+                data.count = len(data.children)
 
             min_items = 2 if self.mode == ScanMode.DUPLICATES else 1
-            if data.get("count", 0) < min_items:
+            if data.count < min_items:
                 groups_to_remove.append(gid)
             elif (
-                data.get("fetched")
+                data.fetched
                 and self.mode == ScanMode.DUPLICATES
-                and not any(f.get("is_best") for f in data["children"])
-                and data["children"]
+                and not any(f.is_best for f in data.children)
+                and data.children
             ):
-                data["children"][0]["is_best"] = True
+                data.children[0].is_best = True
 
         for gid in groups_to_remove:
             if gid in self.groups_data:
@@ -711,28 +697,35 @@ class ImageItemDelegate(QStyledItemDelegate):
         path = Path(item_data["path"])
         line_height = self.regular_font_metrics.height()
         x, y = text_rect.left(), text_rect.top() + self.bold_font_metrics.ascent()
+
         painter.setFont(self.bold_font)
         painter.setPen(main_color)
-        filename = f"[{BEST_FILE_METHOD_NAME}] {path.name}" if item_data.get("is_best") else path.name
+        filename = path.name
         painter.drawText(x, y, self.bold_font_metrics.elidedText(filename, Qt.ElideRight, text_rect.width()))
+
         y += line_height
         painter.setFont(QFont())
         painter.setPen(secondary_color)
 
-        method = item_data.get("found_by")
-        dist = item_data.get("distance", -1)
         dist_text = ""
-        if method == "xxHash":
-            dist_text = "Exact Match | "
-        elif method == "dHash":
-            dist_text = "Simple Match | "
-        elif method == "pHash":
-            dist_text = "Near-Identical | "
-        elif dist >= 0:
-            dist_text = f"Score: {dist}% | "
+        if item_data.get("is_best"):
+            dist_text = f"[{BEST_FILE_METHOD_NAME}] | "
+        else:
+            # Original logic for non-best files
+            method = item_data.get("found_by")
+            dist = item_data.get("distance", -1)
+            if method == "xxHash":
+                dist_text = "Exact Match | "
+            elif method == "dHash":
+                dist_text = "Simple Match | "
+            elif method == "pHash":
+                dist_text = "Near-Identical | "
+            elif dist >= 0:
+                dist_text = f"Score: {dist}% | "
 
         meta_text = f"{dist_text}{item_data.get('resolution_w', 0)}x{item_data.get('resolution_h', 0)} | {item_data.get('format_details', '')}"
         painter.drawText(x, y, self.regular_font_metrics.elidedText(meta_text, Qt.ElideRight, text_rect.width()))
+
         y += line_height
         painter.drawText(
             x,
@@ -765,15 +758,15 @@ class ResultsProxyModel(QSortFilterProxyModel):
         if not source_index.isValid():
             return False
 
-        node = source_index.internalPointer()
-        if not node or node.get("type") == NODE_TYPE_GROUP:
+        node: ResultNode | GroupNode = source_index.internalPointer()
+        if not node or isinstance(node, GroupNode):
             return True
 
-        if node.get("is_best") or node.get("found_by") in METHOD_DISPLAY_NAMES:
+        # node is a ResultNode here
+        if node.is_best or node.found_by in METHOD_DISPLAY_NAMES:
             return True
 
-        similarity_score = node.get("distance", -1)
-        return similarity_score >= self._min_similarity
+        return node.distance >= self._min_similarity
 
     def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
         """Overrides the default sorting behavior to use our custom SortRole."""

@@ -32,7 +32,7 @@ from app.constants import (
 )
 from app.core.helpers import VisualizationTask
 from app.core.scanner import ScannerController
-from app.data_models import AppSettings, ScanConfig, ScanMode
+from app.data_models import AppSettings, GroupNode, ResultNode, ScanConfig, ScanMode
 from app.logging_config import setup_logging
 from app.services.config_builder import ScanConfigBuilder
 from app.services.file_operation_manager import FileOperationManager
@@ -299,15 +299,16 @@ class App(QMainWindow):
         if not source_index.isValid():
             return
 
-        node = source_index.internalPointer()
+        node: GroupNode | ResultNode | None = source_index.internalPointer()
         if not node:
             return
 
         if results_model.mode == ScanMode.DUPLICATES:
-            group_id = node.get("group_id", -1)
-            scroll_to_path = Path(node["path"]) if node.get("type") != "group" else None
-            if group_id != -1:
-                self.viewer_panel.show_image_group(results_model.db_path, group_id, scroll_to_path)
+            group_id = node.group_id
+            scroll_to_path = Path(node.path) if isinstance(node, ResultNode) else None
+
+            # The group_id will always be valid due to dataclass structure
+            self.viewer_panel.show_image_group(results_model.db_path, group_id, scroll_to_path)
 
     @Slot()
     def _request_settings_save(self):
@@ -555,9 +556,9 @@ class App(QMainWindow):
         if not source_idx.isValid():
             return
 
-        node = source_idx.internalPointer()
-        if node and node.get("type") != "group" and (path := node.get("path")):
-            self.context_menu_path = Path(path)
+        node: GroupNode | ResultNode | None = source_idx.internalPointer()
+        if isinstance(node, ResultNode):
+            self.context_menu_path = Path(node.path)
             self.context_menu.exec(QCursor.pos())
 
     def _show_viewer_context_menu(self, pos):

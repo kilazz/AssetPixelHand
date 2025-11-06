@@ -8,10 +8,11 @@ from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QObject, QThreadPool, Signal, Slot
 
+from app.data_models import FileOperation
 from app.gui.tasks import FileOperationTask
 
 if TYPE_CHECKING:
-    from app.gui.panels import FileOperation, ResultsPanel
+    from app.gui.panels import ResultsPanel
 
 
 class FileOperationManager(QObject):
@@ -45,10 +46,7 @@ class FileOperationManager(QObject):
             paths_to_delete: A list of Path objects to be deleted.
         """
         self.log_message.emit(f"Moving {len(paths_to_delete)} files to trash...", "info")
-        task = FileOperationTask(mode="delete", paths=paths_to_delete)
-
-        from app.gui.panels import FileOperation
-
+        task = FileOperationTask(operation=FileOperation.DELETING, paths=paths_to_delete)
         self._execute_task(task, FileOperation.DELETING)
 
     @Slot(dict)
@@ -60,10 +58,7 @@ class FileOperationManager(QObject):
                       source files (values).
         """
         self.log_message.emit(f"Replacing {len(link_map)} files with hardlinks...", "info")
-        task = FileOperationTask(mode="hardlink", link_map=link_map)
-
-        from app.gui.panels import FileOperation
-
+        task = FileOperationTask(operation=FileOperation.HARDLINKING, link_map=link_map)
         self._execute_task(task, FileOperation.HARDLINKING)
 
     @Slot(dict)
@@ -75,10 +70,7 @@ class FileOperationManager(QObject):
                       source files (values).
         """
         self.log_message.emit(f"Replacing {len(link_map)} files with reflinks...", "info")
-        task = FileOperationTask(mode="reflink", link_map=link_map)
-
-        from app.gui.panels import FileOperation
-
+        task = FileOperationTask(operation=FileOperation.REFLINKING, link_map=link_map)
         self._execute_task(task, FileOperation.REFLINKING)
 
     def _execute_task(self, task: FileOperationTask, operation_type: "FileOperation"):
@@ -111,8 +103,6 @@ class FileOperationManager(QObject):
             count: The number of successfully processed files.
             failed: The number of files that failed to process.
         """
-        from app.gui.panels import FileOperation
-
         op_name = "Moved"
         if self._current_operation_type in [FileOperation.HARDLINKING, FileOperation.REFLINKING]:
             op_name = "Replaced"
