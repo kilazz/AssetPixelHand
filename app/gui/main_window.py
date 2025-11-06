@@ -71,7 +71,6 @@ class App(QMainWindow):
         self.log_emitter = log_emitter
         self.stats_dialog: ScanStatisticsDialog | None = None
 
-        # --- Core Controllers and Managers ---
         self.controller = ScannerController()
         self.shared_thread_pool = QThreadPool()
         self.shared_thread_pool.setMaxThreadCount(max(4, os.cpu_count() or 4))
@@ -81,8 +80,6 @@ class App(QMainWindow):
         self.settings_save_timer.setInterval(1000)
 
         self._setup_ui()
-
-        # Instantiate the manager for handling file operations
         self.file_op_manager = FileOperationManager(self.shared_thread_pool, self.results_panel, self)
 
         self._create_menu_bar()
@@ -228,7 +225,7 @@ class App(QMainWindow):
         self.performance_panel.log_message.connect(self.log_panel.log_message)
         self.performance_panel.device_changed.connect(self._update_low_priority_option)
 
-        # Results and Viewer Panel Signals
+        # Results and Viewer Panel Signals (Mediator Pattern)
         self.results_panel.results_view.selectionModel().selectionChanged.connect(self._on_results_selection_changed)
         self.results_panel.visible_results_changed.connect(self.viewer_panel.display_results)
         self.results_panel.results_view.customContextMenuRequested.connect(self._show_results_context_menu)
@@ -324,6 +321,8 @@ class App(QMainWindow):
         if self.controller.is_running():
             return
 
+        self._save_settings()  # Ensure latest UI state is saved before building config
+
         if not (config := self._get_config()):
             return
 
@@ -345,7 +344,12 @@ class App(QMainWindow):
 
     def _get_config(self) -> ScanConfig | None:
         try:
-            builder = ScanConfigBuilder(self.options_panel, self.performance_panel, self.scan_options_panel)
+            builder = ScanConfigBuilder(
+                settings=self.settings,
+                scan_mode=self.options_panel.current_scan_mode,
+                search_query=self.options_panel.search_entry.text(),
+                sample_path=self.options_panel._sample_path,
+            )
             return builder.build()
         except ValueError as e:
             self.log_panel.log_message(f"Configuration Error: {e}", "error")
@@ -485,27 +489,16 @@ class App(QMainWindow):
             self.set_ui_scan_state(is_scanning=False)
             return
 
-        # Block signals to prevent cascading updates during the process
         self.results_panel.results_view.selectionModel().blockSignals(True)
         self.viewer_panel.list_view.blockSignals(True)
 
-        # Step 1: Physically remove records from the results.duckdb file
         self.results_panel.remove_items_from_results_db(affected_paths)
-
-        # Step 2: Clear the image viewer panel to prevent it from trying to load deleted files.
         self.viewer_panel.clear_viewer()
-
-        # Step 3: Update the in-memory model and the UI of the ResultsPanel.
         self.results_panel.update_after_deletion(affected_paths)
-
-        # Step 4: Give Qt time to process all pending redraws and updates.
         QApplication.processEvents()
 
-        # Unblock signals
         self.results_panel.results_view.selectionModel().blockSignals(False)
         self.viewer_panel.list_view.blockSignals(False)
-
-        # Step 5: Re-enable the UI.
         self.set_ui_scan_state(is_scanning=False)
 
     def _confirm_action(self, title: str, text: str) -> bool:
@@ -596,12 +589,10 @@ class App(QMainWindow):
                 app_logger.error(f"Could not open path '{path}': {e}")
 
     def _save_settings(self):
-        # 1. Update the settings object with the current state of all UI panels
         self.options_panel.update_settings(self.settings)
         self.scan_options_panel.update_settings(self.settings)
         self.performance_panel.update_settings(self.settings)
         self.viewer_panel.update_settings(self.settings)
-        # 2. Save the updated object to the file
         self.settings.save()
 
     @Slot(bool)

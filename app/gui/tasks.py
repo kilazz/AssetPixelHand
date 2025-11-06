@@ -12,7 +12,13 @@ import send2trash
 from PySide6.QtCore import QModelIndex, QObject, QRunnable, Signal
 
 from app.cache import get_thumbnail_cache_key, thumbnail_cache
-from app.constants import DEEP_LEARNING_AVAILABLE, DUCKDB_AVAILABLE, QuantizationMode
+from app.constants import (
+    DEEP_LEARNING_AVAILABLE,
+    DUCKDB_AVAILABLE,
+    FP16_MODEL_SUFFIX,
+    QuantizationMode,
+    TonemapMode,
+)
 from app.data_models import ScanMode
 from app.image_io import load_image
 from app.model_adapter import get_model_adapter
@@ -94,7 +100,7 @@ class ModelConverter(QRunnable):
     def _setup_directories(self, models_dir: Path) -> Path:
         target_dir_name = self.onnx_name_base
         if self.quant_mode == QuantizationMode.FP16:
-            target_dir_name += "_fp16"
+            target_dir_name += FP16_MODEL_SUFFIX
         target_dir = models_dir / target_dir_name
         target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -179,7 +185,7 @@ class ImageLoader(QRunnable):
         path_str: str,
         mtime: float,
         target_size: int | None,
-        tonemap_mode: str = "reinhard",
+        tonemap_mode: str = TonemapMode.REINHARD.value,
         use_cache: bool = True,
         receiver: QObject | None = None,
         on_finish_slot=None,

@@ -13,7 +13,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from PySide6.QtCore import QObject, QRunnable, Signal
 
-from app.constants import VISUALS_DIR
+from app.constants import VISUALS_DIR, TonemapMode
 from app.data_models import DuplicateResults, ScanConfig, ScannerSignals, ScanState
 from app.image_io import load_image
 
@@ -89,7 +89,6 @@ class FileFinder:
                                 self.found_count += 1
                                 if self.found_count % 100 == 0:
                                     self.state.update_progress(self.found_count, -1, f"Found: {self.found_count}")
-                                # MODIFIED: Yield the path and the stat result together to save a system call.
                                 yield entry_path, entry.stat()
                     except OSError as e:
                         self.signals.log.emit(f"Skipping unreadable entry '{entry.name}': {e}", "warning")
@@ -132,7 +131,8 @@ class VisualizationTask(QRunnable):
         report_count = 0
 
         total_groups_to_process = min(len(sorted_groups), self.config.max_visuals)
-        tonemap_mode = "reinhard" if self.config.tonemap_visuals else "none"
+
+        tonemap_mode = TonemapMode.REINHARD.value if self.config.tonemap_visuals else TonemapMode.NONE.value
 
         for i, (orig_fp, dups) in enumerate(sorted_groups):
             if report_count >= self.config.max_visuals or not dups:

@@ -23,6 +23,7 @@ from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QImage, QPen, QPi
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate
 
 from app.constants import (
+    BEST_FILE_METHOD_NAME,
     DUCKDB_AVAILABLE,
     METHOD_DISPLAY_NAMES,
     NODE_TYPE_GROUP,
@@ -41,6 +42,9 @@ if DUCKDB_AVAILABLE:
     import duckdb
 
 app_logger = logging.getLogger("AssetPixelHand.gui.models")
+
+# Custom role for sorting
+SortRole = Qt.ItemDataRole.UserRole + 1
 
 
 class ResultsTreeModel(QAbstractItemModel):
@@ -238,6 +242,23 @@ class ResultsTreeModel(QAbstractItemModel):
             return None
         node = index.internalPointer()
 
+        if role == SortRole:
+            if node.get("type") == NODE_TYPE_GROUP:
+                return -1  # Groups should not be sorted with children
+
+            if node.get("is_best"):
+                return 102  # Highest value for "Best"
+
+            method = node.get("found_by")
+            if method == "xxHash":
+                return 101  # Exact Match
+            if method == "dHash":
+                return 100  # Simple Match (Higher)
+            if method == "pHash":
+                return 99  # Near-Identical (Lower)
+
+            return node.get("distance", -1)
+
         if role == Qt.ItemDataRole.DisplayRole:
             return self._get_display_data(index, node)
 
@@ -290,10 +311,14 @@ class ResultsTreeModel(QAbstractItemModel):
         if col == 0:
             return path.name
         elif col == 1:
+            if node.get("is_best"):
+                return f"[{BEST_FILE_METHOD_NAME}]"
+
             method_map = METHOD_DISPLAY_NAMES
             method = node.get("found_by")
             if display_text := method_map.get(method):
                 return display_text
+
             dist = node.get("distance", -1)
             return f"{dist}%" if dist >= 0 else ""
         elif col == 2:
@@ -320,7 +345,6 @@ class ResultsTreeModel(QAbstractItemModel):
                 state_to_apply = Qt.CheckState.Checked
 
             if node.get("fetched"):
-                # Group is expanded, apply state directly to existing children
                 children = node.get("children", [])
                 for child in children:
                     self.check_states[child["path"]] = state_to_apply
@@ -332,13 +356,11 @@ class ResultsTreeModel(QAbstractItemModel):
 
                 def apply_state_after_fetch(parent_index: QModelIndex):
                     if parent_index == index:
-                        # Re-call setData now that children are fetched. It will enter the "fetched" branch.
                         self.setData(index, value, role)
                         self.fetch_completed.disconnect(apply_state_after_fetch)
 
                 self.fetch_completed.connect(apply_state_after_fetch)
                 self.fetchMore(index)
-
         else:
             self.check_states[node["path"]] = new_check_state
             parent_index = self.parent(index)
@@ -365,11 +387,11 @@ class ResultsTreeModel(QAbstractItemModel):
         if not self.groups_data:
             return
         self.beginResetModel()
-        if sort_key == "By Duplicate Count":
+        if sort_key == UIConfig.ResultsView.SORT_OPTIONS[0]:  # "By Duplicate Count"
             self.sorted_group_ids.sort(key=lambda gid: self.groups_data[gid]["count"], reverse=True)
-        elif sort_key == "By Size on Disk":
+        elif sort_key == UIConfig.ResultsView.SORT_OPTIONS[1]:  # "By Size on Disk"
             self.sorted_group_ids.sort(key=lambda gid: self.groups_data[gid].get("total_size", 0), reverse=True)
-        else:
+        else:  # "By Filename"
             self.sorted_group_ids.sort(key=lambda gid: self.groups_data[gid]["name"])
         self.endResetModel()
 
@@ -691,7 +713,7 @@ class ImageItemDelegate(QStyledItemDelegate):
         x, y = text_rect.left(), text_rect.top() + self.bold_font_metrics.ascent()
         painter.setFont(self.bold_font)
         painter.setPen(main_color)
-        filename = f"[BEST] {path.name}" if item_data.get("is_best") else path.name
+        filename = f"[{BEST_FILE_METHOD_NAME}] {path.name}" if item_data.get("is_best") else path.name
         painter.drawText(x, y, self.bold_font_metrics.elidedText(filename, Qt.ElideRight, text_rect.width()))
         y += line_height
         painter.setFont(QFont())
@@ -719,8 +741,8 @@ class ImageItemDelegate(QStyledItemDelegate):
         )
 
 
-class SimilarityFilterProxyModel(QSortFilterProxyModel):
-    """A proxy model to filter results based on a similarity score."""
+class ResultsProxyModel(QSortFilterProxyModel):
+    """A proxy model to handle custom sorting and filtering for the results view."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -732,6 +754,7 @@ class SimilarityFilterProxyModel(QSortFilterProxyModel):
             self.invalidateFilter()
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
+        """Filters rows based on the minimum similarity score slider."""
         if self._min_similarity == 0:
             return True
 
@@ -746,9 +769,21 @@ class SimilarityFilterProxyModel(QSortFilterProxyModel):
         if not node or node.get("type") == NODE_TYPE_GROUP:
             return True
 
-        method = node.get("found_by")
-        if method in ["xxHash", "dHash", "pHash"]:
+        if node.get("is_best") or node.get("found_by") in METHOD_DISPLAY_NAMES:
             return True
 
         similarity_score = node.get("distance", -1)
         return similarity_score >= self._min_similarity
+
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
+        """Overrides the default sorting behavior to use our custom SortRole."""
+        left_data = self.sourceModel().data(left, SortRole)
+        right_data = self.sourceModel().data(right, SortRole)
+
+        if left_data is None or right_data is None:
+            return super().lessThan(left, right)
+
+        try:
+            return float(left_data) < float(right_data)
+        except (ValueError, TypeError):
+            return super().lessThan(left, right)

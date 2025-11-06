@@ -49,6 +49,7 @@ from app.constants import (
     VISUALS_DIR,
     CompareMode,
     QuantizationMode,
+    TonemapMode,
     UIConfig,
 )
 from app.data_models import AppSettings, ScanMode
@@ -58,8 +59,8 @@ from .dialogs import FileTypesDialog
 from .models import (
     ImageItemDelegate,
     ImagePreviewModel,
+    ResultsProxyModel,
     ResultsTreeModel,
-    SimilarityFilterProxyModel,
 )
 from .widgets import AlphaBackgroundWidget, ImageCompareWidget, ResizedListView
 
@@ -672,7 +673,7 @@ class ResultsPanel(QGroupBox):
 
     def _setup_models(self):
         self.results_model = ResultsTreeModel(self)
-        self.proxy_model = SimilarityFilterProxyModel(self)
+        self.proxy_model = ResultsProxyModel(self)
         self.proxy_model.setSourceModel(self.results_model)
         self.results_view.setModel(self.proxy_model)
 
@@ -1113,7 +1114,8 @@ class ImageViewerPanel(QGroupBox):
 
     @Slot(bool)
     def _on_thumbnail_tonemap_toggled(self, checked: bool):
-        self.model.set_tonemap_mode("reinhard" if checked else "none")
+        mode = TonemapMode.REINHARD.value if checked else TonemapMode.NONE.value
+        self.model.set_tonemap_mode(mode)
 
     @Slot()
     def _on_compare_tonemap_changed(self):
@@ -1194,7 +1196,7 @@ class ImageViewerPanel(QGroupBox):
         if len(self.state.get_candidate_paths()) != 2:
             return
         self._set_view_mode(is_list=False)
-        tonemap_mode = "reinhard" if self.compare_tonemap_check.isChecked() else "none"
+        tonemap_mode = TonemapMode.REINHARD.value if self.compare_tonemap_check.isChecked() else TonemapMode.NONE.value
         self.compare_view_1.setPixmap(QPixmap())
         self.compare_view_2.setPixmap(QPixmap())
         self.state.load_full_res_images(tonemap_mode)

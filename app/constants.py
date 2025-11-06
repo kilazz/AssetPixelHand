@@ -58,6 +58,9 @@ if DEEP_LEARNING_AVAILABLE:
 # --- Application-wide Constants ---
 DB_WRITE_BATCH_SIZE = 4096
 CACHE_VERSION = "v4"
+DB_TABLE_NAME = "images"
+FP16_MODEL_SUFFIX = "_fp16"
+BEST_FILE_METHOD_NAME = "Best"
 
 # --- Supported File Formats ---
 _main_supported_ext = [
@@ -197,14 +200,16 @@ class QuantizationMode(Enum):
     FP16 = "FP16 (Recommended)"
 
 
-# --- Data Model & UI Constants ---
+class TonemapMode(Enum):
+    NONE = "none"
+    REINHARD = "reinhard"
+    DRAGO = "drago"
 
-# Display names for evidence methods in the results view
+
+# --- Data Model & UI Constants ---
 METHOD_DISPLAY_NAMES = {
     "xxHash": "Exact Match",
     "dHash": "Simple Match",
     "pHash": "Near-Identical",
 }
-
-# Key used to identify group nodes in the results tree model
 NODE_TYPE_GROUP = "group"

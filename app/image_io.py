@@ -19,6 +19,8 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+from app.constants import TonemapMode
+
 Image.MAX_IMAGE_PIXELS = None
 app_logger = logging.getLogger("AssetPixelHand.image_io")
 
@@ -56,7 +58,7 @@ except ImportError:
 def load_image(
     path_or_buffer: str | Path | io.BytesIO,
     target_size: tuple[int, int] | None = None,
-    tonemap_mode: str = "reinhard",
+    tonemap_mode: str = TonemapMode.REINHARD.value,
 ) -> Image.Image | None:
     path = Path(path_or_buffer) if isinstance(path_or_buffer, (str, Path)) else Path("buffer.tmp")
     filename = path.name
@@ -264,16 +266,14 @@ def _load_with_pyvips(path_or_buffer: str | Path | io.BytesIO, tonemap_mode: str
 
     is_float = "float" in image.format or "double" in image.format
 
-    if is_float and tonemap_mode != "none":
+    if is_float and tonemap_mode != TonemapMode.NONE.value:
         numpy_array = image.numpy()
         tonemapped_array = _tonemap_float_array(numpy_array.astype(np.float32), tonemap_mode)
         return Image.fromarray(tonemapped_array)
 
-    # For non-tonemapped float or integer types, convert to 8-bit uchar for Pillow compatibility
     if image.format != "uchar":
         image = image.cast("uchar")
 
-    # Convert pyvips image to numpy array, then to PIL image
     numpy_array = image.numpy()
     return Image.fromarray(numpy_array)
 
@@ -283,7 +283,7 @@ def _load_with_directxtex(path: Path, tonemap_mode: str) -> Image.Image | None:
         decoded = directxtex_decoder.decode_dds(f.read())
     numpy_array, dtype = decoded["data"], decoded["data"].dtype
     if np.issubdtype(dtype, np.floating):
-        if tonemap_mode != "none":
+        if tonemap_mode != TonemapMode.NONE.value:
             return Image.fromarray(_tonemap_float_array(numpy_array.astype(np.float32), tonemap_mode))
         else:
             return Image.fromarray((np.clip(numpy_array, 0.0, 1.0) * 255).astype(np.uint8))
@@ -307,7 +307,7 @@ def _load_with_oiio(path_or_buffer: str | Path | io.BytesIO, tonemap_mode: str) 
     numpy_array = buf.get_pixels()
     if np.issubdtype(numpy_array.dtype, np.floating):
         is_hdr = np.max(numpy_array) > 1.0
-        if is_hdr and tonemap_mode != "none":
+        if is_hdr and tonemap_mode != TonemapMode.NONE.value:
             return Image.fromarray(_tonemap_float_array(numpy_array, tonemap_mode))
         else:
             return Image.fromarray((np.clip(numpy_array, 0.0, 1.0) * 255).astype(np.uint8))
@@ -332,11 +332,11 @@ def _tonemap_float_array(float_array: np.ndarray, mode: str) -> np.ndarray:
     alpha = float_array[..., 3:4] if float_array.ndim > 2 and float_array.shape[-1] > 3 else None
 
     rgb[rgb < 0.0] = 0.0
-    if mode == "reinhard":
+    if mode == TonemapMode.REINHARD.value:
         gamma_corrected = np.power(rgb / (1.0 + rgb), 1.0 / 2.2)
-    elif mode == "drago":
+    elif mode == TonemapMode.DRAGO.value:
         gamma_corrected = np.power(np.log(1.0 + 5.0 * rgb) / np.log(6.0), 1.0 / 1.9)
-    else:
+    else:  # Fallback to simple clipping
         gamma_corrected = np.clip(rgb, 0.0, 1.0)
     final_rgb = (gamma_corrected * 255).astype(np.uint8)
 

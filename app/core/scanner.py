@@ -13,7 +13,7 @@ import time
 import pyarrow as pa
 from PySide6.QtCore import QObject, QThread, Slot
 
-from app.constants import CACHE_DIR, DUCKDB_AVAILABLE, LANCEDB_AVAILABLE, WIN32_AVAILABLE
+from app.constants import CACHE_DIR, DB_TABLE_NAME, DUCKDB_AVAILABLE, LANCEDB_AVAILABLE, WIN32_AVAILABLE
 from app.core.strategies import FindDuplicatesStrategy, SearchStrategy
 from app.data_models import ScanConfig, ScanMode, ScannerSignals, ScanState
 
@@ -135,7 +135,7 @@ class ScannerCore(QObject):
                 ]
             )
 
-            table_name = "images"
+            table_name = DB_TABLE_NAME
             if table_name in self.db.table_names():
                 self.db.drop_table(table_name)
 

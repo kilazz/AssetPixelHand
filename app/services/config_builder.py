@@ -1,36 +1,48 @@
 # app/services/config_builder.py
 """Contains the ScanConfigBuilder class, responsible for constructing a valid
-ScanConfig object from the state of the UI panels.
+ScanConfig object from the application's settings and current scan context.
 """
 
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from app.constants import QuantizationMode
-from app.data_models import PerformanceConfig, ScanConfig, ScanMode
+from app.constants import FP16_MODEL_SUFFIX, SUPPORTED_MODELS, QuantizationMode
+from app.data_models import AppSettings, PerformanceConfig, ScanConfig, ScanMode
 
 if TYPE_CHECKING:
-    from app.gui.panels import OptionsPanel, PerformancePanel, ScanOptionsPanel
+    # This block is for type hinting only and is not executed at runtime.
+    # We no longer need direct panel imports here.
+    pass
 
 
 class ScanConfigBuilder:
     """A builder class that centralizes the logic for creating a ScanConfig
-    from various UI panels. It also handles validation of the user's inputs.
+    from the application's settings and current scan context.
     """
 
     def __init__(
         self,
-        options_panel: "OptionsPanel",
-        performance_panel: "PerformancePanel",
-        scan_options_panel: "ScanOptionsPanel",
+        settings: AppSettings,
+        scan_mode: ScanMode,
+        search_query: str | None,
+        sample_path: Path | None,
     ):
-        self.opts = options_panel
-        self.perf = performance_panel
-        self.scan_opts = scan_options_panel
-        self.settings = options_panel.settings
+        """
+        Initializes the builder with a snapshot of the application state.
+
+        Args:
+            settings: The fully updated AppSettings object.
+            scan_mode: The current ScanMode (DUPLICATES, TEXT_SEARCH, etc.).
+            search_query: The current text in the search box.
+            sample_path: The currently selected sample image path, if any.
+        """
+        self.settings = settings
+        self.scan_mode = scan_mode
+        self.search_query = search_query
+        self.sample_path = sample_path
 
     def build(self) -> ScanConfig:
-        """Constructs and validates a ScanConfig object based on the current UI state."""
+        """Constructs and validates a ScanConfig object."""
         folder_path = self._validate_folder_path()
         self._validate_search_inputs()
 
@@ -39,13 +51,13 @@ class ScanConfigBuilder:
 
         return ScanConfig(
             folder_path=folder_path,
-            similarity_threshold=self.opts.threshold_spinbox.value(),
-            excluded_folders=[p.strip() for p in self.opts.exclude_entry.text().split(",")],
+            similarity_threshold=int(self.settings.threshold),
+            excluded_folders=[p.strip() for p in self.settings.exclude.split(",") if p.strip()],
             model_name=onnx_name,
             model_dim=model_info["dim"],
             model_info=model_info,
-            selected_extensions=self.opts.selected_extensions,
-            scan_mode=self.opts.current_scan_mode,
+            selected_extensions=self.settings.selected_extensions,
+            scan_mode=self.scan_mode,
             device=self.settings.performance.device,
             find_exact_duplicates=self.settings.hashing.find_exact,
             find_simple_duplicates=self.settings.hashing.find_simple,
@@ -58,14 +70,14 @@ class ScanConfigBuilder:
             visuals_columns=self.settings.visuals.columns,
             tonemap_visuals=self.settings.visuals.tonemap_enabled,
             search_precision=self.settings.performance.search_precision,
-            search_query=self.opts.search_entry.text() if self.opts.current_scan_mode == ScanMode.TEXT_SEARCH else None,
-            sample_path=self.opts._sample_path,
+            search_query=self.search_query if self.scan_mode == ScanMode.TEXT_SEARCH else None,
+            sample_path=self.sample_path,
             perf=performance_config,
         )
 
     def _validate_folder_path(self) -> Path:
         """Validates that the selected folder path exists and is a directory."""
-        folder_path_str = self.opts.folder_path_entry.text()
+        folder_path_str = self.settings.folder_path
         if not folder_path_str:
             raise ValueError("Please select a folder to scan.")
         folder_path = Path(folder_path_str)
@@ -75,21 +87,21 @@ class ScanConfigBuilder:
 
     def _validate_search_inputs(self):
         """Validates inputs specific to text or sample search modes."""
-        if self.opts.current_scan_mode == ScanMode.TEXT_SEARCH and not self.opts.search_entry.text().strip():
+        if self.scan_mode == ScanMode.TEXT_SEARCH and not (self.search_query and self.search_query.strip()):
             raise ValueError("Please enter a text search query.")
 
-        if self.opts.current_scan_mode == ScanMode.SAMPLE_SEARCH:
-            sample_path = self.opts._sample_path
-            if not (sample_path and sample_path.is_file()):
-                raise ValueError("Please select a valid sample image for the search.")
+        if self.scan_mode == ScanMode.SAMPLE_SEARCH and not (self.sample_path and self.sample_path.is_file()):
+            raise ValueError("Please select a valid sample image for the search.")
 
     def _get_model_details(self) -> tuple[dict, str]:
         """Determines the correct ONNX model name based on UI selections."""
-        model_info = self.opts.get_selected_model_info()
-        quant_mode = self.perf.get_selected_quantization()
+        model_info = SUPPORTED_MODELS.get(self.settings.model_key, next(iter(SUPPORTED_MODELS.values())))
+        quant_mode_str = self.settings.performance.quantization_mode
+        quant_mode = next((q for q in QuantizationMode if q.value == quant_mode_str), QuantizationMode.FP16)
+
         onnx_name = model_info["onnx_name"]
         if quant_mode == QuantizationMode.FP16:
-            onnx_name += "_fp16"
+            onnx_name += FP16_MODEL_SUFFIX
         return model_info, onnx_name
 
     def _build_performance_config(self) -> PerformanceConfig:
@@ -98,10 +110,15 @@ class ScanConfigBuilder:
             batch_size = int(self.settings.performance.batch_size)
             if batch_size <= 0:
                 raise ValueError
-        except ValueError:
+        except (ValueError, TypeError):
             raise ValueError("Batch size must be a positive integer.") from None
 
-        num_workers = int(self.settings.performance.num_workers)
+        try:
+            num_workers = int(self.settings.performance.num_workers)
+            if num_workers <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            raise ValueError("Number of workers must be a positive integer.") from None
 
         return PerformanceConfig(
             num_workers=num_workers,

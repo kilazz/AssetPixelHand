@@ -15,7 +15,7 @@ import duckdb
 import numpy as np
 
 from app.cache import _configure_db_connection
-from app.constants import DUCKDB_AVAILABLE, RESULTS_DB_FILE
+from app.constants import BEST_FILE_METHOD_NAME, DUCKDB_AVAILABLE, RESULTS_DB_FILE
 from app.data_models import (
     DuplicateResults,
     ImageFingerprint,
@@ -134,9 +134,10 @@ class ScanStrategy(ABC):
         )
 
     def _prepare_results_data(self, final_groups: DuplicateResults, search_context: str | None = None) -> list[tuple]:
+        """Prepare results data for database insertion."""
         data = []
         for i, (best_fp, dups) in enumerate(final_groups.items(), 1):
-            data.append(self._create_result_row(i, True, best_fp, -1, search_context, "Original"))
+            data.append(self._create_result_row(i, True, best_fp, -1, search_context, BEST_FILE_METHOD_NAME))
             for dup_fp, dist, method in dups:
                 data.append(self._create_result_row(i, False, dup_fp, dist, None, method))
         return data
@@ -145,6 +146,7 @@ class ScanStrategy(ABC):
     def _create_result_row(
         group_id: int, is_best: bool, fp: ImageFingerprint, distance: int, search_context: str | None, found_by: str
     ) -> tuple:
+        """Create a single result row tuple."""
         return (
             group_id,
             is_best,
