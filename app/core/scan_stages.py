@@ -26,11 +26,7 @@ from app.services.signal_bus import SignalBus
 from app.utils import find_best_in_group
 
 from .engines import LanceDBSimilarityEngine
-from .hashing_worker import (
-    worker_get_dhash,
-    worker_get_phash,
-    worker_get_xxhash,
-)
+from .hashing_worker import worker_get_perceptual_hashes, worker_get_xxhash
 from .helpers import FileFinder
 from .pipeline import PipelineManager
 
@@ -67,8 +63,7 @@ class HashingConfig:
 
 HASHING_CONFIGS = {
     "xxhash": HashingConfig(200, 500, "Phase 2/6: Finding exact duplicates (xxHash)..."),
-    "dhash": HashingConfig(150, 300, "Phase 3/6: Finding simple duplicates (dHash)..."),
-    "phash": HashingConfig(100, 200, "Phase 4/6: Finding near-duplicates (pHash)..."),
+    "perceptual": HashingConfig(100, 200, "Phase 3/6: Finding simple & near-duplicates..."),
     "metadata": HashingConfig(100, 100, "Processing metadata..."),
 }
 
@@ -289,37 +284,67 @@ class HashingStageRunner:
         self.cluster_manager = cluster_manager
         self.all_image_fps = all_image_fps
 
-    def run_stage(self, stage_name: str, files: list[Path], stop_event: threading.Event, ctx) -> list[Path]:
-        config = HASHING_CONFIGS[stage_name]
+    def run_xxhash_stage(self, files: list[Path], stop_event: threading.Event, ctx) -> list[Path]:
+        config = HASHING_CONFIGS["xxhash"]
         self.state.set_phase(config.phase_description, 0.10)
-        if stage_name == "phash":
-            return self._run_phash_stage(files, stop_event, ctx, config)
-        return self._run_simple_hashing_stage(stage_name, files, stop_event, ctx, config)
-
-    def _run_simple_hashing_stage(
-        self, stage_name: str, files: list[Path], stop_event: threading.Event, ctx, config: HashingConfig
-    ) -> list[Path]:
-        worker_func = {"xxhash": worker_get_xxhash, "dhash": worker_get_dhash}[stage_name]
-        evidence_method = {"xxhash": EvidenceMethod.XXHASH.value, "dhash": EvidenceMethod.DHASH.value}[stage_name]
-        hash_map = self._run_hashing_worker(worker_func, files, stop_event, ctx, config)
+        hash_map = self._run_hashing_worker(worker_get_xxhash, files, stop_event, ctx, config)
         if not hash_map or stop_event.is_set():
-            return [] if stage_name == "xxhash" else files
+            return []
         reps = []
         for paths in hash_map.values():
             rep = paths[0]
             reps.append(rep)
             if len(paths) > 1:
                 for other_path in paths[1:]:
-                    self.cluster_manager.add_evidence(rep, other_path, evidence_method, 0.0)
+                    self.cluster_manager.add_evidence(rep, other_path, EvidenceMethod.XXHASH.value, 0.0)
         return reps
 
-    def _run_phash_stage(
-        self, files: list[Path], stop_event: threading.Event, ctx, config: HashingConfig
-    ) -> list[Path]:
-        phashes = self._run_hashing_worker(worker_get_phash, files, stop_event, ctx, config, return_pairs=True)
-        if not phashes or stop_event.is_set():
+    def run_perceptual_hashing_stage(self, files: list[Path], stop_event: threading.Event, ctx) -> list[Path]:
+        config = HASHING_CONFIGS["perceptual"]
+        self.state.set_phase(config.phase_description, 0.20)
+
+        # 1. Compute both hashes in a single pass over the files.
+        all_hashes = self._run_hashing_worker(
+            worker_get_perceptual_hashes, files, stop_event, ctx, config, return_list=True
+        )
+        if not all_hashes or stop_event.is_set():
             return files
-        hashes_ph, paths_ph = zip(*phashes, strict=True)
+
+        # 2. Process dHashes in memory first, if enabled.
+        if self.config.find_simple_duplicates:
+            dhash_map = defaultdict(list)
+            path_to_phash = {}
+            for dhash, phash, path in all_hashes:
+                if dhash is not None:
+                    dhash_map[dhash].append(path)
+                if phash is not None:
+                    path_to_phash[path] = phash
+
+            dhash_reps = []
+            for paths in dhash_map.values():
+                rep = paths[0]
+                dhash_reps.append(rep)
+                if len(paths) > 1:
+                    for other_path in paths[1:]:
+                        self.cluster_manager.add_evidence(rep, other_path, EvidenceMethod.DHASH.value, 0.0)
+
+            if not self.config.find_perceptual_duplicates:
+                return dhash_reps
+
+            files_for_phash = dhash_reps
+        else:
+            path_to_phash = {path: phash for _, phash, path in all_hashes if phash is not None}
+            files_for_phash = list(path_to_phash.keys())
+
+        # 3. Process pHashes on the remaining representatives.
+        if not self.config.find_perceptual_duplicates:
+            return files_for_phash
+
+        phashes_to_process = [(path_to_phash[p], p) for p in files_for_phash if p in path_to_phash]
+        if not phashes_to_process:
+            return files_for_phash
+
+        hashes_ph, paths_ph = zip(*phashes_to_process, strict=True)
         components = self._find_phash_components(paths_ph, hashes_ph)
         return self._process_phash_components(components)
 
@@ -330,7 +355,7 @@ class HashingStageRunner:
         n = len(paths)
         for i in range(n):
             for j in range(i + 1, n):
-                if hashes[i] - hashes[j] <= PHASH_THRESHOLD:
+                if hashes[i] - hashes[j] <= self.config.phash_threshold:
                     rows.append(i)
                     cols.append(j)
         if not rows:
@@ -346,12 +371,15 @@ class HashingStageRunner:
         representatives = []
         for group in components.values():
             if len(group) > 1:
-                best = find_best_in_group([self.all_image_fps[p] for p in group])
+                best = find_best_in_group([self.all_image_fps[p] for p in group if p in self.all_image_fps])
+                # ИСПРАВЛЕНО: `if not best: continue` на нескольких строках.
+                if not best:
+                    continue
                 representatives.append(best.path)
                 for path in group:
                     if path != best.path:
                         self.cluster_manager.add_evidence(best.path, path, EvidenceMethod.PHASH.value, 0.0)
-            else:
+            elif group:
                 representatives.extend(group)
         return representatives
 
@@ -362,9 +390,9 @@ class HashingStageRunner:
         stop_event: threading.Event,
         ctx,
         config: HashingConfig,
-        return_pairs: bool = False,
+        return_list: bool = False,
     ) -> Any:
-        if return_pairs:
+        if return_list:
             results: list[tuple] = []
         else:
             results = defaultdict(list)
@@ -373,15 +401,15 @@ class HashingStageRunner:
         with ctx.Pool(processes=self.config.perf.num_workers) as pool:
             for i, result in enumerate(pool.imap_unordered(worker_func, files_list, config.batch_size), 1):
                 if stop_event.is_set():
-                    return [] if return_pairs else {}
+                    return [] if return_list else {}
 
-                if i % config.update_interval == 0:
-                    path = result[1]
+                path = result[-1]
+                if i % config.update_interval == 0 and path:
                     details_text = f"Hashing: {path.name}"
                     self.state.update_progress(i, len(files_list), details=details_text)
 
                 if result and result[0] is not None:
-                    if return_pairs:
+                    if return_list:
                         results.append(result)
                     else:
                         file_hash, path = result
@@ -501,7 +529,7 @@ class HashingExecutionStage(ScanStage):
 
     @property
     def name(self) -> str:
-        return "Phase 2-4/6: Finding duplicates with hashing..."
+        return "Phase 2-3/6: Finding duplicates with hashing..."
 
     def run(self, context: ScanContext) -> bool:
         runner = HashingStageRunner(
@@ -509,18 +537,17 @@ class HashingExecutionStage(ScanStage):
         )
         reps = context.files_to_process
         ctx = multiprocessing.get_context("spawn")
+
         if context.config.find_exact_duplicates:
-            reps = runner.run_stage("xxhash", reps, context.stop_event, ctx)
+            reps = runner.run_xxhash_stage(reps, context.stop_event, ctx)
             if context.stop_event.is_set():
                 return False
-        if context.config.find_simple_duplicates:
-            reps = runner.run_stage("dhash", reps, context.stop_event, ctx)
+
+        if context.config.find_simple_duplicates or context.config.find_perceptual_duplicates:
+            reps = runner.run_perceptual_hashing_stage(reps, context.stop_event, ctx)
             if context.stop_event.is_set():
                 return False
-        if context.config.find_perceptual_duplicates:
-            reps = runner.run_stage("phash", reps, context.stop_event, ctx)
-            if context.stop_event.is_set():
-                return False
+
         context.files_to_process = reps
         context.signals.log_message.emit(f"Found {len(reps)} unique candidates for AI processing.", "info")
         return True
@@ -531,7 +558,7 @@ class FingerprintGenerationStage(ScanStage):
 
     @property
     def name(self) -> str:
-        return "Phase 5/6: Creating AI fingerprints..."
+        return "Phase 4/6: Creating AI fingerprints..."
 
     def run(self, context: ScanContext) -> bool:
         if not context.files_to_process:
@@ -556,7 +583,7 @@ class DatabaseIndexStage(ScanStage):
 
     @property
     def name(self) -> str:
-        return "Optimizing database for fast search..."
+        return "Phase 5/6: Optimizing database for fast search..."
 
     def run(self, context: ScanContext) -> bool:
         try:

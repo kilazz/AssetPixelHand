@@ -11,7 +11,7 @@ import numpy as np
 import xxhash
 
 from app.data_models import ImageFingerprint
-from app.image_io import get_image_metadata
+from app.image_io import get_image_metadata, load_image
 
 try:
     import imagehash
@@ -37,28 +37,28 @@ def worker_get_xxhash(path: Path) -> tuple[str | None, Path]:
         return None, path
 
 
-def worker_get_phash(path: Path) -> tuple[Union["imagehash.ImageHash", None], Path]:
-    """Worker function to calculate the perceptual hash (pHash) of an image."""
+def worker_get_perceptual_hashes(
+    path: Path,
+) -> tuple[Union["imagehash.ImageHash", None], Union["imagehash.ImageHash", None], Path]:
+    """
+    NEW WORKER: Opens an image once using the best available loader
+    and computes both dHash and pHash.
+    """
     if not IMAGEHASH_AVAILABLE:
-        return None, path
-    try:
-        with Image.open(path) as img:
-            phash = imagehash.phash(img)
-        return phash, path
-    except Exception:
-        return None, path
+        return None, None, path
 
-
-def worker_get_dhash(path: Path) -> tuple[Union["imagehash.ImageHash", None], Path]:
-    """Worker function to calculate the difference hash (dHash) of an image."""
-    if not IMAGEHASH_AVAILABLE:
-        return None, path
     try:
-        with Image.open(path) as img:
-            dhash = imagehash.dhash(img)
-        return dhash, path
+        # Use the robust loader, which automatically selects the best engine (pyvips, oiio, pillow)
+        pil_img = load_image(path)
+        if not pil_img:
+            return None, None, path
+
+        # Compute both hashes from the single loaded image object
+        dhash = imagehash.dhash(pil_img)
+        phash = imagehash.phash(pil_img)
+        return dhash, phash, path
     except Exception:
-        return None, path
+        return None, None, path
 
 
 def worker_create_dummy_fp(path: Path) -> ImageFingerprint | None:
