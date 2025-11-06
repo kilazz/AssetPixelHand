@@ -476,13 +476,14 @@ class ImagePreviewModel(QAbstractListModel):
         super().__init__(parent)
         self.db_path: Path | None = None
         self.group_id: int = -1
-        self.items: list[dict] = []
+        self.items: list[ResultNode] = []
         self.pixmap_cache: OrderedDict[str, QPixmap] = OrderedDict()
         self.CACHE_SIZE_LIMIT = 200
         self.thread_pool = thread_pool
         self.loading_paths = set()
         self.tonemap_mode = "none"
         self.target_size = 250
+        self.error_paths = {}
 
     def set_tonemap_mode(self, mode: str):
         if self.tonemap_mode != mode:
@@ -498,15 +499,17 @@ class ImagePreviewModel(QAbstractListModel):
         self.beginResetModel()
         self.pixmap_cache.clear()
         self.loading_paths.clear()
+        self.error_paths.clear()
         self.endResetModel()
 
-    def set_items_from_list(self, items: list[dict]):
+    def set_items_from_list(self, items: list[ResultNode]):
         self.beginResetModel()
         self.db_path = None
         self.group_id = -1
         self.items = items
         self.pixmap_cache.clear()
         self.loading_paths.clear()
+        self.error_paths.clear()
         self.endResetModel()
 
     def set_group(self, db_path: Path, group_id: int):
@@ -516,6 +519,7 @@ class ImagePreviewModel(QAbstractListModel):
         self.items.clear()
         self.pixmap_cache.clear()
         self.loading_paths.clear()
+        self.error_paths.clear()
         if DUCKDB_AVAILABLE and self.group_id != -1:
             try:
                 with duckdb.connect(database=str(self.db_path), read_only=True) as conn:
@@ -530,8 +534,7 @@ class ImagePreviewModel(QAbstractListModel):
                     cols = [desc[0] for desc in conn.execute(query, [self.group_id]).description]
                     for row_tuple in conn.execute(query, [self.group_id]).fetchall():
                         row_dict = dict(zip(cols, row_tuple, strict=False))
-                        row_dict["distance"] = int(row_dict.get("distance", -1) or -1)
-                        self.items.append(row_dict)
+                        self.items.append(ResultNode.from_dict(row_dict))
             except duckdb.Error as e:
                 app_logger.error(f"Failed to load group {self.group_id}: {e}")
         self.endResetModel()
@@ -544,7 +547,7 @@ class ImagePreviewModel(QAbstractListModel):
         if not index.isValid() or not (0 <= index.row() < len(self.items)):
             return None
         item = self.items[index.row()]
-        path_str = item["path"]
+        path_str = item.path
         if role == Qt.ItemDataRole.UserRole:
             return item
         if role == Qt.ItemDataRole.ToolTipRole:
@@ -556,7 +559,7 @@ class ImagePreviewModel(QAbstractListModel):
                 self.loading_paths.add(path_str)
                 loader = ImageLoader(
                     path_str=path_str,
-                    mtime=item.get("mtime", 0.0),
+                    mtime=item.mtime,
                     target_size=self.target_size,
                     tonemap_mode=self.tonemap_mode,
                     use_cache=True,
@@ -583,15 +586,12 @@ class ImagePreviewModel(QAbstractListModel):
     def _on_image_error(self, path_str: str, error_msg: str):
         if path_str in self.loading_paths:
             self.loading_paths.remove(path_str)
-        for item in self.items:
-            if item["path"] == path_str:
-                item["error"] = error_msg
-                self._emit_data_changed_for_path(path_str)
-                break
+        self.error_paths[path_str] = error_msg
+        self._emit_data_changed_for_path(path_str)
 
     def _emit_data_changed_for_path(self, path_str: str):
         for i, item in enumerate(self.items):
-            if item["path"] == path_str:
+            if item.path == path_str:
                 index = self.index(i, 0)
                 self.dataChanged.emit(index, index, [Qt.ItemDataRole.DecorationRole])
                 return
@@ -599,7 +599,7 @@ class ImagePreviewModel(QAbstractListModel):
     def get_row_for_path(self, path: Path) -> int | None:
         path_str = str(path)
         for i, item in enumerate(self.items):
-            if item["path"] == path_str:
+            if item.path == path_str:
                 return i
         return None
 
@@ -633,7 +633,7 @@ class ImageItemDelegate(QStyledItemDelegate):
         painter.save()
         try:
             painter.setClipRect(option.rect)
-            item_data = index.data(Qt.ItemDataRole.UserRole)
+            item_data: ResultNode = index.data(Qt.ItemDataRole.UserRole)
             if not item_data:
                 return
             self._draw_background(painter, option, item_data)
@@ -642,15 +642,14 @@ class ImageItemDelegate(QStyledItemDelegate):
         finally:
             painter.restore()
 
-    def _draw_background(self, painter, option, item_data):
+    def _draw_background(self, painter, option, item_data: ResultNode):
         painter.fillRect(option.rect, option.palette.base())
         if option.state & QStyle.State_Selected:
             highlight_color = option.palette.highlight().color()
             highlight_color.setAlpha(80)
             painter.fillRect(option.rect, highlight_color)
 
-        path_str = item_data.get("path")
-        if path_str and self.state.is_candidate(path_str):
+        if item_data.path and self.state.is_candidate(item_data.path):
             painter.setPen(QPen(QColor(UIConfig.Colors.HIGHLIGHT), 2))
             painter.drawRect(option.rect.adjusted(1, 1, -1, -1))
 
@@ -662,8 +661,7 @@ class ImageItemDelegate(QStyledItemDelegate):
                 AlphaBackgroundWidget._get_checkered_pixmap(thumb_rect.size(), self.bg_alpha),
             )
         pixmap = index.data(Qt.ItemDataRole.DecorationRole)
-        item_data = index.data(Qt.ItemDataRole.UserRole)
-        error_msg = item_data.get("error") if item_data else None
+        error_msg = self.parent().model.error_paths.get(index.data(Qt.ItemDataRole.UserRole).path)
         if pixmap and not pixmap.isNull():
             scaled = pixmap.scaled(
                 thumb_rect.size(),
@@ -683,7 +681,7 @@ class ImageItemDelegate(QStyledItemDelegate):
         else:
             painter.drawText(thumb_rect, Qt.AlignmentFlag.AlignCenter, "Loading...")
 
-    def _draw_text_info(self, painter, option, item_data):
+    def _draw_text_info(self, painter, option, item_data: ResultNode):
         text_rect = option.rect.adjusted(self.preview_size + 15, 5, -5, -5)
         if not text_rect.isValid():
             return
@@ -694,7 +692,7 @@ class ImageItemDelegate(QStyledItemDelegate):
         )
         secondary_color = QColor(main_color)
         secondary_color.setAlpha(150)
-        path = Path(item_data["path"])
+        path = Path(item_data.path)
         line_height = self.regular_font_metrics.height()
         x, y = text_rect.left(), text_rect.top() + self.bold_font_metrics.ascent()
 
@@ -708,12 +706,11 @@ class ImageItemDelegate(QStyledItemDelegate):
         painter.setPen(secondary_color)
 
         dist_text = ""
-        if item_data.get("is_best"):
+        if item_data.is_best:
             dist_text = f"[{BEST_FILE_METHOD_NAME}] | "
         else:
-            # Original logic for non-best files
-            method = item_data.get("found_by")
-            dist = item_data.get("distance", -1)
+            method = item_data.found_by
+            dist = item_data.distance
             if method == "xxHash":
                 dist_text = "Exact Match | "
             elif method == "dHash":
@@ -723,7 +720,7 @@ class ImageItemDelegate(QStyledItemDelegate):
             elif dist >= 0:
                 dist_text = f"Score: {dist}% | "
 
-        meta_text = f"{dist_text}{item_data.get('resolution_w', 0)}x{item_data.get('resolution_h', 0)} | {item_data.get('format_details', '')}"
+        meta_text = f"{dist_text}{item_data.resolution_w}x{item_data.resolution_h} | {item_data.format_details}"
         painter.drawText(x, y, self.regular_font_metrics.elidedText(meta_text, Qt.ElideRight, text_rect.width()))
 
         y += line_height

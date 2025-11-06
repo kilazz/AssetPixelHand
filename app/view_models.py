@@ -9,6 +9,7 @@ from PIL.ImageQt import fromqimage
 from PySide6.QtCore import QObject, QThreadPool, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
 
+from app.data_models import ResultNode
 from app.gui.tasks import ImageLoader
 
 
@@ -30,15 +31,15 @@ class ImageComparerState(QObject):
         """
         super().__init__()
         self.thread_pool = thread_pool
-        self._candidates: OrderedDict[str, dict] = OrderedDict()
+        self._candidates: OrderedDict[str, ResultNode] = OrderedDict()
         self._pil_images: dict[str, Image.Image] = {}
         self._active_loaders: dict[str, ImageLoader] = {}
 
-    def toggle_candidate(self, item_data: dict):
+    def toggle_candidate(self, item_data: ResultNode):
         """Adds or removes an item from the comparison candidates list.
         Maintains a maximum of two candidates and emits signals for UI updates.
         """
-        path_str = item_data["path"]
+        path_str = item_data.path
         is_currently_candidate = path_str in self._candidates
 
         added_path, removed_path = "", ""
@@ -59,7 +60,6 @@ class ImageComparerState(QObject):
         self.candidates_changed.emit(len(self._candidates))
         self.candidate_updated.emit(added_path, removed_path)
 
-    # NEW: Public method for the delegate to query the state.
     def is_candidate(self, path_str: str) -> bool:
         """Checks if a given path is currently a comparison candidate."""
         return path_str in self._candidates
@@ -95,7 +95,7 @@ class ImageComparerState(QObject):
         for path_str, item_data in self._candidates.items():
             loader = ImageLoader(
                 path_str=path_str,
-                mtime=item_data.get("mtime", 0.0),
+                mtime=item_data.mtime,
                 target_size=None,  # Load full resolution
                 tonemap_mode=tonemap_mode,
                 use_cache=False,  # Always reload full-res to apply new settings

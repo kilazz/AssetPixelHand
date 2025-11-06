@@ -103,6 +103,15 @@ class LanceDBSimilarityEngine(QObject):
         )
         self.signals.log_message.emit(log_msg, "info")
 
+    def _create_data_generator(self, arrow_table):
+        """
+        Creates a generator to stream data from an Arrow table,
+        avoiding loading the entire table into memory.
+        """
+        app_logger.info(f"Streaming {arrow_table.num_rows} vectors for processing...")
+        for batch in arrow_table.to_batches():
+            yield from batch.to_pylist()
+
     def find_similar_pairs(self, stop_event: threading.Event) -> list[tuple[str, str, float]]:
         """Finds all pairs of similar images that are below the distance threshold IN PARALLEL."""
         if self.table.to_lance().count_rows() == 0:
@@ -117,8 +126,7 @@ class LanceDBSimilarityEngine(QObject):
             self.signals.log_message.emit(f"Failed to fetch data: {e}", "error")
             return []
 
-        all_data = arrow_table.to_pylist()
-        num_points = len(all_data)
+        num_points = arrow_table.num_rows
         self.state.update_progress(0, num_points, "Finding nearest neighbors (AI)...")
 
         all_links = set()
@@ -138,8 +146,10 @@ class LanceDBSimilarityEngine(QObject):
 
         processed_count = 0
         try:
+            data_generator = self._create_data_generator(arrow_table)
+
             with ctx.Pool(processes=num_workers, initializer=init_search_worker, initargs=init_args) as pool:
-                results_iterator = pool.imap_unordered(search_worker, all_data, chunksize=10)
+                results_iterator = pool.imap_unordered(search_worker, data_generator, chunksize=10)
 
                 for found_links in results_iterator:
                     if stop_event.is_set():
