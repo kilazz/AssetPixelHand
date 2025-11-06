@@ -13,7 +13,7 @@ import duckdb
 from PIL import Image, ImageChops
 from PIL.ImageQt import ImageQt
 from PySide6.QtCore import QModelIndex, QPoint, Qt, QThreadPool, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QActionGroup, QIntValidator, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QCursor, QIntValidator, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -70,6 +70,21 @@ if TYPE_CHECKING:
 
 
 app_logger = logging.getLogger("AssetPixelHand.gui.panels")
+
+
+def create_file_context_menu(parent) -> tuple[QMenu, QAction, QAction, QAction]:
+    """Creates a standardized context menu for file operations."""
+    context_menu = QMenu(parent)
+    open_action = QAction("Open File", parent)
+    show_action = QAction("Show in Explorer", parent)
+    delete_action = QAction("Move to Trash", parent)
+
+    context_menu.addAction(open_action)
+    context_menu.addAction(show_action)
+    context_menu.addSeparator()
+    context_menu.addAction(delete_action)
+
+    return context_menu, open_action, show_action, delete_action
 
 
 class OptionsPanel(QGroupBox):
@@ -176,13 +191,10 @@ class OptionsPanel(QGroupBox):
         main_layout.addWidget(self.scan_button)
 
     def _connect_signals(self):
-        # Connect UI widgets directly to SettingsManager slots
         self.folder_path_entry.textChanged.connect(self.settings_manager.set_folder_path)
         self.threshold_spinbox.valueChanged.connect(self.settings_manager.set_threshold)
         self.exclude_entry.textChanged.connect(self.settings_manager.set_exclude_folders)
         self.model_combo.currentTextChanged.connect(self.settings_manager.set_model_key)
-
-        # Connect other signals for UI logic and actions
         self.browse_folder_button.clicked.connect(self._browse_for_folder)
         self.browse_sample_button.clicked.connect(self._browse_for_sample)
         self.clear_sample_button.clicked.connect(self._clear_sample)
@@ -399,7 +411,6 @@ class ScanOptionsPanel(QGroupBox):
         layout.addLayout(visuals_layout)
 
     def _connect_signals(self):
-        # Connect settings widgets to manager slots
         self.exact_duplicates_check.toggled.connect(self.settings_manager.set_find_exact)
         self.simple_duplicates_check.toggled.connect(self.settings_manager.set_find_simple)
         self.dhash_threshold_spin.valueChanged.connect(self.settings_manager.set_dhash_threshold)
@@ -411,8 +422,6 @@ class ScanOptionsPanel(QGroupBox):
         self.visuals_tonemap_check.toggled.connect(self.settings_manager.set_visuals_tonemap)
         self.max_visuals_entry.textChanged.connect(self.settings_manager.set_max_visuals)
         self.visuals_columns_spinbox.valueChanged.connect(self.settings_manager.set_visuals_columns)
-
-        # Connect signals for internal UI logic
         self.exact_duplicates_check.toggled.connect(self._update_hashing_options_state)
         self.simple_duplicates_check.toggled.connect(self._update_hashing_options_state)
         self.perceptual_duplicates_check.toggled.connect(self._update_hashing_options_state)
@@ -634,9 +643,12 @@ class ResultsPanel(QGroupBox):
         self.hardlink_available = False
         self.reflink_available = False
         self.current_operation = FileOperation.NONE
+
         self._init_ui()
         self._setup_models()
+        self._init_context_menu()
         self._connect_signals()
+
         self.set_enabled_state(is_enabled=False)
 
     def _init_ui(self):
@@ -669,6 +681,16 @@ class ResultsPanel(QGroupBox):
         self.proxy_model = ResultsProxyModel(self)
         self.proxy_model.setSourceModel(self.results_model)
         self.results_view.setModel(self.proxy_model)
+
+    def _init_context_menu(self):
+        self.context_menu_path: Path | None = None
+        (
+            self.context_menu,
+            self.open_action,
+            self.show_action,
+            self.delete_action,
+        ) = create_file_context_menu(self)
+        self.results_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
     def _create_header_controls(self, layout):
         top_controls_layout = QHBoxLayout()
@@ -727,6 +749,51 @@ class ResultsPanel(QGroupBox):
         self.similarity_filter_slider.valueChanged.connect(self._on_similarity_filter_changed)
         self.similarity_filter_slider.sliderReleased.connect(self._emit_visible_results)
         self.results_model.fetch_completed.connect(self._on_fetch_completed)
+        self.results_view.customContextMenuRequested.connect(self._show_context_menu)
+        self.open_action.triggered.connect(self._context_open_file)
+        self.show_action.triggered.connect(self._context_show_in_explorer)
+        self.delete_action.triggered.connect(self._context_delete_file)
+
+    def _open_path(self, path: Path | None):
+        if path and path.exists():
+            try:
+                webbrowser.open(path.resolve().as_uri())
+            except Exception as e:
+                app_logger.error(f"Could not open path '{path}': {e}")
+
+    @Slot(QPoint)
+    def _show_context_menu(self, pos):
+        from app.data_models import ResultNode
+
+        proxy_idx = self.results_view.indexAt(pos)
+        if not proxy_idx.isValid():
+            return
+
+        source_idx = self.proxy_model.mapToSource(proxy_idx)
+        if not source_idx.isValid():
+            return
+
+        node = source_idx.internalPointer()
+        if isinstance(node, ResultNode):
+            self.context_menu_path = Path(node.path)
+            self.context_menu.exec(QCursor.pos())
+
+    @Slot()
+    def _context_open_file(self):
+        self._open_path(self.context_menu_path)
+
+    @Slot()
+    def _context_show_in_explorer(self):
+        self._open_path(self.context_menu_path.parent if self.context_menu_path else None)
+
+    @Slot()
+    def _context_delete_file(self):
+        if (
+            self.context_menu_path
+            and QMessageBox.question(self, "Confirm Move", f"Move '{self.context_menu_path.name}' to trash?")
+            == QMessageBox.StandardButton.Yes
+        ):
+            self.file_op_manager.request_deletion([self.context_menu_path])
 
     @Slot(QModelIndex)
     def _on_fetch_completed(self, parent_index: QModelIndex):
@@ -909,7 +976,6 @@ class ResultsPanel(QGroupBox):
             self.file_op_manager.request_reflink(link_map)
 
     def remove_items_from_results_db(self, paths_to_delete: list[Path]):
-        """Physically removes rows from the results.duckdb file."""
         if not self.results_model.db_path or not paths_to_delete:
             return
 
@@ -970,10 +1036,13 @@ class ImageViewerPanel(QGroupBox):
 
     log_message = Signal(str, str)
 
-    def __init__(self, settings_manager: SettingsManager, thread_pool: QThreadPool):
+    def __init__(
+        self, settings_manager: SettingsManager, thread_pool: QThreadPool, file_op_manager: "FileOperationManager"
+    ):
         super().__init__("Image Viewer")
         self.settings_manager = settings_manager
         self.thread_pool = thread_pool
+        self.file_op_manager = file_op_manager
         self.state = ImageComparerState(thread_pool)
         self.is_transparency_enabled = settings_manager.settings.viewer.show_transparency
         self.update_timer = QTimer(self)
@@ -981,6 +1050,7 @@ class ImageViewerPanel(QGroupBox):
         self.update_timer.setInterval(150)
         self._init_state()
         self._init_ui()
+        self._init_context_menu()
         self._connect_signals()
         self.load_settings(settings_manager.settings)
         self.clear_viewer()
@@ -1090,8 +1160,17 @@ class ImageViewerPanel(QGroupBox):
         self.compare_stack.addWidget(self.diff_view)
         parent_layout.addWidget(self.compare_stack, 1)
 
+    def _init_context_menu(self):
+        self.context_menu_path: Path | None = None
+        (
+            self.context_menu,
+            self.open_action,
+            self.show_action,
+            self.delete_action,
+        ) = create_file_context_menu(self)
+        self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
     def _connect_signals(self):
-        # Connect signals for UI logic
         self.alpha_slider.valueChanged.connect(self._on_alpha_change)
         self.compare_button.clicked.connect(self._show_comparison_view)
         self.back_button.clicked.connect(self._back_to_list_view)
@@ -1107,19 +1186,49 @@ class ImageViewerPanel(QGroupBox):
         self.state.image_loaded.connect(self._on_full_res_image_loaded)
         self.state.load_complete.connect(self._on_load_complete)
         self.state.load_error.connect(self.log_message.emit)
-
-        # Connect settings widgets to SettingsManager slots
         self.preview_size_slider.sliderReleased.connect(
             lambda: self.settings_manager.set_preview_size(self.preview_size_slider.value())
         )
         self.bg_alpha_check.toggled.connect(self.settings_manager.set_show_transparency)
         self.thumbnail_tonemap_check.toggled.connect(self.settings_manager.set_thumbnail_tonemap_enabled)
         self.compare_tonemap_check.toggled.connect(self.settings_manager.set_compare_tonemap_enabled)
-
-        # Connect internal slots for UI updates
         self.compare_bg_alpha_check.toggled.connect(self._on_transparency_toggled)
         self.thumbnail_tonemap_check.toggled.connect(self._on_thumbnail_tonemap_toggled)
         self.compare_tonemap_check.toggled.connect(self._on_compare_tonemap_changed)
+        self.list_view.customContextMenuRequested.connect(self._show_context_menu)
+        self.open_action.triggered.connect(self._context_open_file)
+        self.show_action.triggered.connect(self._context_show_in_explorer)
+        self.delete_action.triggered.connect(self._context_delete_file)
+
+    def _open_path(self, path: Path | None):
+        if path and path.exists():
+            try:
+                webbrowser.open(path.resolve().as_uri())
+            except Exception as e:
+                app_logger.error(f"Could not open path '{path}': {e}")
+
+    @Slot(QPoint)
+    def _show_context_menu(self, pos):
+        if (item := self.get_item_at_pos(pos)) and (path_str := item.get("path")):
+            self.context_menu_path = Path(path_str)
+            self.context_menu.exec(QCursor.pos())
+
+    @Slot()
+    def _context_open_file(self):
+        self._open_path(self.context_menu_path)
+
+    @Slot()
+    def _context_show_in_explorer(self):
+        self._open_path(self.context_menu_path.parent if self.context_menu_path else None)
+
+    @Slot()
+    def _context_delete_file(self):
+        if (
+            self.context_menu_path
+            and QMessageBox.question(self, "Confirm Move", f"Move '{self.context_menu_path.name}' to trash?")
+            == QMessageBox.StandardButton.Yes
+        ):
+            self.file_op_manager.request_deletion([self.context_menu_path])
 
     @Slot(list)
     def display_results(self, items: list):
@@ -1190,7 +1299,6 @@ class ImageViewerPanel(QGroupBox):
 
     @Slot(str, str)
     def _on_candidate_updated(self, added_path: str, removed_path: str):
-        """Trigger repaint for items that were added or removed from candidates."""
         for path_str in [added_path, removed_path]:
             if path_str and (row := self.model.get_row_for_path(Path(path_str))) is not None:
                 index = self.model.index(row, 0)

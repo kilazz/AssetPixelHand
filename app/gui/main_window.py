@@ -6,18 +6,16 @@ controllers and managers.
 """
 
 import logging
-import webbrowser
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThreadPool, Slot
-from PySide6.QtGui import QAction, QCursor
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
     QMainWindow,
-    QMenu,
     QMessageBox,
     QSplitter,
+    QStatusBar,
     QVBoxLayout,
     QWidget,
 )
@@ -67,6 +65,8 @@ class App(QMainWindow):
         self.setWindowTitle("AssetPixelHand")
         self.setGeometry(100, 100, 1600, 900)
 
+        self.setStatusBar(QStatusBar(self))
+
         self.settings_manager = SettingsManager(self)
         self.stats_dialog: ScanStatisticsDialog | None = None
 
@@ -75,7 +75,6 @@ class App(QMainWindow):
 
         self._setup_ui()
         self._create_menu_bar()
-        self._create_context_menu()
         self._connect_signals()
 
         self.options_panel._update_scan_context()
@@ -130,7 +129,7 @@ class App(QMainWindow):
 
         self.results_viewer_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.results_panel = ResultsPanel(self.file_op_manager)
-        self.viewer_panel = ImageViewerPanel(self.settings_manager, QThreadPool.globalInstance())
+        self.viewer_panel = ImageViewerPanel(self.settings_manager, QThreadPool.globalInstance(), self.file_op_manager)
 
         results_pane_wrapper = QWidget()
         results_pane_layout = QHBoxLayout(results_pane_wrapper)
@@ -175,7 +174,6 @@ class App(QMainWindow):
                 action.setChecked(True)
                 action.trigger()
                 return
-        # Fallback to the first theme if the saved one is not found
         if self.options_panel.theme_menu.actions():
             self.options_panel.theme_menu.actions()[0].trigger()
 
@@ -199,30 +197,18 @@ class App(QMainWindow):
             self.settings_manager.settings.theme = theme_name
             self.settings_manager.save()
 
-    def _create_context_menu(self):
-        self.context_menu_path: Path | None = None
-        self.open_action = QAction("Open File", self)
-        self.show_action = QAction("Show in Explorer", self)
-        self.delete_action = QAction("Move to Trash", self)
-        self.context_menu = QMenu(self)
-        self.context_menu.addAction(self.open_action)
-        self.context_menu.addAction(self.show_action)
-        self.context_menu.addSeparator()
-        self.context_menu.addAction(self.delete_action)
-        self.results_panel.results_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.viewer_panel.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-
     def _connect_signals(self):
         # Connect to the Signal Bus
         APP_SIGNAL_BUS.scan_finished.connect(self.on_scan_complete)
         APP_SIGNAL_BUS.scan_error.connect(self.on_scan_error)
-
         APP_SIGNAL_BUS.file_operation_started.connect(self._on_file_op_started)
         APP_SIGNAL_BUS.file_operation_finished.connect(self._on_file_op_finished)
-
         APP_SIGNAL_BUS.log_message.connect(self.log_panel.log_message)
         APP_SIGNAL_BUS.lock_ui.connect(lambda: self.set_ui_scan_state(is_scanning=True))
         APP_SIGNAL_BUS.unlock_ui.connect(lambda: self.set_ui_scan_state(is_scanning=False))
+
+        # CHANGE: Connect the new status bar signal.
+        APP_SIGNAL_BUS.status_message_updated.connect(self.statusBar().showMessage)
 
         # Connect UI Panels to this window or each other (Mediator role)
         self.options_panel.scan_requested.connect(self._start_scan)
@@ -235,13 +221,6 @@ class App(QMainWindow):
 
         self.results_panel.results_view.selectionModel().selectionChanged.connect(self._on_results_selection_changed)
         self.results_panel.visible_results_changed.connect(self.viewer_panel.display_results)
-        self.results_panel.results_view.customContextMenuRequested.connect(self._show_results_context_menu)
-        self.viewer_panel.list_view.customContextMenuRequested.connect(self._show_viewer_context_menu)
-
-        # Connect Context Menu Signals
-        self.open_action.triggered.connect(self._context_open_file)
-        self.show_action.triggered.connect(self._context_show_in_explorer)
-        self.delete_action.triggered.connect(self._context_delete_file)
 
     @Slot()
     def _on_results_selection_changed(self):
@@ -386,7 +365,6 @@ class App(QMainWindow):
         self.on_scan_end()
 
     def on_scan_end(self):
-        """Finalizes any scan-related state, closes dialogs, and re-enables the UI."""
         if self.stats_dialog:
             if not self.stats_dialog.close():
                 self.stats_dialog.deleteLater()
@@ -415,10 +393,8 @@ class App(QMainWindow):
 
     @Slot(str)
     def _on_file_op_started(self, operation_name: str):
-        """Locks the UI and updates the ResultsPanel to show an operation is in progress."""
         self.set_ui_scan_state(is_scanning=True)
         try:
-            # Convert the operation name string back to an enum member
             op_enum = FileOperation[operation_name]
             self.results_panel.set_operation_in_progress(op_enum)
         except KeyError:
@@ -426,21 +402,20 @@ class App(QMainWindow):
 
     @Slot(list)
     def _on_file_op_finished(self, affected_paths: list[Path]):
-        """Handles UI updates after a file operation completes."""
+        self.statusBar().clearMessage()
         self.results_panel.clear_operation_in_progress()
 
         if not affected_paths:
             self.set_ui_scan_state(is_scanning=False)
             return
 
-        # Block signals to prevent UI flicker or race conditions
         self.results_panel.results_view.selectionModel().blockSignals(True)
         self.viewer_panel.list_view.blockSignals(True)
 
         self.results_panel.remove_items_from_results_db(affected_paths)
         self.viewer_panel.clear_viewer()
         self.results_panel.update_after_deletion(affected_paths)
-        QApplication.processEvents()  # Force UI to redraw with updated model
+        QApplication.processEvents()
 
         self.results_panel.results_view.selectionModel().blockSignals(False)
         self.viewer_panel.list_view.blockSignals(False)
@@ -480,7 +455,6 @@ class App(QMainWindow):
             try:
                 success = clear_all_app_data()
             finally:
-                # Re-initialize logging
                 setup_logging(APP_SIGNAL_BUS, force_debug="--debug" in QApplication.arguments())
             if success:
                 self.results_panel.clear_results()
@@ -488,47 +462,6 @@ class App(QMainWindow):
                 QMessageBox.information(self, "Success", "All application data cleared.")
             else:
                 QMessageBox.critical(self, "Error", "Failed to clear all app data.")
-
-    def _show_results_context_menu(self, pos):
-        proxy_idx = self.results_panel.results_view.indexAt(pos)
-        if not proxy_idx.isValid():
-            return
-
-        source_idx = self.results_panel.proxy_model.mapToSource(proxy_idx)
-        if not source_idx.isValid():
-            return
-
-        node: GroupNode | ResultNode | None = source_idx.internalPointer()
-        if isinstance(node, ResultNode):
-            self.context_menu_path = Path(node.path)
-            self.context_menu.exec(QCursor.pos())
-
-    def _show_viewer_context_menu(self, pos):
-        if (item := self.viewer_panel.get_item_at_pos(pos)) and (path := item.get("path")):
-            self.context_menu_path = Path(path)
-            self.context_menu.exec(QCursor.pos())
-
-    def _context_open_file(self):
-        self._open_path(self.context_menu_path)
-
-    def _context_show_in_explorer(self):
-        self._open_path(self.context_menu_path.parent if self.context_menu_path else None)
-
-    @Slot()
-    def _context_delete_file(self):
-        if (
-            self.context_menu_path
-            and QMessageBox.question(self, "Confirm Move", f"Move '{self.context_menu_path.name}' to trash?")
-            == QMessageBox.StandardButton.Yes
-        ):
-            self.file_op_manager.request_deletion([self.context_menu_path])
-
-    def _open_path(self, path: Path | None):
-        if path and path.exists():
-            try:
-                webbrowser.open(path.resolve().as_uri())
-            except Exception as e:
-                app_logger.error(f"Could not open path '{path}': {e}")
 
     @Slot(bool)
     def _update_low_priority_option(self, is_cpu: bool):

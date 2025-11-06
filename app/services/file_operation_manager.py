@@ -83,8 +83,9 @@ class FileOperationManager(QObject):
 
         task.signals.finished.connect(self._on_operation_complete)
         task.signals.log.connect(APP_SIGNAL_BUS.log_message)
+
         task.signals.progress_updated.connect(
-            lambda msg, cur, tot: APP_SIGNAL_BUS.log_message.emit(f"{msg} ({cur}/{tot})", "info")
+            lambda msg, cur, tot: APP_SIGNAL_BUS.status_message_updated.emit(f"{msg} ({cur}/{tot})", 0)
         )
 
         self.thread_pool.start(task)

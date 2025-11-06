@@ -50,6 +50,9 @@ class SignalBus(QObject):
     # For showing critical error dialogs to the user
     show_error_dialog = Signal(str, str)  # title, message
 
+    # show a temporary message in the status bar
+    status_message_updated = Signal(str, int)  # message, timeout in ms (0 = permanent)
+
 
 # Create a single, globally accessible instance of the signal bus.
 # All other modules will import this instance.
