@@ -49,6 +49,11 @@ class ScanConfigBuilder:
         model_info, onnx_name = self._get_model_details()
         performance_config = self._build_performance_config()
 
+        # Convert the user-facing device name (e.g., "GPU (DirectML)")
+        # to the internal system name (e.g., "gpu") that the core expects.
+        device_setting = self.settings.performance.device
+        device_internal_name = "gpu" if "gpu" in device_setting.lower() else "cpu"
+
         return ScanConfig(
             folder_path=folder_path,
             similarity_threshold=int(self.settings.threshold),
@@ -58,7 +63,7 @@ class ScanConfigBuilder:
             model_info=model_info,
             selected_extensions=self.settings.selected_extensions,
             scan_mode=self.scan_mode,
-            device=self.settings.performance.device,
+            device=device_internal_name,
             find_exact_duplicates=self.settings.hashing.find_exact,
             find_simple_duplicates=self.settings.hashing.find_simple,
             dhash_threshold=self.settings.hashing.dhash_threshold,

@@ -41,7 +41,7 @@ def worker_get_perceptual_hashes(
     path: Path,
 ) -> tuple[Union["imagehash.ImageHash", None], Union["imagehash.ImageHash", None], Path]:
     """
-    NEW WORKER: Opens an image once using the best available loader
+    Opens an image once using the best available loader
     and computes both dHash and pHash.
     """
     if not IMAGEHASH_AVAILABLE:
