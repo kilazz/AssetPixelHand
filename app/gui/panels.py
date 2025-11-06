@@ -1188,6 +1188,7 @@ class ImageViewerPanel(QGroupBox):
         self.state.load_error.connect(self.log_message.emit)
 
         self.preview_size_slider.sliderReleased.connect(self._update_preview_sizes)
+
         self.bg_alpha_check.toggled.connect(self._on_transparency_toggled)
         self.compare_bg_alpha_check.toggled.connect(self._on_transparency_toggled)
 
@@ -1386,10 +1387,16 @@ class ImageViewerPanel(QGroupBox):
         self.is_transparency_enabled = state
         self.bg_alpha_check.setChecked(state)
         self.compare_bg_alpha_check.setChecked(state)
+
         for w in [self.alpha_slider, self.alpha_label, self.compare_bg_alpha_slider]:
             w.setEnabled(state)
+
         self.delegate.set_transparency_enabled(state)
+        for view in [self.compare_view_1, self.compare_view_2, self.compare_widget, self.diff_view]:
+            view.set_transparency_enabled(state)
+
         self.settings_manager.set_show_transparency(state)
+
         self.list_view.viewport().update()
         self.compare_container.update()
 
