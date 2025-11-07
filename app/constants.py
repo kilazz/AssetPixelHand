@@ -199,7 +199,6 @@ class TonemapMode(Enum):
     NONE = "none"
     ACES = "aces"
     REINHARD = "reinhard"
-    DRAGO = "drago"
 
 
 # --- Data Model & UI Constants ---

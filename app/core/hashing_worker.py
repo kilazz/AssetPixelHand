@@ -25,8 +25,8 @@ except ImportError:
 def worker_collect_all_data(path: Path) -> dict[str, Any] | None:
     """
     A "super-worker" that collects all hashes and metadata for a file.
-    It reads the file twice in the worst case (once for xxhash, once for image loading)
-    but does so in a single worker pass to simplify the main pipeline.
+    It may read the file twice in the worst case (once for xxhash, once for image loading)
+    but does so in a single worker pass to simplify the main pipeline and improve stability.
     """
     try:
         # 1. Get basic metadata from stat, which is fast and handles file-not-found.

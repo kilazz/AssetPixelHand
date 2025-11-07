@@ -5,8 +5,8 @@ This module provides a unified interface for handling a wide variety of image
 formats by using a prioritized chain of specialized libraries:
 1. pyvips for maximum format compatibility and performance.
 2. DirectXTex (via directxtex_decoder) for DDS textures.
-3. OpenImageIO for professional formats and HDR images (EXR, DPX, etc.).
-4. Pillow (PIL) as a robust fallback for standard web and raster formats.
+3. OpenImageIO for professional formats.
+4. Pillow (PIL) as a robust fallback.
 """
 
 import contextlib
@@ -54,10 +54,20 @@ except ImportError:
     PILLOW_AVAILABLE = False
 
 
+def is_dds_hdr(format_str: str) -> tuple[bool, int]:
+    """Checks if a DDS format string corresponds to an HDR format."""
+    fmt = format_str.upper()
+    if any(x in fmt for x in ["BC6H", "R16G16B16A16_FLOAT", "R16G16_FLOAT", "R16_FLOAT"]):
+        return True, 16
+    if any(x in fmt for x in ["R32G32B32A32_FLOAT", "R32G32B32_FLOAT", "R32_FLOAT", "R11G11B10_FLOAT"]):
+        return True, 32
+    return False, 8
+
+
 def load_image(
     path: str | Path,
     target_size: tuple[int, int] | None = None,
-    tonemap_mode: str = TonemapMode.REINHARD.value,
+    tonemap_mode: str = TonemapMode.ACES.value,
 ) -> Image.Image | None:
     try:
         path = Path(path)
@@ -69,7 +79,6 @@ def load_image(
 
     pil_image = None
 
-    # --- Stage 1: PyVips (Highest Priority) ---
     if PYVIPS_AVAILABLE:
         app_logger.debug(f"Attempting to load '{filename}' with pyvips.")
         try:
@@ -78,7 +87,6 @@ def load_image(
         except Exception as e:
             app_logger.debug(f"pyvips failed for '{filename}': {e}. Falling back.")
 
-    # --- Stage 2: DirectXTex for DDS ---
     if pil_image is None and ext == ".dds" and DIRECTXTEX_AVAILABLE:
         app_logger.debug(f"Attempting to load '{filename}' with DirectXTex.")
         try:
@@ -87,7 +95,6 @@ def load_image(
         except Exception as e:
             app_logger.debug(f"DirectXTex failed for '{filename}': {e}. Falling back.")
 
-    # --- Stage 3: OpenImageIO ---
     if pil_image is None and OIIO_AVAILABLE:
         app_logger.debug(f"Attempting to load '{filename}' with OpenImageIO.")
         try:
@@ -96,7 +103,6 @@ def load_image(
         except Exception as e:
             app_logger.debug(f"OIIO failed for '{filename}': {e}. Falling back.")
 
-    # --- Stage 4: Pillow (Fallback) ---
     if pil_image is None and PILLOW_AVAILABLE:
         app_logger.debug(f"Attempting to load '{filename}' with Pillow.")
         try:
@@ -135,7 +141,6 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
             app_logger.debug(f"Getting metadata for '{filename}' with pyvips.")
             try:
                 img = pyvips.Image.new_from_file(str(path), access="sequential")
-
                 format_map = {
                     "uchar": 8,
                     "char": 8,
@@ -151,13 +156,11 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
                 bit_depth = format_map.get(img.format, 8)
                 ch_str = {1: "Grayscale", 2: "GA", 3: "RGB", 4: "RGBA"}.get(img.bands, f"{img.bands}ch")
                 has_alpha = img.hasalpha()
-
                 capture_date = None
                 if "exif-ifd0-DateTime" in img.get_fields():
                     dt_str = img.get("exif-ifd0-DateTime")
                     with contextlib.suppress(ValueError, TypeError):
                         capture_date = datetime.strptime(dt_str.split("\0", 1)[0], "%Y:%m:%d %H:%M:%S").timestamp()
-
                 return {
                     "resolution": (img.width, img.height),
                     "file_size": stat.st_size,
@@ -198,7 +201,6 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
                 buf = oiio.ImageBuf(str(path))
                 if buf.has_error:
                     raise RuntimeError(f"OIIO Error: {buf.geterror(autoclear=1)}")
-
                 spec = buf.spec()
                 bit_depth = {oiio.UINT8: 8, oiio.UINT16: 16, oiio.HALF: 16, oiio.FLOAT: 32, oiio.DOUBLE: 64}.get(
                     spec.format.basetype, 8
@@ -253,35 +255,20 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
     return None
 
 
-def is_dds_hdr(format_str: str) -> tuple[bool, int]:
-    fmt = format_str.upper()
-    if any(x in fmt for x in ["BC6H", "R16G16B16A16_FLOAT", "R16G16_FLOAT", "R16_FLOAT"]):
-        return True, 16
-    if any(x in fmt for x in ["R32G32B32A32_FLOAT", "R32G32B32_FLOAT", "R32_FLOAT", "R11G11B10_FLOAT"]):
-        return True, 32
-    return False, 8
-
-
 def _load_with_pyvips(path: str | Path, tonemap_mode: str) -> Image.Image | None:
-    """Load an image using pyvips from a path and convert to a Pillow Image."""
     image = pyvips.Image.new_from_file(str(path), access="sequential")
-
     is_float = "float" in image.format or "double" in image.format
-
     if is_float and tonemap_mode != TonemapMode.NONE.value:
         numpy_array = image.numpy()
         tonemapped_array = _tonemap_float_array(numpy_array.astype(np.float32), tonemap_mode)
         return Image.fromarray(tonemapped_array)
-
     if image.format != "uchar":
         image = image.cast("uchar")
-
     numpy_array = image.numpy()
     return Image.fromarray(numpy_array)
 
 
 def _load_with_directxtex(dds_bytes: bytes, tonemap_mode: str) -> Image.Image | None:
-    """Loads a DDS file from a bytes object."""
     decoded = directxtex_decoder.decode_dds(dds_bytes)
     numpy_array, dtype = decoded["data"], decoded["data"].dtype
     if np.issubdtype(dtype, np.floating):
@@ -300,11 +287,9 @@ def _load_with_directxtex(dds_bytes: bytes, tonemap_mode: str) -> Image.Image | 
 
 
 def _load_with_oiio(path: str | Path, tonemap_mode: str) -> Image.Image | None:
-    """Loads an image using OpenImageIO from a path."""
     buf = oiio.ImageBuf(str(path))
     if buf.has_error:
         raise RuntimeError(f"OIIO Error: {buf.geterror(autoclear=1)}")
-
     numpy_array = buf.get_pixels()
     if np.issubdtype(numpy_array.dtype, np.floating):
         is_hdr = np.max(numpy_array) > 1.0
@@ -320,6 +305,7 @@ def _load_with_oiio(path: str | Path, tonemap_mode: str) -> Image.Image | None:
 
 
 def _tonemap_float_array(float_array: np.ndarray, mode: str) -> np.ndarray:
+    """Applies a tonemapping operator to a floating-point NumPy array."""
     if float_array.ndim == 2:
         rgb = np.stack([float_array] * 3, axis=-1)
     elif float_array.shape[-1] == 1:
@@ -331,13 +317,30 @@ def _tonemap_float_array(float_array: np.ndarray, mode: str) -> np.ndarray:
 
     alpha = float_array[..., 3:4] if float_array.ndim > 2 and float_array.shape[-1] > 3 else None
 
-    rgb[rgb < 0.0] = 0.0
-    if mode == TonemapMode.REINHARD.value:
+    rgb = np.maximum(rgb, 0.0)
+
+    if mode == TonemapMode.ACES.value:
+        # Apply exposure boost
+        exposure = 1.5
+        rgb *= exposure
+
+        # ACES Filmic tonemapping curve (a common, effective approximation)
+        a = 2.51
+        b = 0.03
+        c = 2.43
+        d = 0.59
+        e = 0.14
+        rgb = (rgb * (a * rgb + b)) / (rgb * (c * rgb + d) + e)
+
+        # Apply gamma correction for sRGB display
+        gamma_corrected = np.power(np.clip(rgb, 0.0, 1.0), 1.0 / 2.2)
+
+    elif mode == TonemapMode.REINHARD.value:
         gamma_corrected = np.power(rgb / (1.0 + rgb), 1.0 / 2.2)
-    elif mode == TonemapMode.DRAGO.value:
-        gamma_corrected = np.power(np.log(1.0 + 5.0 * rgb) / np.log(6.0), 1.0 / 1.9)
-    else:  # Fallback to simple clipping
+
+    else:  # 'none' mode just clips the values
         gamma_corrected = np.clip(rgb, 0.0, 1.0)
+
     final_rgb = (gamma_corrected * 255).astype(np.uint8)
 
     if alpha is not None:
