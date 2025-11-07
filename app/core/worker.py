@@ -19,14 +19,15 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-from app.constants import APP_DATA_DIR, DEEP_LEARNING_AVAILABLE, FP16_MODEL_SUFFIX, MODELS_DIR, WIN32_AVAILABLE
-from app.data_models import ImageFingerprint
-from app.image_io import (
-    DIRECTXTEX_AVAILABLE,
-    PILLOW_AVAILABLE,
-    _load_with_directxtex,
-    get_image_metadata,
+from app.constants import (
+    APP_DATA_DIR,
+    DEEP_LEARNING_AVAILABLE,
+    FP16_MODEL_SUFFIX,
+    MODELS_DIR,
+    WIN32_AVAILABLE,
 )
+from app.data_models import ImageFingerprint
+from app.image_io import get_image_metadata, load_image
 
 if WIN32_AVAILABLE:
     import win32api
@@ -160,99 +161,34 @@ def _process_batch_from_paths(
     paths: list[Path], input_size
 ) -> tuple[list, list[ImageFingerprint], list[tuple[str, str]]]:
     """
-    Helper to load images and metadata for a batch of paths using a robust,
-    version-agnostic approach for OIIO optimization.
+    Loads images and metadata for a batch of paths using the centralized `load_image` function.
     """
-    try:
-        import OpenImageIO as oiio
-    except ImportError:
-        oiio = None
-
     images, fingerprints, skipped_tuples = [], [], []
 
-    oiio_cache = None
-    cache_needs_destroy = False
-    if oiio:
-        if hasattr(oiio.ImageCache, "create"):
-            with contextlib.suppress(Exception):
-                oiio_cache = oiio.ImageCache.create(shared=False)
-                cache_needs_destroy = True
-        elif hasattr(oiio, "ImageCache"):
-            with contextlib.suppress(Exception):
-                oiio_cache = oiio.ImageCache()
-        if not oiio_cache:
-            app_logger.warning("Could not create/get OIIO ImageCache. Performance may be reduced.")
+    for path in paths:
+        try:
+            # 1. Get metadata first. If it fails, skip the file.
+            metadata = get_image_metadata(path)
+            if not metadata or not metadata.get("resolution") or metadata["resolution"][0] == 0:
+                skipped_tuples.append((str(path), "Metadata extraction failed"))
+                continue
 
-    def smart_convert_to_rgb(img: Image.Image) -> Image.Image:
-        """
-        Converts any image to a 3-channel RGB format, intelligently handling
-        alpha-only textures and different modes.
-        """
-        if img.mode == "RGB":
-            return img
+            # 2. Use the unified loading function from image_io.py
+            pil_image = load_image(path)
 
-        if "A" in img.getbands() and "R" in img.getbands():
-            rgb_bands = img.getchannel("R"), img.getchannel("G"), img.getchannel("B")
-            is_rgb_blank = all(band.getextrema() == (0, 0) for band in rgb_bands) or all(
-                band.getextrema() == (255, 255) for band in rgb_bands
-            )
-            if is_rgb_blank:
-                alpha = img.getchannel("A")
-                return Image.merge("RGB", (alpha, alpha, alpha))
+            if pil_image:
+                pil_image.thumbnail(input_size, Image.Resampling.LANCZOS)
+                # Convert to RGB if needed for the model (most models require 3 channels)
+                processed_image = pil_image.convert("RGB") if pil_image.mode != "RGB" else pil_image
+                images.append(processed_image)
+                fingerprints.append(ImageFingerprint(path=path, hashes=np.array([]), **metadata))
+            else:
+                skipped_tuples.append((str(path), "Image loading failed"))
 
-        return img.convert("RGB")
-
-    try:
-        for path in paths:
-            try:
-                metadata = get_image_metadata(path)
-                if not metadata or not metadata.get("resolution") or metadata["resolution"][0] == 0:
-                    skipped_tuples.append((str(path), "Metadata extraction failed"))
-                    continue
-
-                pil_image = None
-                ext = path.suffix.lower()
-
-                if ext == ".dds" and DIRECTXTEX_AVAILABLE:
-                    with contextlib.suppress(Exception):
-                        pil_image = _load_with_directxtex(path, "none")
-
-                if pil_image is None and oiio:
-                    with contextlib.suppress(Exception):
-                        buf = oiio.ImageBuf()
-                        if oiio_cache:
-                            oiio_cache.get_imagebuf(str(path), buf)
-                        else:
-                            buf.reset(str(path))
-
-                        if not buf.has_error:
-                            pil_image = Image.fromarray(buf.get_pixels())
-                        else:
-                            raise RuntimeError(buf.geterror(autoclear=1))
-
-                if pil_image is None and PILLOW_AVAILABLE:
-                    try:
-                        with Image.open(path) as img:
-                            img.load()
-                        pil_image = img
-                    except Exception:
-                        skipped_tuples.append((str(path), "Image loading failed"))
-                        continue
-
-                if pil_image:
-                    pil_image.thumbnail(input_size, Image.Resampling.LANCZOS)
-                    processed_image = smart_convert_to_rgb(pil_image)
-                    images.append(processed_image)
-                    fingerprints.append(ImageFingerprint(path=path, hashes=np.array([]), **metadata))
-                else:
-                    skipped_tuples.append((str(path), "All image loaders failed"))
-
-            except Exception as e:
-                app_logger.error(f"Error processing {path.name} in batch", exc_info=True)
-                skipped_tuples.append((str(path), f"{type(e).__name__}: {str(e).splitlines()[0]}"))
-    finally:
-        if oiio_cache and cache_needs_destroy:
-            oiio_cache.destroy()
+        except Exception as e:
+            # Log the error and add the file to the skipped list
+            app_logger.error(f"Error processing {path.name} in batch", exc_info=True)
+            skipped_tuples.append((str(path), f"{type(e).__name__}: {str(e).splitlines()[0]}"))
 
     return images, fingerprints, skipped_tuples
 

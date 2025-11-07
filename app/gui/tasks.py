@@ -306,12 +306,16 @@ class GroupFetcherTask(QRunnable):
             with duckdb.connect(database=str(self.db_path), read_only=True) as conn:
                 query = "SELECT * FROM results WHERE group_id = ? ORDER BY is_best DESC, distance DESC"
                 cols = [desc[0] for desc in conn.execute(query, [self.group_id]).description]
-                children = [
-                    dict(zip(cols, row, strict=False)) for row in conn.execute(query, [self.group_id]).fetchall()
-                ]
 
-                for child in children:
-                    child["distance"] = int(child.get("distance", -1) or -1)
+                children = []
+                for row_tuple in conn.execute(query, [self.group_id]).fetchall():
+                    child_dict = dict(zip(cols, row_tuple, strict=False))
+                    # FIXED: Check if the file exists on disk before adding it to the view
+                    if Path(child_dict["path"]).exists():
+                        child_dict["distance"] = int(child_dict.get("distance", -1) or -1)
+                        children.append(child_dict)
+                    else:
+                        app_logger.info(f"Stale file reference found and removed from view: {child_dict['path']}")
 
                 is_search = self.mode in [ScanMode.TEXT_SEARCH, ScanMode.SAMPLE_SEARCH]
 

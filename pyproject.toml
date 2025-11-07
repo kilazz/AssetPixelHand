@@ -25,13 +25,6 @@ dependencies = [
     # Databases
     "lancedb>=0.25.2",
     "duckdb>=1.4.1",
-    # Image Processing
-    "Pillow>=12.0.0",
-    #"OpenImageIO>=3.1.7.0",
-    "oiio-python>=3.0.10.0.1", #replacement OpenImageIO
-    "pyvips>=3.0.0",
-    "pyvips-binary>=8.17.3",
-    #"directxtex-decoder", #for DDS
     # Data Handling & Utilities
     "numpy>=2.2.6", #oiio-python
     "scipy>=1.16.3",
@@ -40,6 +33,13 @@ dependencies = [
     "xxhash>=3.6.0",
     "ImageHash>=4.3.2",
     "zstandard>=0.25.0",
+    # Image Processing
+    "Pillow>=12.0.0",
+    #"OpenImageIO>=3.1.7.0",
+    "oiio-python>=3.0.10.0.1", #replacement OpenImageIO
+    "pyvips>=3.0.0",
+    "pyvips-binary>=8.17.3",
+    #"directxtex-decoder", #for DDS
 ]
 
 [project.optional-dependencies]

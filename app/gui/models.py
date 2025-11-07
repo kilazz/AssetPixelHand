@@ -205,6 +205,12 @@ class ResultsTreeModel(QAbstractItemModel):
             return
 
         node = self.groups_data[group_id]
+
+        if not children_dicts and node.count > 0:
+            self.remove_group_by_id(group_id)
+            del self.running_tasks[group_id]
+            return
+
         children = [ResultNode.from_dict(c) for c in children_dicts]
 
         for child in children:
@@ -371,6 +377,17 @@ class ResultsTreeModel(QAbstractItemModel):
             return UIConfig.ResultsView.HEADERS[section]
         return None
 
+    @Slot(int)
+    def remove_group_by_id(self, group_id: int):
+        """Finds and removes a group row from the model by its ID."""
+        if group_id in self.sorted_group_ids:
+            row = self.sorted_group_ids.index(group_id)
+            self.beginRemoveRows(QModelIndex(), row, row)
+            self.sorted_group_ids.pop(row)
+            if group_id in self.groups_data:
+                del self.groups_data[group_id]
+            self.endRemoveRows()
+
     def sort_results(self, sort_key: str):
         if not self.groups_data:
             return
@@ -534,7 +551,10 @@ class ImagePreviewModel(QAbstractListModel):
                     cols = [desc[0] for desc in conn.execute(query, [self.group_id]).description]
                     for row_tuple in conn.execute(query, [self.group_id]).fetchall():
                         row_dict = dict(zip(cols, row_tuple, strict=False))
-                        self.items.append(ResultNode.from_dict(row_dict))
+                        if Path(row_dict["path"]).exists():
+                            self.items.append(ResultNode.from_dict(row_dict))
+                        else:
+                            app_logger.info(f"Stale file reference found and removed from viewer: {row_dict['path']}")
             except duckdb.Error as e:
                 app_logger.error(f"Failed to load group {self.group_id}: {e}")
         self.endResetModel()

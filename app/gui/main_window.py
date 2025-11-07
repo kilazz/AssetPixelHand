@@ -222,6 +222,9 @@ class App(QMainWindow):
         self.results_panel.results_view.selectionModel().selectionChanged.connect(self._on_results_selection_changed)
         self.results_panel.visible_results_changed.connect(self.viewer_panel.display_results)
 
+        self.viewer_panel.group_became_empty.connect(self.results_panel.results_model.remove_group_by_id)
+        self.viewer_panel.group_became_empty.connect(self.results_panel._update_summary)
+
     @Slot()
     def _on_results_selection_changed(self):
         proxy_indexes = self.results_panel.results_view.selectionModel().selectedRows()

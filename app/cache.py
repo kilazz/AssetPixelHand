@@ -231,7 +231,6 @@ class DuckDBThumbnailCache(AbstractThumbnailCache):
             if in_memory:
                 app_logger.info("Using in-memory database for thumbnail cache.")
             else:
-                (CACHE_DIR / "session_thumbnail_cache.duckdb").unlink(missing_ok=True)
                 app_logger.info("Using on-disk database for thumbnail cache (HDD-friendly mode).")
 
             self.conn = duckdb.connect(database=db_path, read_only=False)

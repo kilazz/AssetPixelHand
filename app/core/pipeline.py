@@ -12,6 +12,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from multiprocessing import shared_memory
+from pathlib import Path
 from queue import Empty
 from typing import TYPE_CHECKING, Any
 
@@ -27,8 +28,6 @@ from app.services.signal_bus import SignalBus
 from . import worker
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from app.data_models import ScanConfig, ScanState
 
 if LANCEDB_AVAILABLE:
@@ -156,7 +155,6 @@ class PipelineManager(QObject):
             processes=self.num_workers,
             initializer=worker.init_preprocessor_worker,
             initargs=(preproc_init_cfg, free_buffers_q),
-            maxtasksperchild=1,
         ) as pool:
             preproc_results_iterator = pool.imap_unordered(
                 worker_func, self._data_generator(self.config.perf.batch_size)
@@ -244,7 +242,7 @@ class PipelineManager(QObject):
                 "capture_date": fp.capture_date,
                 "format_str": fp.format_str,
                 "format_details": fp.format_details,
-                "has_alpha": fp.has_alpha,
+                "has_alpha": bool(fp.has_alpha),
                 "bit_depth": fp.bit_depth,
             }
             for fp in fingerprints

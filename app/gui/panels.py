@@ -764,6 +764,10 @@ class ResultsPanel(QGroupBox):
         self.show_action.triggered.connect(self._context_show_in_explorer)
         self.delete_action.triggered.connect(self._context_delete_file)
 
+    @Slot()
+    def _update_summary(self):
+        self.setTitle(f"Results {self.results_model.get_summary_text()}")
+
     def _open_path(self, path: Path | None):
         if path and path.exists():
             try:
@@ -809,6 +813,7 @@ class ResultsPanel(QGroupBox):
     def _on_fetch_completed(self, parent_index: QModelIndex):
         if self.results_model.mode in [ScanMode.TEXT_SEARCH, ScanMode.SAMPLE_SEARCH]:
             self._emit_visible_results()
+        self._update_summary()
 
     def _emit_visible_results(self):
         if self.results_model.mode not in [ScanMode.TEXT_SEARCH, ScanMode.SAMPLE_SEARCH]:
@@ -855,7 +860,7 @@ class ResultsPanel(QGroupBox):
     def _on_search_triggered(self):
         expanded_ids = self._get_expanded_group_ids()
         self.results_model.filter(self.search_entry.text())
-        self.setTitle(f"Results {self.results_model.get_summary_text()}")
+        self._update_summary()
         self._restore_expanded_group_ids(expanded_ids)
         self._emit_visible_results()
 
@@ -897,7 +902,7 @@ class ResultsPanel(QGroupBox):
         is_search_mode = mode in [ScanMode.TEXT_SEARCH, ScanMode.SAMPLE_SEARCH]
         self.filter_widget.setVisible(is_search_mode)
         self.similarity_filter_slider.setValue(0)
-        self.setTitle(f"Results {self.results_model.get_summary_text()}")
+        self._update_summary()
         is_duplicate_mode = self.results_model.mode == ScanMode.DUPLICATES
         for widget in [
             self.sort_combo,
@@ -1006,7 +1011,7 @@ class ResultsPanel(QGroupBox):
         self.proxy_model.sourceModel().beginResetModel()
         self.proxy_model.sourceModel().endResetModel()
 
-        self.setTitle(f"Results {self.results_model.get_summary_text()}")
+        self._update_summary()
         self._restore_expanded_group_ids(expanded)
         if self.results_model.rowCount() == 0:
             self.set_enabled_state(is_enabled=False)
@@ -1045,6 +1050,7 @@ class ImageViewerPanel(QGroupBox):
     """Displays previews of selected image groups and allows for comparison."""
 
     log_message = Signal(str, str)
+    group_became_empty = Signal(int)
 
     def __init__(
         self, settings_manager: SettingsManager, thread_pool: QThreadPool, file_op_manager: "FileOperationManager"
@@ -1279,6 +1285,12 @@ class ImageViewerPanel(QGroupBox):
         self.current_group_id = group_id
         self.state.clear_candidates()
         self.model.set_group(db_path, group_id)
+
+        if self.model.rowCount() == 0 and self.current_group_id is not None:
+            self.group_became_empty.emit(self.current_group_id)
+            self.current_group_id = None
+            return
+
         if self.model.rowCount() > 0:
             app_logger.debug(f"Loaded group with {self.model.rowCount()} items.")
             self.list_view.scrollToTop()
@@ -1286,7 +1298,7 @@ class ImageViewerPanel(QGroupBox):
             self._on_thumbnail_tonemap_toggled(self.thumbnail_tonemap_check.isChecked())
             QTimer.singleShot(50, self.update_timer.start)
             if scroll_to_path:
-                QTimer.singleShot(100, lambda: self._scroll_to_file(scroll_to_path))
+                QTimer.singleShot(0, lambda: self._scroll_to_file(scroll_to_path))
 
     def _scroll_to_file(self, file_path: Path):
         if (row := self.model.get_row_for_path(file_path)) is not None:

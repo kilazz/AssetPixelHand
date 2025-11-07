@@ -153,7 +153,8 @@ class LanceDBSimilarityEngine(QObject):
 
                 for found_links in results_iterator:
                     if stop_event.is_set():
-                        pool.terminate()
+                        pool.close()
+                        pool.join()
                         return []
 
                     all_links.update(found_links)
