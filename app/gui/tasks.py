@@ -310,7 +310,7 @@ class GroupFetcherTask(QRunnable):
                 children = []
                 for row_tuple in conn.execute(query, [self.group_id]).fetchall():
                     child_dict = dict(zip(cols, row_tuple, strict=False))
-                    # FIXED: Check if the file exists on disk before adding it to the view
+                    # Check if the file exists on disk before adding it to the view
                     if Path(child_dict["path"]).exists():
                         child_dict["distance"] = int(child_dict.get("distance", -1) or -1)
                         children.append(child_dict)

@@ -10,7 +10,6 @@ formats by using a prioritized chain of specialized libraries:
 """
 
 import contextlib
-import io
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -56,13 +55,17 @@ except ImportError:
 
 
 def load_image(
-    path_or_buffer: str | Path | io.BytesIO,
+    path: str | Path,
     target_size: tuple[int, int] | None = None,
     tonemap_mode: str = TonemapMode.REINHARD.value,
 ) -> Image.Image | None:
-    path = Path(path_or_buffer) if isinstance(path_or_buffer, (str, Path)) else Path("buffer.tmp")
-    filename = path.name
-    ext = path.suffix.lower()
+    try:
+        path = Path(path)
+        filename = path.name
+        ext = path.suffix.lower()
+    except Exception as e:
+        app_logger.error(f"Invalid path provided to load_image: {path}. Error: {e}")
+        return None
 
     pil_image = None
 
@@ -70,7 +73,7 @@ def load_image(
     if PYVIPS_AVAILABLE:
         app_logger.debug(f"Attempting to load '{filename}' with pyvips.")
         try:
-            pil_image = _load_with_pyvips(path_or_buffer, tonemap_mode)
+            pil_image = _load_with_pyvips(path, tonemap_mode)
             app_logger.debug(f"Successfully loaded '{filename}' with pyvips.")
         except Exception as e:
             app_logger.debug(f"pyvips failed for '{filename}': {e}. Falling back.")
@@ -79,7 +82,7 @@ def load_image(
     if pil_image is None and ext == ".dds" and DIRECTXTEX_AVAILABLE:
         app_logger.debug(f"Attempting to load '{filename}' with DirectXTex.")
         try:
-            pil_image = _load_with_directxtex(path, tonemap_mode)
+            pil_image = _load_with_directxtex(path.read_bytes(), tonemap_mode)
             app_logger.debug(f"Successfully loaded '{filename}' with DirectXTex.")
         except Exception as e:
             app_logger.debug(f"DirectXTex failed for '{filename}': {e}. Falling back.")
@@ -88,7 +91,7 @@ def load_image(
     if pil_image is None and OIIO_AVAILABLE:
         app_logger.debug(f"Attempting to load '{filename}' with OpenImageIO.")
         try:
-            pil_image = _load_with_oiio(path_or_buffer, tonemap_mode)
+            pil_image = _load_with_oiio(path, tonemap_mode)
             app_logger.debug(f"Successfully loaded '{filename}' with OpenImageIO.")
         except Exception as e:
             app_logger.debug(f"OIIO failed for '{filename}': {e}. Falling back.")
@@ -97,7 +100,7 @@ def load_image(
     if pil_image is None and PILLOW_AVAILABLE:
         app_logger.debug(f"Attempting to load '{filename}' with Pillow.")
         try:
-            with Image.open(path_or_buffer) as img:
+            with Image.open(path) as img:
                 img.load()
             pil_image = img
             app_logger.debug(f"Successfully loaded '{filename}' with Pillow.")
@@ -113,19 +116,21 @@ def load_image(
         return pil_image
 
     if not any([PYVIPS_AVAILABLE, DIRECTXTEX_AVAILABLE, OIIO_AVAILABLE, PILLOW_AVAILABLE]):
-        app_logger.error("No image loading libraries (Pillow, OIIO, pyvips, etc.) are installed.")
+        app_logger.error("No image loading libraries are installed.")
 
     return None
 
 
 def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | None:
-    """Extracts image metadata using the best available library."""
     try:
         stat = precomputed_stat if precomputed_stat else path.stat()
+    except FileNotFoundError:
+        return None
+
+    try:
         ext = path.suffix.lower()
         filename = path.name
 
-        # --- Stage 1: PyVips (Highest Priority) ---
         if PYVIPS_AVAILABLE:
             app_logger.debug(f"Getting metadata for '{filename}' with pyvips.")
             try:
@@ -166,7 +171,6 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
             except Exception as e:
                 app_logger.debug(f"pyvips metadata failed for '{filename}': {e}. Falling back.")
 
-        # --- Fallback stages ---
         if ext == ".dds" and DIRECTXTEX_AVAILABLE:
             app_logger.debug(f"Getting metadata for '{filename}' with DirectXTex.")
             try:
@@ -233,7 +237,6 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
     except Exception as e:
         app_logger.error(f"All metadata methods failed for {path.name}. Error: {e}")
         try:
-            stat = precomputed_stat if precomputed_stat else path.stat()
             return {
                 "resolution": (0, 0),
                 "file_size": stat.st_size,
@@ -259,10 +262,9 @@ def is_dds_hdr(format_str: str) -> tuple[bool, int]:
     return False, 8
 
 
-def _load_with_pyvips(path_or_buffer: str | Path | io.BytesIO, tonemap_mode: str) -> Image.Image | None:
-    """Load an image using pyvips and convert to a Pillow Image."""
-    source = str(path_or_buffer) if isinstance(path_or_buffer, (str, Path)) else path_or_buffer
-    image = pyvips.Image.new_from_file(source, access="sequential")
+def _load_with_pyvips(path: str | Path, tonemap_mode: str) -> Image.Image | None:
+    """Load an image using pyvips from a path and convert to a Pillow Image."""
+    image = pyvips.Image.new_from_file(str(path), access="sequential")
 
     is_float = "float" in image.format or "double" in image.format
 
@@ -278,15 +280,14 @@ def _load_with_pyvips(path_or_buffer: str | Path | io.BytesIO, tonemap_mode: str
     return Image.fromarray(numpy_array)
 
 
-def _load_with_directxtex(path: Path, tonemap_mode: str) -> Image.Image | None:
-    with path.open("rb") as f:
-        decoded = directxtex_decoder.decode_dds(f.read())
+def _load_with_directxtex(dds_bytes: bytes, tonemap_mode: str) -> Image.Image | None:
+    """Loads a DDS file from a bytes object."""
+    decoded = directxtex_decoder.decode_dds(dds_bytes)
     numpy_array, dtype = decoded["data"], decoded["data"].dtype
     if np.issubdtype(dtype, np.floating):
         if tonemap_mode != TonemapMode.NONE.value:
             return Image.fromarray(_tonemap_float_array(numpy_array.astype(np.float32), tonemap_mode))
-        else:
-            return Image.fromarray((np.clip(numpy_array, 0.0, 1.0) * 255).astype(np.uint8))
+        return Image.fromarray((np.clip(numpy_array, 0.0, 1.0) * 255).astype(np.uint8))
     elif np.issubdtype(dtype, np.uint16):
         return Image.fromarray((numpy_array // 257).astype(np.uint8))
     elif np.issubdtype(dtype, np.signedinteger):
@@ -298,9 +299,9 @@ def _load_with_directxtex(path: Path, tonemap_mode: str) -> Image.Image | None:
     raise TypeError(f"Unhandled NumPy dtype from DirectXTex decoder: {dtype}")
 
 
-def _load_with_oiio(path_or_buffer: str | Path | io.BytesIO, tonemap_mode: str) -> Image.Image | None:
-    path_str = str(path_or_buffer) if isinstance(path_or_buffer, (str, Path)) else path_or_buffer
-    buf = oiio.ImageBuf(path_str)
+def _load_with_oiio(path: str | Path, tonemap_mode: str) -> Image.Image | None:
+    """Loads an image using OpenImageIO from a path."""
+    buf = oiio.ImageBuf(str(path))
     if buf.has_error:
         raise RuntimeError(f"OIIO Error: {buf.geterror(autoclear=1)}")
 
@@ -309,8 +310,7 @@ def _load_with_oiio(path_or_buffer: str | Path | io.BytesIO, tonemap_mode: str) 
         is_hdr = np.max(numpy_array) > 1.0
         if is_hdr and tonemap_mode != TonemapMode.NONE.value:
             return Image.fromarray(_tonemap_float_array(numpy_array, tonemap_mode))
-        else:
-            return Image.fromarray((np.clip(numpy_array, 0.0, 1.0) * 255).astype(np.uint8))
+        return Image.fromarray((np.clip(numpy_array, 0.0, 1.0) * 255).astype(np.uint8))
     elif numpy_array.dtype != np.uint8:
         if numpy_array.dtype == np.uint16:
             numpy_array = (numpy_array / 257).astype(np.uint8)

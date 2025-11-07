@@ -11,8 +11,6 @@ import multiprocessing
 import threading
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -21,12 +19,11 @@ from typing import Any, NamedTuple
 import numpy as np
 
 from app.data_models import ImageFingerprint, ScanConfig, ScanState
-from app.image_io import get_image_metadata
 from app.services.signal_bus import SignalBus
 from app.utils import find_best_in_group
 
 from .engines import LanceDBSimilarityEngine
-from .hashing_worker import worker_get_perceptual_hashes, worker_get_xxhash
+from .hashing_worker import worker_collect_all_data
 from .helpers import FileFinder
 from .pipeline import PipelineManager
 
@@ -60,12 +57,6 @@ class HashingConfig:
     update_interval: int
     phase_description: str
 
-
-HASHING_CONFIGS = {
-    "xxhash": HashingConfig(200, 500, "Phase 2/6: Finding exact duplicates (xxHash)..."),
-    "perceptual": HashingConfig(100, 200, "Phase 3/6: Finding simple & near-duplicates..."),
-    "metadata": HashingConfig(100, 100, "Processing metadata..."),
-}
 
 METHOD_PRIORITY = {
     EvidenceMethod.XXHASH.value: 4,
@@ -274,149 +265,6 @@ class PrecisionClusterManager:
         return 100
 
 
-class HashingStageRunner:
-    """Helper class to run hashing stages with consistent configuration."""
-
-    def __init__(self, config, state, signals, cluster_manager, all_image_fps):
-        self.config = config
-        self.state = state
-        self.signals = signals
-        self.cluster_manager = cluster_manager
-        self.all_image_fps = all_image_fps
-
-    def run_xxhash_stage(self, files: list[Path], stop_event: threading.Event, ctx) -> list[Path]:
-        config = HASHING_CONFIGS["xxhash"]
-        self.state.set_phase(config.phase_description, 0.10)
-        hash_map = self._run_hashing_worker(worker_get_xxhash, files, stop_event, ctx, config)
-        if not hash_map or stop_event.is_set():
-            return []
-        reps = []
-        for paths in hash_map.values():
-            rep = paths[0]
-            reps.append(rep)
-            if len(paths) > 1:
-                for other_path in paths[1:]:
-                    self.cluster_manager.add_evidence(rep, other_path, EvidenceMethod.XXHASH.value, 0.0)
-        return reps
-
-    def run_perceptual_hashing_stage(self, files: list[Path], stop_event: threading.Event, ctx) -> list[Path]:
-        config = HASHING_CONFIGS["perceptual"]
-        self.state.set_phase(config.phase_description, 0.20)
-
-        # 1. Compute both hashes in a single pass over the files.
-        all_hashes = self._run_hashing_worker(
-            worker_get_perceptual_hashes, files, stop_event, ctx, config, return_list=True
-        )
-        if not all_hashes or stop_event.is_set():
-            return files
-
-        # 2. Process dHashes in memory first, if enabled.
-        if self.config.find_simple_duplicates:
-            dhash_map = defaultdict(list)
-            path_to_phash = {}
-            for dhash, phash, path in all_hashes:
-                if dhash is not None:
-                    dhash_map[dhash].append(path)
-                if phash is not None:
-                    path_to_phash[path] = phash
-
-            dhash_reps = []
-            for paths in dhash_map.values():
-                rep = paths[0]
-                dhash_reps.append(rep)
-                if len(paths) > 1:
-                    for other_path in paths[1:]:
-                        self.cluster_manager.add_evidence(rep, other_path, EvidenceMethod.DHASH.value, 0.0)
-
-            if not self.config.find_perceptual_duplicates:
-                return dhash_reps
-
-            files_for_phash = dhash_reps
-        else:
-            path_to_phash = {path: phash for _, phash, path in all_hashes if phash is not None}
-            files_for_phash = list(path_to_phash.keys())
-
-        # 3. Process pHashes on the remaining representatives.
-        if not self.config.find_perceptual_duplicates:
-            return files_for_phash
-
-        phashes_to_process = [(path_to_phash[p], p) for p in files_for_phash if p in path_to_phash]
-        if not phashes_to_process:
-            return files_for_phash
-
-        hashes_ph, paths_ph = zip(*phashes_to_process, strict=True)
-        components = self._find_phash_components(paths_ph, hashes_ph)
-        return self._process_phash_components(components)
-
-    def _find_phash_components(self, paths: tuple[Path, ...], hashes: tuple[Any, ...]) -> dict[int, list[Path]]:
-        if not SCIPY_AVAILABLE or not IMAGEHASH_AVAILABLE:
-            return {i: [p] for i, p in enumerate(paths)}
-        rows, cols = [], []
-        n = len(paths)
-        for i in range(n):
-            for j in range(i + 1, n):
-                if hashes[i] - hashes[j] <= self.config.phash_threshold:
-                    rows.append(i)
-                    cols.append(j)
-        if not rows:
-            return {i: [p] for i, p in enumerate(paths)}
-        graph = csr_matrix((np.ones_like(rows), (rows, cols)), (n, n))
-        _, labels = connected_components(graph, directed=False, return_labels=True)
-        components = defaultdict(list)
-        for i, label in enumerate(labels):
-            components[label].append(paths[i])
-        return components
-
-    def _process_phash_components(self, components: dict[int, list[Path]]) -> list[Path]:
-        representatives = []
-        for group in components.values():
-            if len(group) > 1:
-                best = find_best_in_group([self.all_image_fps[p] for p in group if p in self.all_image_fps])
-                # ИСПРАВЛЕНО: `if not best: continue` на нескольких строках.
-                if not best:
-                    continue
-                representatives.append(best.path)
-                for path in group:
-                    if path != best.path:
-                        self.cluster_manager.add_evidence(best.path, path, EvidenceMethod.PHASH.value, 0.0)
-            elif group:
-                representatives.extend(group)
-        return representatives
-
-    def _run_hashing_worker(
-        self,
-        worker_func: Callable,
-        files: list[Path],
-        stop_event: threading.Event,
-        ctx,
-        config: HashingConfig,
-        return_list: bool = False,
-    ) -> Any:
-        if return_list:
-            results: list[tuple] = []
-        else:
-            results = defaultdict(list)
-
-        files_list = list(files)
-        with ctx.Pool(processes=self.config.perf.num_workers) as pool:
-            for i, result in enumerate(pool.imap_unordered(worker_func, files_list, config.batch_size), 1):
-                if stop_event.is_set():
-                    return [] if return_list else {}
-
-                path = result[-1]
-                if i % config.update_interval == 0 and path:
-                    details_text = f"Hashing: {path.name}"
-                    self.state.update_progress(i, len(files_list), details=details_text)
-
-                if result and result[0] is not None:
-                    if return_list:
-                        results.append(result)
-                    else:
-                        file_hash, path = result
-                        results[file_hash].append(path)
-        return results
-
-
 @dataclass
 class ScanContext:
     """A data container passed between scan stages."""
@@ -450,14 +298,20 @@ class ScanStage(ABC):
         pass
 
 
-class MetadataReadStage(ScanStage):
-    """Stage 1: Finds all files and reads their metadata in parallel."""
+class CombinedCollectionStage(ScanStage):
+    """
+    A unified stage that replaces MetadataReadStage and HashingExecutionStage.
+    It runs a single worker pool to collect all metadata and hashes for each file in one pass,
+    significantly reducing disk I/O. After collection, it performs all hash-based grouping
+    in memory.
+    """
 
     @property
     def name(self) -> str:
-        return "Phase 1/6: Finding files and reading metadata..."
+        return "Phase 1-3/6: Collecting file data and finding duplicates by hash..."
 
     def run(self, context: ScanContext) -> bool:
+        # 1. Find all files to process
         finder = FileFinder(
             context.state,
             context.config.folder_path,
@@ -465,92 +319,139 @@ class MetadataReadStage(ScanStage):
             context.config.selected_extensions,
             context.signals,
         )
-        files_with_stats = [
-            entry
-            for batch in finder.stream_files(context.stop_event)
-            if not context.stop_event.is_set()
-            for entry in batch
-        ]
-        if context.stop_event.is_set():
+        all_files = [path for batch in finder.stream_files(context.stop_event) for path, _ in batch]
+        if not all_files or context.stop_event.is_set():
             return False
 
-        fingerprints, skipped = self._process_metadata_parallel(files_with_stats, context)
-        context.all_image_fps = fingerprints
-        context.all_skipped_files.extend(skipped)
-        context.files_to_process = list(fingerprints.keys())
-
-        if not context.files_to_process:
-            context.signals.log_message.emit("No image files found to process.", "info")
+        # 2. Collect all data in parallel using the new "super-worker"
+        context.state.set_phase("Collecting file data...", 0.45)
+        all_data = self._collect_data_parallel(all_files, context)
+        if not all_data or context.stop_event.is_set():
             return False
-        return True
 
-    def _process_metadata_parallel(
-        self, files_with_stats: list[tuple[Path, Any]], context: ScanContext
-    ) -> tuple[dict[Path, ImageFingerprint], list[str]]:
-        fingerprints: dict[Path, ImageFingerprint] = {}
-        skipped_files: list[str] = []
-        with ThreadPoolExecutor(max_workers=context.config.perf.num_workers * 2) as executor:
-            future_to_path = {
-                executor.submit(self._process_single_metadata, entry): entry[0] for entry in files_with_stats
-            }
-            for i, future in enumerate(as_completed(future_to_path)):
-                if context.stop_event.is_set():
-                    for f in future_to_path:
-                        f.cancel()
-                    break
+        # 3. Populate all_image_fps for later stages (e.g., finding best in group)
+        for data in all_data:
+            fp = ImageFingerprint(path=data["path"], hashes=np.array([]), **data["meta"])
+            context.all_image_fps[fp.path] = fp
 
-                path = future_to_path[future]
-                try:
-                    if fp := future.result():
-                        fingerprints[fp.path] = fp
-                except Exception as e:
-                    app_logger.warning(f"Metadata processing failed for {path}: {e}")
-                    skipped_files.append(str(path))
-
-                if (i + 1) % 100 == 0:
-                    details = f"Reading: {path.name}"
-                    context.state.update_progress(i + 1, len(files_with_stats), details=details)
-
-        return fingerprints, skipped_files
-
-    @staticmethod
-    def _process_single_metadata(entry: tuple[Path, Any]) -> ImageFingerprint | None:
-        path, stat_result = entry
-        try:
-            meta = get_image_metadata(path, precomputed_stat=stat_result)
-            return ImageFingerprint(path=path, hashes=np.array([]), **meta) if meta else None
-        except Exception as e:
-            app_logger.debug(f"Failed to process metadata for {path}: {e}")
-            return None
-
-
-class HashingExecutionStage(ScanStage):
-    """Stage 2: Runs the multi-level hashing pipeline (xxHash, dHash, pHash)."""
-
-    @property
-    def name(self) -> str:
-        return "Phase 2-3/6: Finding duplicates with hashing..."
-
-    def run(self, context: ScanContext) -> bool:
-        runner = HashingStageRunner(
-            context.config, context.state, context.signals, context.cluster_manager, context.all_image_fps
-        )
-        reps = context.files_to_process
-        ctx = multiprocessing.get_context("spawn")
-
-        if context.config.find_exact_duplicates:
-            reps = runner.run_xxhash_stage(reps, context.stop_event, ctx)
-            if context.stop_event.is_set():
-                return False
-
-        if context.config.find_simple_duplicates or context.config.find_perceptual_duplicates:
-            reps = runner.run_perceptual_hashing_stage(reps, context.stop_event, ctx)
-            if context.stop_event.is_set():
-                return False
+        # 4. Perform hash-based grouping in memory
+        reps = self._group_in_memory(all_data, context)
 
         context.files_to_process = reps
         context.signals.log_message.emit(f"Found {len(reps)} unique candidates for AI processing.", "info")
         return True
+
+    def _collect_data_parallel(self, files: list[Path], context: ScanContext) -> list[dict]:
+        all_results = []
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(processes=context.config.perf.num_workers) as pool:
+            for i, result in enumerate(pool.imap_unordered(worker_collect_all_data, files, chunksize=50), 1):
+                if context.stop_event.is_set():
+                    return []
+
+                if (i % 100) == 0:
+                    context.state.update_progress(i, len(files))
+
+                if result:
+                    all_results.append(result)
+                else:
+                    # The path is not available if the worker failed early, so we can't log it here.
+                    # The worker itself should handle logging errors if possible.
+                    pass
+        return all_results
+
+    def _group_in_memory(self, all_data: list[dict], context: ScanContext) -> list[Path]:
+        """Performs multi-level grouping by hash entirely in memory."""
+
+        # Initial representatives are all files
+        reps_data = all_data
+
+        # Phase 1: xxHash grouping
+        if context.config.find_exact_duplicates:
+            reps_data = self._group_by_hash_key(reps_data, "xxhash", EvidenceMethod.XXHASH.value, context)
+            if context.stop_event.is_set():
+                return []
+
+        # Phase 2: dHash grouping
+        if context.config.find_simple_duplicates:
+            reps_data = self._group_by_hash_key(reps_data, "dhash", EvidenceMethod.DHASH.value, context)
+            if context.stop_event.is_set():
+                return []
+
+        # Phase 3: pHash grouping
+        if context.config.find_perceptual_duplicates:
+            phashes_to_process = [(d["phash"], d["path"]) for d in reps_data if d["phash"] is not None]
+            if phashes_to_process:
+                hashes_ph, paths_ph = zip(*phashes_to_process, strict=True)
+                components = self._find_phash_components(paths_ph, hashes_ph, context.config.phash_threshold)
+                final_reps_paths = self._process_phash_components(components, context)
+                return final_reps_paths
+
+        return [d["path"] for d in reps_data]
+
+    def _group_by_hash_key(self, data_list: list[dict], key: str, method: str, context: ScanContext) -> list[dict]:
+        """Helper to group items by a specific hash key and return representatives."""
+        hash_map = defaultdict(list)
+        for item in data_list:
+            if item[key] is not None:
+                hash_map[item[key]].append(item["path"])
+
+        representatives = []
+        rep_paths = set()
+        for paths in hash_map.values():
+            if not paths:
+                continue
+
+            rep_path = paths[0]
+            representatives.append(next(d for d in data_list if d["path"] == rep_path))
+            rep_paths.add(rep_path)
+
+            if len(paths) > 1:
+                for other_path in paths[1:]:
+                    context.cluster_manager.add_evidence(rep_path, other_path, method, 0.0)
+
+        return representatives
+
+    def _find_phash_components(
+        self, paths: tuple[Path, ...], hashes: tuple[Any, ...], threshold: int
+    ) -> dict[int, list[Path]]:
+        if not SCIPY_AVAILABLE or not IMAGEHASH_AVAILABLE:
+            return {i: [p] for i, p in enumerate(paths)}
+        rows, cols = [], []
+        n = len(paths)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if hashes[i] - hashes[j] <= threshold:
+                    rows.append(i)
+                    cols.append(j)
+        if not rows:
+            return {i: [p] for i, p in enumerate(paths)}
+        graph = csr_matrix((np.ones_like(rows), (rows, cols)), (n, n))
+        _, labels = connected_components(graph, directed=False, return_labels=True)
+        components = defaultdict(list)
+        for i, label in enumerate(labels):
+            components[label].append(paths[i])
+        return components
+
+    def _process_phash_components(self, components: dict[int, list[Path]], context: ScanContext) -> list[Path]:
+        representatives = []
+        for group in components.values():
+            if len(group) > 1:
+                group_fps = [context.all_image_fps[p] for p in group if p in context.all_image_fps]
+                if not group_fps:
+                    continue
+
+                best = find_best_in_group(group_fps)
+                if not best:
+                    continue
+
+                representatives.append(best.path)
+                for path in group:
+                    if path != best.path:
+                        context.cluster_manager.add_evidence(best.path, path, EvidenceMethod.PHASH.value, 0.0)
+            elif group:
+                representatives.extend(group)
+        return representatives
 
 
 class FingerprintGenerationStage(ScanStage):

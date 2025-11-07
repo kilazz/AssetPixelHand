@@ -31,10 +31,9 @@ from .helpers import FileFinder
 from .pipeline import PipelineManager
 from .scan_stages import (
     AILinkingStage,
+    CombinedCollectionStage,
     DatabaseIndexStage,
     FingerprintGenerationStage,
-    HashingExecutionStage,
-    MetadataReadStage,
     ScanContext,
 )
 from .worker import init_worker, worker_get_single_vector, worker_get_text_vector
@@ -159,8 +158,7 @@ class FindDuplicatesStrategy(ScanStrategy):
         super().__init__(*args)
         # The entire scan pipeline is defined centrally here.
         self.pipeline = [
-            (MetadataReadStage(), 0.15),
-            (HashingExecutionStage(), 0.30),
+            (CombinedCollectionStage(), 0.45),
             (FingerprintGenerationStage(), 0.40),
             (DatabaseIndexStage(), 0.0),
             (AILinkingStage(), 0.15),
