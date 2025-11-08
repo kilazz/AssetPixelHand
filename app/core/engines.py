@@ -56,11 +56,11 @@ def search_worker(item: dict) -> set:
         g_lancedb_table.search(source_vector)
         .limit(g_search_params["k_neighbors"])
         .nprobes(g_search_params["nprobes"])
-        .to_df()
+        .to_polars()
     )
 
     found_links = set()
-    for _, hit in hits.iterrows():
+    for hit in hits.iter_rows(named=True):
         target_path = hit["path"]
         distance = hit["_distance"]
         if source_path != target_path and distance < g_search_params["distance_threshold"]:

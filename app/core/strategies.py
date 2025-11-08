@@ -13,6 +13,7 @@ from pathlib import Path
 
 import duckdb
 import numpy as np
+import polars as pl
 
 from app.cache import _configure_db_connection
 from app.constants import BEST_FILE_METHOD_NAME, DUCKDB_AVAILABLE, RESULTS_DB_FILE
@@ -275,11 +276,14 @@ class SearchStrategy(ScanStrategy):
             .limit(1000)
             .nprobes(sim_engine.nprobes)
             .refine_factor(sim_engine.refine_factor)
-            .to_pandas()
+            .to_polars()
         )
-        hits = raw_hits[raw_hits["_distance"] < sim_engine.distance_threshold]
+        hits = raw_hits.filter(pl.col("_distance") < sim_engine.distance_threshold)
 
-        results = [(ImageFingerprint.from_db_row(r.to_dict()), r["_distance"]) for _, r in hits.iterrows()]
+        results = [
+            (ImageFingerprint.from_db_row(row_dict), row_dict["_distance"]) for row_dict in hits.iter_rows(named=True)
+        ]
+
         if not results:
             return 0, None
 
