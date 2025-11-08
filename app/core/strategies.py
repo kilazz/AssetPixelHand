@@ -31,9 +31,12 @@ from .helpers import FileFinder
 from .pipeline import PipelineManager
 from .scan_stages import (
     AILinkingStage,
-    CombinedCollectionStage,
     DatabaseIndexStage,
+    ExactGroupingStage,
+    FileDiscoveryStage,
     FingerprintGenerationStage,
+    HashingStage,
+    PerceptualGroupingStage,
     ScanContext,
 )
 from .worker import init_worker, worker_get_single_vector, worker_get_text_vector
@@ -156,9 +159,13 @@ class FindDuplicatesStrategy(ScanStrategy):
 
     def __init__(self, *args):
         super().__init__(*args)
-        # The entire scan pipeline is defined centrally here.
+        # The entire scan pipeline is defined centrally here as a list of stages and their
+        # approximate weight for the progress bar calculation.
         self.pipeline = [
-            (CombinedCollectionStage(), 0.45),
+            (FileDiscoveryStage(), 0.05),
+            (HashingStage(), 0.25),
+            (ExactGroupingStage(), 0.10),
+            (PerceptualGroupingStage(), 0.05),
             (FingerprintGenerationStage(), 0.40),
             (DatabaseIndexStage(), 0.0),
             (AILinkingStage(), 0.15),

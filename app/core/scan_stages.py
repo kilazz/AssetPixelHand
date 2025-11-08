@@ -160,6 +160,21 @@ class PrecisionCluster:
 
 
 class PrecisionClusterManager:
+    """
+    Manages the creation and merging of duplicate groups (clusters) based on evidence.
+
+    This class builds a graph of relationships between files. Each connection ("evidence")
+    has a type (xxHash, pHash, AI) and a confidence score. The manager ensures that
+    files are grouped logically, even through indirect connections (A is similar to B,
+    and B is similar to C, so A, B, C are in one group).
+
+    Key features:
+    - Evidence Priority: More reliable methods (like exact hash) override less reliable ones.
+    - Cluster Merging: Small, related clusters are merged to form a complete group.
+    - Size Limiting: Prevents clusters from growing infinitely large, which could occur
+      with low AI similarity thresholds and degrade performance and relevance.
+    """
+
     __slots__ = ("clusters", "max_cluster_size", "next_cluster_id", "path_to_cluster")
 
     def __init__(self, max_cluster_size: int = MAX_CLUSTER_SIZE):
@@ -169,6 +184,7 @@ class PrecisionClusterManager:
         self.max_cluster_size = max_cluster_size
 
     def add_evidence(self, path1: Path, path2: Path, method: str, confidence: float):
+        """Adds a piece of evidence connecting two files, creating or merging clusters as needed."""
         cluster1_id = self.path_to_cluster.get(path1)
         cluster2_id = self.path_to_cluster.get(path2)
         if cluster1_id is None and cluster2_id is None:
@@ -183,6 +199,7 @@ class PrecisionClusterManager:
             self.clusters[cluster1_id].add_direct_evidence(path1, path2, method, confidence)
 
     def _create_new_cluster_with_evidence(self, path1: Path, path2: Path, method: str, confidence: float):
+        """Creates a new cluster for two previously unseen files."""
         new_id = self.next_cluster_id
         self.clusters[new_id] = PrecisionCluster(new_id)
         self.clusters[new_id].add_direct_evidence(path1, path2, method, confidence)
@@ -191,11 +208,13 @@ class PrecisionClusterManager:
         self.next_cluster_id += 1
 
     def _add_to_existing_cluster(self, cluster_id: int, path1: Path, path2: Path, method: str, confidence: float):
+        """Adds a new file to an existing cluster."""
         self.clusters[cluster_id].add_direct_evidence(path1, path2, method, confidence)
         new_path = path2 if path1 in self.path_to_cluster else path1
         self.path_to_cluster[new_path] = cluster_id
 
     def _merge_or_link_clusters(self, id1: int, id2: int, path1: Path, path2: Path, method: str, confidence: float):
+        """Decides whether to merge two clusters or simply link them based on size."""
         if self._should_merge(id1, id2):
             final_id = self._merge_clusters(id1, id2)
             self.clusters[final_id].add_direct_evidence(path1, path2, method, confidence)
@@ -206,9 +225,16 @@ class PrecisionClusterManager:
             self.clusters[larger_id].add_direct_evidence(path1, path2, method, confidence)
 
     def _should_merge(self, id1: int, id2: int) -> bool:
+        """Determines if two clusters are small enough to be merged."""
         return (len(self.clusters[id1].members) + len(self.clusters[id2].members)) <= self.max_cluster_size
 
     def _merge_clusters(self, id1: int, id2: int) -> int:
+        """
+        Merges the smaller cluster into the larger one.
+
+        This is a critical optimization to keep the cluster management efficient.
+        It updates the internal data structures of the larger cluster and removes the smaller one.
+        """
         if len(self.clusters[id1].members) < len(self.clusters[id2].members):
             id1, id2 = id2, id1
         cluster1, cluster2 = self.clusters[id1], self.clusters[id2]
@@ -222,6 +248,7 @@ class PrecisionClusterManager:
         return id1
 
     def get_final_groups(self, all_fingerprints: dict[Path, ImageFingerprint]) -> dict:
+        """Converts the final clusters into a dictionary of {best_file: [duplicates]}."""
         final_groups: dict = {}
         for cluster in self.clusters.values():
             if len(cluster.members) < 2:
@@ -238,6 +265,7 @@ class PrecisionClusterManager:
     def _find_duplicates_in_cluster(
         self, cluster: PrecisionCluster, best_fp: ImageFingerprint, fingerprints: list[ImageFingerprint]
     ) -> set[tuple[ImageFingerprint, int, str]]:
+        """Finds the relationship between the best file and all others in the cluster."""
         duplicates: set[tuple[ImageFingerprint, int, str]] = set()
         for fp in fingerprints:
             if fp.path == best_fp.path:
@@ -263,6 +291,7 @@ class ScanContext:
     stop_event: threading.Event
     scanner_core: Any
     all_image_fps: dict[Path, ImageFingerprint] = field(default_factory=dict)
+    all_hashed_data: list[dict] = field(default_factory=list)
     files_to_process: list[Path] = field(default_factory=list)
     cluster_manager: PrecisionClusterManager = field(default_factory=PrecisionClusterManager)
     all_skipped_files: list[str] = field(default_factory=list)
@@ -279,10 +308,10 @@ class ScanStage(ABC):
         pass
 
 
-class CombinedCollectionStage(ScanStage):
+class FileDiscoveryStage(ScanStage):
     @property
     def name(self) -> str:
-        return "Phase 1-3/6: Collecting file data and finding duplicates by hash..."
+        return "Phase 1/6: Finding image files..."
 
     def run(self, context: ScanContext) -> bool:
         finder = FileFinder(
@@ -292,59 +321,61 @@ class CombinedCollectionStage(ScanStage):
             context.config.selected_extensions,
             context.signals,
         )
-        all_files = [path for batch in finder.stream_files(context.stop_event) for path, _ in batch]
-        if not all_files or context.stop_event.is_set():
+        context.files_to_process = [path for batch in finder.stream_files(context.stop_event) for path, _ in batch]
+        return bool(context.files_to_process) and not context.stop_event.is_set()
+
+
+class HashingStage(ScanStage):
+    @property
+    def name(self) -> str:
+        return "Phase 2/6: Collecting file hashes and metadata..."
+
+    def run(self, context: ScanContext) -> bool:
+        all_results = []
+        files_to_hash = context.files_to_process
+        total_files = len(files_to_hash)
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(processes=context.config.perf.num_workers) as pool:
+            for i, result in enumerate(pool.imap_unordered(worker_collect_all_data, files_to_hash, chunksize=50), 1):
+                if context.stop_event.is_set():
+                    pool.terminate()
+                    return False
+                if (i % 100) == 0:
+                    context.state.update_progress(i, total_files)
+                if result:
+                    all_results.append(result)
+
+        if not all_results or context.stop_event.is_set():
             return False
 
-        context.state.set_phase("Collecting file data...", 0.45)
-        all_data = self._collect_data_parallel(all_files, context)
-        if not all_data or context.stop_event.is_set():
-            return False
-
-        for data in all_data:
+        for data in all_results:
             fp = ImageFingerprint(path=data["path"], hashes=np.array([]), **data["meta"])
             context.all_image_fps[fp.path] = fp
 
-        reps = self._group_in_memory(all_data, context)
-
-        context.files_to_process = reps
-        context.signals.log_message.emit(f"Found {len(reps)} unique candidates for AI processing.", "info")
+        context.all_hashed_data = all_results
         return True
 
-    def _collect_data_parallel(self, files: list[Path], context: ScanContext) -> list[dict]:
-        all_results = []
-        ctx = multiprocessing.get_context("spawn")
-        with ctx.Pool(processes=context.config.perf.num_workers) as pool:
-            for i, result in enumerate(pool.imap_unordered(worker_collect_all_data, files, chunksize=50), 1):
-                if context.stop_event.is_set():
-                    return []
-                if (i % 100) == 0:
-                    context.state.update_progress(i, len(files))
-                if result:
-                    all_results.append(result)
-        return all_results
 
-    def _group_in_memory(self, all_data: list[dict], context: ScanContext) -> list[Path]:
-        reps_data = all_data
+class ExactGroupingStage(ScanStage):
+    @property
+    def name(self) -> str:
+        return "Phase 3/6: Finding duplicates by exact hashes..."
+
+    def run(self, context: ScanContext) -> bool:
+        reps_data = context.all_hashed_data
 
         if context.config.find_exact_duplicates:
             reps_data = self._group_by_hash_key(reps_data, "xxhash", EvidenceMethod.XXHASH.value, context)
             if context.stop_event.is_set():
-                return []
+                return False
 
         if context.config.find_simple_duplicates:
             reps_data = self._group_by_hash_key(reps_data, "dhash", EvidenceMethod.DHASH.value, context)
             if context.stop_event.is_set():
-                return []
+                return False
 
-        if context.config.find_perceptual_duplicates:
-            phashes_to_process = [(d["phash"], d["path"]) for d in reps_data if d["phash"] is not None]
-            if phashes_to_process:
-                hashes_ph, paths_ph = zip(*phashes_to_process, strict=True)
-                components = self._find_phash_components(paths_ph, hashes_ph, context.config.phash_threshold)
-                return self._process_phash_components(components, context)
-
-        return [d["path"] for d in reps_data]
+        context.files_to_process = [d["path"] for d in reps_data]
+        return True
 
     def _group_by_hash_key(self, data_list: list[dict], key: str, method: str, context: ScanContext) -> list[dict]:
         hash_map = defaultdict(list)
@@ -353,17 +384,40 @@ class CombinedCollectionStage(ScanStage):
                 hash_map[item[key]].append(item["path"])
 
         representatives = []
-        rep_paths = set()
         for paths in hash_map.values():
             if paths:
                 rep_path = paths[0]
                 representatives.append(next(d for d in data_list if d["path"] == rep_path))
-                rep_paths.add(rep_path)
                 if len(paths) > 1:
                     for other_path in paths[1:]:
                         context.cluster_manager.add_evidence(rep_path, other_path, method, 0.0)
-
         return representatives
+
+
+class PerceptualGroupingStage(ScanStage):
+    @property
+    def name(self) -> str:
+        return "Phase 3/6: Finding duplicates by perceptual hashes..."
+
+    def run(self, context: ScanContext) -> bool:
+        if not context.config.find_perceptual_duplicates:
+            return True
+
+        # Get the current representatives to process for pHash
+        rep_paths = set(context.files_to_process)
+        reps_data = [d for d in context.all_hashed_data if d["path"] in rep_paths]
+
+        phashes_to_process = [(d["phash"], d["path"]) for d in reps_data if d.get("phash") is not None]
+        if not phashes_to_process:
+            return True
+
+        hashes_ph, paths_ph = zip(*phashes_to_process, strict=True)
+        components = self._find_phash_components(paths_ph, hashes_ph, context.config.phash_threshold)
+        final_reps = self._process_phash_components(components, context)
+
+        context.files_to_process = final_reps
+        context.signals.log_message.emit(f"Found {len(final_reps)} unique candidates for AI processing.", "info")
+        return True
 
     def _find_phash_components(
         self, paths: tuple[Path, ...], hashes: tuple[Any, ...], threshold: int
@@ -387,8 +441,16 @@ class CombinedCollectionStage(ScanStage):
         return components
 
     def _process_phash_components(self, components: dict[int, list[Path]], context: ScanContext) -> list[Path]:
-        representatives = []
+        final_representatives = []
+        processed_paths = set()
+
         for group in components.values():
+            if not group:
+                continue
+
+            # Add all paths from this component to the processed set
+            processed_paths.update(group)
+
             if len(group) > 1:
                 group_fps = [context.all_image_fps[p] for p in group if p in context.all_image_fps]
                 if not group_fps:
@@ -396,13 +458,19 @@ class CombinedCollectionStage(ScanStage):
                 best = find_best_in_group(group_fps)
                 if not best:
                     continue
-                representatives.append(best.path)
+                final_representatives.append(best.path)
                 for path in group:
                     if path != best.path:
                         context.cluster_manager.add_evidence(best.path, path, EvidenceMethod.PHASH.value, 0.0)
             elif group:
-                representatives.extend(group)
-        return representatives
+                final_representatives.append(group[0])
+
+        # Add any remaining representatives that were not part of any pHash component
+        for path in context.files_to_process:
+            if path not in processed_paths:
+                final_representatives.append(path)
+
+        return final_representatives
 
 
 class FingerprintGenerationStage(ScanStage):

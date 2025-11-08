@@ -178,42 +178,57 @@ class PipelineManager(QObject):
             if self.stop_event.is_set() or not self.infer_proc.is_alive():
                 app_logger.error("Inference process terminated unexpectedly.")
                 break
+
+            # 1. Feed the GPU queue from the CPU workers if work is not yet complete.
             if not feeding_complete:
                 try:
                     preproc_output = next(preproc_results)
                     if preproc_output is not None:
                         tensor_q.put(preproc_output)
                 except StopIteration:
-                    tensor_q.put(None)
+                    tensor_q.put(None)  # Sentinel value to signal completion
                     feeding_complete = True
-            try:
-                gpu_result = results_q.get(timeout=0.01)
-                if gpu_result is None:
-                    break
-                batch_fps, skipped_items = gpu_result
-                self._handle_batch_results(batch_fps, skipped_items, cache, fps_to_cache)
-                all_skipped.extend([path for path, _ in skipped_items])
-                processed_count += len(batch_fps) + len(skipped_items)
-                self.state.update_progress(processed_count, total_files)
-            except Empty:
-                pass
 
-        while True:
-            try:
-                gpu_result = results_q.get(timeout=1.0)
-                if gpu_result is None:
-                    break
-                batch_fps, skipped_items = gpu_result
-                self._handle_batch_results(batch_fps, skipped_items, cache, fps_to_cache)
-                all_skipped.extend([path for path, _ in skipped_items])
-                processed_count += len(batch_fps) + len(skipped_items)
+            # 2. Process any available results from the GPU queue without blocking.
+            processed_now, should_break = self._process_gpu_results_queue(results_q, cache, fps_to_cache, all_skipped)
+            if processed_now > 0:
+                processed_count += processed_now
                 self.state.update_progress(processed_count, total_files)
-            except Empty:
+            if should_break:
+                break
+
+        # 3. After the main loop, drain any remaining items from the results queue.
+        while True:
+            processed_now, should_break = self._process_gpu_results_queue(
+                results_q, cache, fps_to_cache, all_skipped, timeout=1.0
+            )
+            if processed_now > 0:
+                processed_count += processed_now
+                self.state.update_progress(processed_count, total_files)
+            if should_break or processed_now == 0:
                 break
 
         if fps_to_cache:
             cache.put_many(fps_to_cache)
         return processed_count, all_skipped
+
+    def _process_gpu_results_queue(self, results_q, cache, fps_to_cache, all_skipped, timeout=0.01) -> tuple[int, bool]:
+        """Processes one batch of results from the GPU worker's queue."""
+        processed_count = 0
+        try:
+            gpu_result = results_q.get(timeout=timeout)
+            if gpu_result is None:
+                return 0, True  # Sentinel received, break the loop.
+
+            batch_fps, skipped_items = gpu_result
+            self._handle_batch_results(batch_fps, skipped_items, cache, fps_to_cache)
+            all_skipped.extend([path for path, _ in skipped_items])
+            processed_count += len(batch_fps) + len(skipped_items)
+
+        except Empty:
+            pass  # No results available, continue.
+
+        return processed_count, False
 
     def _handle_batch_results(self, batch_fps, skipped_items, cache, fps_to_cache):
         """Processes a batch of results from the inference worker."""

@@ -21,15 +21,15 @@ dependencies = [
     "transformers>=4.57.1",
     "onnx>=1.19.1",
     #"onnxruntime>=1.23.2",
+    #"onnxruntime-gpu>=1.23.2",
     "onnxruntime-directml>=1.23.0",
     "sentencepiece>=0.2.1",
-    "huggingface_hub[hf_xet]>=0.36.0",
+    "huggingface_hub[hf_xet]>=0.36.0", #transformers
     # Databases
     "lancedb>=0.25.2",
     "duckdb>=1.4.1",
     # Data Handling & Utilities
     "numpy>=2.3.4",
-    "scipy>=1.16.3",
     "pyarrow>=22.0.0",
     "pandas>=2.3.3",
     "xxhash>=3.6.0",

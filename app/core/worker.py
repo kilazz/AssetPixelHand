@@ -73,12 +73,29 @@ class InferenceEngine:
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
         providers = ["CPUExecutionProvider"]
-        provider_options = None
+        provider_options = [{}]  # Corresponds to CPUExecutionProvider
 
         if device == "gpu":
-            providers.insert(0, "DmlExecutionProvider")
-            if self.is_fp16 and hasattr(opts, "enable_float16_for_dml"):
-                opts.enable_float16_for_dml = True
+            preferred_providers = ["CUDAExecutionProvider", "DmlExecutionProvider"]
+            available_providers = ort.get_available_providers()
+
+            chosen_provider = next((p for p in preferred_providers if p in available_providers), None)
+
+            if chosen_provider:
+                providers.insert(0, chosen_provider)
+                provider_options.insert(0, {})  # Placeholder for GPU options
+
+                # Specific options for FP16 on DirectML
+                if (
+                    chosen_provider == "DmlExecutionProvider"
+                    and self.is_fp16
+                    and hasattr(opts, "enable_float16_for_dml")
+                ):
+                    opts.enable_float16_for_dml = True
+            else:
+                app_logger.warning(
+                    "GPU device selected, but no compatible provider (CUDA/DirectML) found. Falling back to CPU."
+                )
         else:  # CPU-specific optimizations
             opts.inter_op_num_threads = 1
             opts.intra_op_num_threads = threads_per_worker
@@ -93,7 +110,7 @@ class InferenceEngine:
             self.text_input_names = {i.name for i in self.text_session.get_inputs()}
 
         provider_name = self.visual_session.get_providers()[0]
-        thread_info = f"({threads_per_worker} threads/worker)" if device == "cpu" else ""
+        thread_info = f"({threads_per_worker} threads/worker)" if "CPU" in provider_name else ""
         app_logger.info(f"Worker PID {os.getpid()}: ONNX models loaded on '{provider_name}' {thread_info}")
 
     def get_text_features(self, text: str) -> np.ndarray:

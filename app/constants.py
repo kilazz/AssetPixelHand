@@ -1,5 +1,7 @@
 # app/constants.py
 import importlib.util
+import json
+import logging
 import os
 import sys
 from enum import Enum
@@ -12,7 +14,9 @@ try:
     APP_DIR = Path(__file__).resolve().parent
     SCRIPT_DIR = APP_DIR.parent
 except NameError:
+    # Fallback for environments where __file__ is not defined
     SCRIPT_DIR = Path(os.path.abspath(os.path.join(os.path.dirname(sys.argv[0]))))
+    APP_DIR = SCRIPT_DIR / "app"
 
 sys.path.insert(0, str(SCRIPT_DIR.resolve()))
 
@@ -33,15 +37,14 @@ CACHE_DIR = APP_DATA_DIR / ".cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 RESULTS_DB_FILE = CACHE_DIR / "results.duckdb"
-THUMBNAIL_CACHE_DB = CACHE_DIR / "thumbnail_cache.duckdb"
+THUMBNAIL_CACHE_DB = CACHE_DIR / "thumbnail_cache.db"
 CRASH_LOG_DIR = APP_DATA_DIR / "crash_logs"
 VISUALS_DIR = APP_DATA_DIR / "duplicate_visuals"
 LOG_FILE = APP_DATA_DIR / "app_log.txt"
-MODELS_CONFIG_FILE = APP_DATA_DIR / "models.json"
+CUSTOM_MODELS_CONFIG_FILE = APP_DATA_DIR / "custom_models.json"
 
 # --- Library Availability Checks ---
 WIN32_AVAILABLE = sys.platform == "win32"
-# Use find_spec to check for pywin32 availability without importing it here.
 PYWIN32_FEATURE_AVAILABLE = WIN32_AVAILABLE and bool(importlib.util.find_spec("win32api"))
 
 DEEP_LEARNING_AVAILABLE = all(importlib.util.find_spec(pkg) for pkg in ["onnxruntime", "transformers", "torch"])
@@ -91,22 +94,20 @@ _main_supported_ext = [
     ".tiff",
     ".webp",
 ]
-
 _all_ext = list(_main_supported_ext)
-
 if DIRECTXTEX_AVAILABLE:
     _all_ext.append(".dds")
-
 ALL_SUPPORTED_EXTENSIONS = sorted(set(_all_ext))
 
 
 # --- Supported AI Models ---
 def _get_default_models() -> dict:
-    """Returns the hardcoded default model configuration."""
+    """Returns the hardcoded, built-in model configurations."""
     return {
         "Fastest (OpenCLIP ViT-B/32)": {
             "hf_name": "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
             "onnx_name": "CLIP-ViT-B-32-laion2B-s34B-b79K",
+            "adapter": "clip",
             "dim": 512,
             "supports_text_search": True,
             "supports_image_search": True,
@@ -114,6 +115,7 @@ def _get_default_models() -> dict:
         "Compact (SigLIP-B)": {
             "hf_name": "google/siglip-base-patch16-384",
             "onnx_name": "siglip-base-patch16-384",
+            "adapter": "siglip",
             "dim": 768,
             "supports_text_search": True,
             "supports_image_search": True,
@@ -121,6 +123,7 @@ def _get_default_models() -> dict:
         "Balanced (OpenCLIP-ViT-L/14)": {
             "hf_name": "laion/CLIP-ViT-L-14-laion2B-s32B-b82K",
             "onnx_name": "ViT-L-14-laion2B-s32B-b82K",
+            "adapter": "clip",
             "dim": 768,
             "supports_text_search": True,
             "supports_image_search": True,
@@ -128,6 +131,7 @@ def _get_default_models() -> dict:
         "High Quality (SigLIP-L)": {
             "hf_name": "google/siglip-large-patch16-384",
             "onnx_name": "siglip-large-patch16-384",
+            "adapter": "siglip",
             "dim": 1024,
             "supports_text_search": True,
             "supports_image_search": True,
@@ -135,6 +139,7 @@ def _get_default_models() -> dict:
         "Visual Structure (DINOv2-B)": {
             "hf_name": "facebook/dinov2-base",
             "onnx_name": "dinov2-base",
+            "adapter": "dinov2",
             "dim": 768,
             "supports_text_search": False,
             "supports_image_search": True,
@@ -143,8 +148,35 @@ def _get_default_models() -> dict:
 
 
 def _load_models_config() -> dict:
-    """Loads model configurations directly from the hardcoded defaults."""
-    return _get_default_models()
+    """
+    Loads model configurations by merging built-in defaults with user-defined custom models.
+    Custom models from 'custom_models.json' will override defaults if names match.
+    """
+    # 1. Start with the guaranteed, hardcoded default models.
+    all_models = _get_default_models()
+
+    # 2. Try to load custom models from the user's data directory.
+    if CUSTOM_MODELS_CONFIG_FILE.exists():
+        try:
+            with open(CUSTOM_MODELS_CONFIG_FILE, encoding="utf-8") as f:
+                custom_models = json.load(f)
+            # 3. Merge them. The update() method will overwrite keys from `all_models`
+            #    with keys from `custom_models` if they are the same.
+            all_models.update(custom_models)
+            logging.getLogger("AssetPixelHand.constants").info(f"Loaded and merged {len(custom_models)} custom models.")
+        except (json.JSONDecodeError, OSError) as e:
+            logging.getLogger("AssetPixelHand.constants").error(
+                f"Failed to load custom_models.json: {e}. Using default models only."
+            )
+    else:
+        # If the file doesn't exist, create an empty one as an example for the user.
+        try:
+            with open(CUSTOM_MODELS_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+        except OSError:
+            pass  # Ignore if we can't write, not a critical error.
+
+    return all_models
 
 
 SUPPORTED_MODELS = _load_models_config()

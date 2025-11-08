@@ -24,6 +24,10 @@ from app.constants import OCIO_AVAILABLE, TonemapMode
 Image.MAX_IMAGE_PIXELS = None
 app_logger = logging.getLogger("AssetPixelHand.image_io")
 
+# A safe upper limit for image dimensions to prevent excessive memory usage.
+# 32767 is a common limit in libraries like libjpeg.
+MAX_PIXEL_DIMENSION = 32767
+
 # --- OCIO Setup (simple-ocio) ---
 TONE_MAPPER = None
 if OCIO_AVAILABLE:
@@ -168,6 +172,11 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
             app_logger.debug(f"Getting metadata for '{filename}' with pyvips.")
             try:
                 img = pyvips.Image.new_from_file(str(path), access="sequential")
+
+                if img.width > MAX_PIXEL_DIMENSION or img.height > MAX_PIXEL_DIMENSION:
+                    app_logger.warning(f"Skipping abnormally large image: {filename} ({img.width}x{img.height}).")
+                    return None
+
                 format_map = {
                     "uchar": 8,
                     "char": 8,
