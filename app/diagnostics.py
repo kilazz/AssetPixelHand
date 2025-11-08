@@ -64,9 +64,11 @@ def check_library_imports() -> bool:
             "duckdb": "duckdb",
             "lancedb": "lancedb",
             "xxhash": "xxhash",
+            "imagehash": "ImageHash",
             "sentencepiece": "sentencepiece",
-            "OpenImageIO": "oiio-python",
+            "OpenImageIO": "OpenImageIO",
             "scipy": "scipy",
+            "simple_ocio": "simple-ocio",
         },
         "Optional (for extended file format support and features)": {
             "directxtex_decoder": "directxtex-decoder",

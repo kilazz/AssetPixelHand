@@ -185,7 +185,7 @@ class ImageLoader(QRunnable):
         path_str: str,
         mtime: float,
         target_size: int | None,
-        tonemap_mode: str = TonemapMode.REINHARD.value,
+        tonemap_mode: str = TonemapMode.ENABLED.value,
         use_cache: bool = True,
         receiver: QObject | None = None,
         on_finish_slot=None,
@@ -310,7 +310,6 @@ class GroupFetcherTask(QRunnable):
                 children = []
                 for row_tuple in conn.execute(query, [self.group_id]).fetchall():
                     child_dict = dict(zip(cols, row_tuple, strict=False))
-                    # Check if the file exists on disk before adding it to the view
                     if Path(child_dict["path"]).exists():
                         child_dict["distance"] = int(child_dict.get("distance", -1) or -1)
                         children.append(child_dict)

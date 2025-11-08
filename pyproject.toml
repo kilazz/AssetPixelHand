@@ -14,19 +14,21 @@ authors = [{ name = "kilazz"}]
 dependencies = [
     # Core Application & GUI
     "PySide6>=6.10.0",
-    "pywin32>=311",
     "send2trash>=1.8.3",
+    "pywin32>=311; sys_platform == 'win32'",
     # AI & Machine Learning
     "torch>=2.9.0",
     "transformers>=4.57.1",
     "onnx>=1.19.1",
+    #"onnxruntime>=1.23.2",
+    "onnxruntime-directml>=1.23.0",
     "sentencepiece>=0.2.1",
-    "huggingface_hub[hf_xet]>=0.36.0", #transformers
+    "huggingface_hub[hf_xet]>=0.36.0",
     # Databases
     "lancedb>=0.25.2",
     "duckdb>=1.4.1",
     # Data Handling & Utilities
-    "numpy>=2.2.6", #oiio-python
+    "numpy>=2.3.4",
     "scipy>=1.16.3",
     "pyarrow>=22.0.0",
     "pandas>=2.3.3",
@@ -34,23 +36,19 @@ dependencies = [
     "ImageHash>=4.3.2",
     "zstandard>=0.25.0",
     # Image Processing
+    "simple-ocio>=0.2.0",
     "Pillow>=12.0.0",
-    #"OpenImageIO>=3.1.7.0",
-    "oiio-python>=3.0.10.0.1", #replacement OpenImageIO
+    "OpenImageIO>=3.1.7.0",
     "pyvips>=3.0.0",
     "pyvips-binary>=8.17.3",
     #"directxtex-decoder", #for DDS
 ]
 
 [project.optional-dependencies]
-cpu = ["onnxruntime>=1.23.2"]
-gpu = ["onnxruntime-directml>=1.23.0"]
-
 dev = [
     "ruff",
     "snakeviz",
     "tabulate2",
-    "types-oiio-python>=3.0.10.0.1",
 ]
 
 [tool.ruff]

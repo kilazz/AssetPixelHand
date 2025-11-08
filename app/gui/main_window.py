@@ -23,9 +23,9 @@ from PySide6.QtWidgets import (
 from app.cache import thumbnail_cache
 from app.constants import (
     DEEP_LEARNING_AVAILABLE,
+    PYWIN32_FEATURE_AVAILABLE,
     SCRIPT_DIR,
     VISUALS_DIR,
-    WIN32_AVAILABLE,
 )
 from app.core.helpers import VisualizationTask
 from app.core.scanner import ScannerController
@@ -468,7 +468,7 @@ class App(QMainWindow):
 
     @Slot(bool)
     def _update_low_priority_option(self, is_cpu: bool):
-        self.scan_options_panel.low_priority_check.setEnabled(is_cpu and WIN32_AVAILABLE)
+        self.scan_options_panel.low_priority_check.setEnabled(is_cpu and PYWIN32_FEATURE_AVAILABLE)
 
     def closeEvent(self, event):
         self.settings_manager.save()

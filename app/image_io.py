@@ -3,10 +3,11 @@
 
 This module provides a unified interface for handling a wide variety of image
 formats by using a prioritized chain of specialized libraries:
-1. pyvips for maximum format compatibility and performance.
-2. DirectXTex (via directxtex_decoder) for DDS textures.
-3. OpenImageIO for professional formats.
-4. Pillow (PIL) as a robust fallback.
+1. simple-ocio for professional color management (tonemapping).
+2. pyvips for maximum format compatibility and performance.
+3. DirectXTex for DDS textures.
+4. OpenImageIO for professional formats.
+5. Pillow (PIL) as a robust fallback.
 """
 
 import contextlib
@@ -18,10 +19,36 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from app.constants import TonemapMode
+from app.constants import OCIO_AVAILABLE, TonemapMode
 
 Image.MAX_IMAGE_PIXELS = None
 app_logger = logging.getLogger("AssetPixelHand.image_io")
+
+# --- OCIO Setup (simple-ocio) ---
+TONE_MAPPER = None
+if OCIO_AVAILABLE:
+    try:
+        from simple_ocio import ToneMapper
+
+        # Initialize the ToneMapper with the "Khronos PBR Neutral" view.
+        TONE_MAPPER = ToneMapper(view="Khronos PBR Neutral")
+        app_logger.info(
+            "simple-ocio (Khronos PBR Neutral) processor created successfully for high-quality tonemapping."
+        )
+    except Exception as e:
+        app_logger.error(f"Failed to initialize simple-ocio ToneMapper: {e}")
+        OCIO_AVAILABLE = False  # Disable if initialization fails
+
+
+def set_active_tonemap_view(view_name: str):
+    """Dynamically sets the active view on the global tone mapper."""
+    global TONE_MAPPER
+    if TONE_MAPPER and view_name in TONE_MAPPER.available_views and TONE_MAPPER.view != view_name:
+        TONE_MAPPER.view = view_name
+        app_logger.info(f"Switched active tonemapping view to: {view_name}")
+        return True
+    return False
+
 
 try:
     import pyvips
@@ -67,7 +94,7 @@ def is_dds_hdr(format_str: str) -> tuple[bool, int]:
 def load_image(
     path: str | Path,
     target_size: tuple[int, int] | None = None,
-    tonemap_mode: str = TonemapMode.ACES.value,
+    tonemap_mode: str = TonemapMode.ENABLED.value,
 ) -> Image.Image | None:
     try:
         path = Path(path)
@@ -319,29 +346,21 @@ def _tonemap_float_array(float_array: np.ndarray, mode: str) -> np.ndarray:
 
     rgb = np.maximum(rgb, 0.0)
 
-    if mode == TonemapMode.ACES.value:
-        # Apply exposure boost
-        exposure = 1.5
-        rgb *= exposure
-
-        # ACES Filmic tonemapping curve (a common, effective approximation)
-        a = 2.51
-        b = 0.03
-        c = 2.43
-        d = 0.59
-        e = 0.14
-        rgb = (rgb * (a * rgb + b)) / (rgb * (c * rgb + d) + e)
-
-        # Apply gamma correction for sRGB display
-        gamma_corrected = np.power(np.clip(rgb, 0.0, 1.0), 1.0 / 2.2)
-
-    elif mode == TonemapMode.REINHARD.value:
-        gamma_corrected = np.power(rgb / (1.0 + rgb), 1.0 / 2.2)
-
-    else:  # 'none' mode just clips the values
-        gamma_corrected = np.clip(rgb, 0.0, 1.0)
-
-    final_rgb = (gamma_corrected * 255).astype(np.uint8)
+    # Use OCIO if tonemapping is enabled and the TONE_MAPPER is available
+    if mode == TonemapMode.ENABLED.value and TONE_MAPPER:
+        try:
+            exposure = 1.5
+            rgb *= exposure
+            # Use the hdr_to_ldr method from the initialized ToneMapper
+            rgb_tonemapped = TONE_MAPPER.hdr_to_ldr(rgb.astype(np.float32), clip=True)
+            final_rgb = (rgb_tonemapped * 255).astype(np.uint8)
+        except Exception as e:
+            app_logger.error(f"simple-ocio tonemapping failed with view '{TONE_MAPPER.view}': {e}")
+            # If tonemapping fails, just clip the values to prevent a crash.
+            final_rgb = (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
+    else:
+        # If tonemapping is disabled or OCIO is unavailable, simply clip the values.
+        final_rgb = (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
 
     if alpha is not None:
         final_alpha = (np.clip(alpha, 0.0, 1.0) * 255).astype(np.uint8)

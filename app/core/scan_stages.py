@@ -40,8 +40,6 @@ app_logger = logging.getLogger("AssetPixelHand.scan_stages")
 
 
 class EvidenceMethod(Enum):
-    """Enumeration for evidence types to avoid magic strings and typos."""
-
     XXHASH = "xxHash"
     DHASH = "dHash"
     PHASH = "pHash"
@@ -51,8 +49,6 @@ class EvidenceMethod(Enum):
 
 @dataclass(frozen=True)
 class HashingConfig:
-    """Configuration for hashing stages."""
-
     batch_size: int
     update_interval: int
     phase_description: str
@@ -71,8 +67,6 @@ MAX_CLUSTER_SIZE = 500
 
 
 class EvidenceRecord(NamedTuple):
-    """Immutable record storing how two images are linked."""
-
     method: str
     confidence: float
     direct: bool
@@ -90,8 +84,6 @@ class EvidenceRecord(NamedTuple):
 
 
 class PrecisionCluster:
-    """A cluster that maintains a full graph of evidence between its members."""
-
     __slots__ = ("_max_indirect_depth", "connection_graph", "evidence_matrix", "id", "members")
 
     def __init__(self, cluster_id: int, max_indirect_depth: int = 3):
@@ -168,8 +160,6 @@ class PrecisionCluster:
 
 
 class PrecisionClusterManager:
-    """Manages clusters to ensure high precision and prevent mega-clusters."""
-
     __slots__ = ("clusters", "max_cluster_size", "next_cluster_id", "path_to_cluster")
 
     def __init__(self, max_cluster_size: int = MAX_CLUSTER_SIZE):
@@ -267,8 +257,6 @@ class PrecisionClusterManager:
 
 @dataclass
 class ScanContext:
-    """A data container passed between scan stages."""
-
     config: ScanConfig
     state: ScanState
     signals: SignalBus
@@ -281,37 +269,22 @@ class ScanContext:
 
 
 class ScanStage(ABC):
-    """Abstract base class for a single stage in the scanning pipeline."""
-
     @property
     @abstractmethod
     def name(self) -> str:
-        """The name of the stage, used for logging and UI updates."""
         pass
 
     @abstractmethod
     def run(self, context: ScanContext) -> bool:
-        """
-        Executes the stage.
-        Returns True to continue to the next stage, False to abort the scan.
-        """
         pass
 
 
 class CombinedCollectionStage(ScanStage):
-    """
-    A unified stage that replaces MetadataReadStage and HashingExecutionStage.
-    It runs a single worker pool to collect all metadata and hashes for each file in one pass,
-    significantly reducing disk I/O. After collection, it performs all hash-based grouping
-    in memory.
-    """
-
     @property
     def name(self) -> str:
         return "Phase 1-3/6: Collecting file data and finding duplicates by hash..."
 
     def run(self, context: ScanContext) -> bool:
-        # 1. Find all files to process
         finder = FileFinder(
             context.state,
             context.config.folder_path,
@@ -323,18 +296,15 @@ class CombinedCollectionStage(ScanStage):
         if not all_files or context.stop_event.is_set():
             return False
 
-        # 2. Collect all data in parallel using the new "super-worker"
         context.state.set_phase("Collecting file data...", 0.45)
         all_data = self._collect_data_parallel(all_files, context)
         if not all_data or context.stop_event.is_set():
             return False
 
-        # 3. Populate all_image_fps for later stages (e.g., finding best in group)
         for data in all_data:
             fp = ImageFingerprint(path=data["path"], hashes=np.array([]), **data["meta"])
             context.all_image_fps[fp.path] = fp
 
-        # 4. Perform hash-based grouping in memory
         reps = self._group_in_memory(all_data, context)
 
         context.files_to_process = reps
@@ -348,67 +318,50 @@ class CombinedCollectionStage(ScanStage):
             for i, result in enumerate(pool.imap_unordered(worker_collect_all_data, files, chunksize=50), 1):
                 if context.stop_event.is_set():
                     return []
-
                 if (i % 100) == 0:
                     context.state.update_progress(i, len(files))
-
                 if result:
                     all_results.append(result)
-                else:
-                    # The path is not available if the worker failed early, so we can't log it here.
-                    # The worker itself should handle logging errors if possible.
-                    pass
         return all_results
 
     def _group_in_memory(self, all_data: list[dict], context: ScanContext) -> list[Path]:
-        """Performs multi-level grouping by hash entirely in memory."""
-
-        # Initial representatives are all files
         reps_data = all_data
 
-        # Phase 1: xxHash grouping
         if context.config.find_exact_duplicates:
             reps_data = self._group_by_hash_key(reps_data, "xxhash", EvidenceMethod.XXHASH.value, context)
             if context.stop_event.is_set():
                 return []
 
-        # Phase 2: dHash grouping
         if context.config.find_simple_duplicates:
             reps_data = self._group_by_hash_key(reps_data, "dhash", EvidenceMethod.DHASH.value, context)
             if context.stop_event.is_set():
                 return []
 
-        # Phase 3: pHash grouping
         if context.config.find_perceptual_duplicates:
             phashes_to_process = [(d["phash"], d["path"]) for d in reps_data if d["phash"] is not None]
             if phashes_to_process:
                 hashes_ph, paths_ph = zip(*phashes_to_process, strict=True)
                 components = self._find_phash_components(paths_ph, hashes_ph, context.config.phash_threshold)
-                final_reps_paths = self._process_phash_components(components, context)
-                return final_reps_paths
+                return self._process_phash_components(components, context)
 
         return [d["path"] for d in reps_data]
 
     def _group_by_hash_key(self, data_list: list[dict], key: str, method: str, context: ScanContext) -> list[dict]:
-        """Helper to group items by a specific hash key and return representatives."""
         hash_map = defaultdict(list)
         for item in data_list:
-            if item[key] is not None:
+            if item.get(key) is not None:
                 hash_map[item[key]].append(item["path"])
 
         representatives = []
         rep_paths = set()
         for paths in hash_map.values():
-            if not paths:
-                continue
-
-            rep_path = paths[0]
-            representatives.append(next(d for d in data_list if d["path"] == rep_path))
-            rep_paths.add(rep_path)
-
-            if len(paths) > 1:
-                for other_path in paths[1:]:
-                    context.cluster_manager.add_evidence(rep_path, other_path, method, 0.0)
+            if paths:
+                rep_path = paths[0]
+                representatives.append(next(d for d in data_list if d["path"] == rep_path))
+                rep_paths.add(rep_path)
+                if len(paths) > 1:
+                    for other_path in paths[1:]:
+                        context.cluster_manager.add_evidence(rep_path, other_path, method, 0.0)
 
         return representatives
 
@@ -440,11 +393,9 @@ class CombinedCollectionStage(ScanStage):
                 group_fps = [context.all_image_fps[p] for p in group if p in context.all_image_fps]
                 if not group_fps:
                     continue
-
                 best = find_best_in_group(group_fps)
                 if not best:
                     continue
-
                 representatives.append(best.path)
                 for path in group:
                     if path != best.path:
@@ -455,8 +406,6 @@ class CombinedCollectionStage(ScanStage):
 
 
 class FingerprintGenerationStage(ScanStage):
-    """Stage 3: Generates AI fingerprints for the remaining unique images."""
-
     @property
     def name(self) -> str:
         return "Phase 4/6: Creating AI fingerprints..."
@@ -480,8 +429,6 @@ class FingerprintGenerationStage(ScanStage):
 
 
 class DatabaseIndexStage(ScanStage):
-    """Stage 4: Creates an optimized index in LanceDB for large datasets."""
-
     @property
     def name(self) -> str:
         return "Phase 5/6: Optimizing database for fast search..."
@@ -510,8 +457,6 @@ class DatabaseIndexStage(ScanStage):
 
 
 class AILinkingStage(ScanStage):
-    """Stage 5: Runs AI similarity search to find the final links between images."""
-
     @property
     def name(self) -> str:
         return "Phase 6/6: Finding similar images (AI)..."

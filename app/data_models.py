@@ -179,6 +179,7 @@ class ScanConfig:
     lancedb_in_memory: bool
     visuals_columns: int
     tonemap_visuals: bool
+    tonemap_view: str
     model_info: dict = field(default_factory=dict)
     sample_path: Path | None = None
     search_query: str | None = None
@@ -217,6 +218,7 @@ class ViewerSettings:
     show_transparency: bool = True
     thumbnail_tonemap_enabled: bool = False
     compare_tonemap_enabled: bool = False
+    tonemap_view: str = "Khronos PBR Neutral"
 
 
 @dataclass
@@ -276,6 +278,7 @@ class AppSettings:
                     "show_transparency": data.pop("show_transparency", True),
                     "thumbnail_tonemap_enabled": data.pop("thumbnail_tonemap_enabled", False),
                     "compare_tonemap_enabled": data.pop("compare_tonemap_enabled", False),
+                    "tonemap_view": data.pop("tonemap_view", "Khronos PBR Neutral"),
                 }
 
             # --- Load into nested structure ---

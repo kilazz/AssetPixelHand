@@ -191,3 +191,9 @@ class SettingsManager(QObject):
         if self._settings.viewer.compare_tonemap_enabled != checked:
             self._settings.viewer.compare_tonemap_enabled = checked
             self._request_save()
+
+    @Slot(str)
+    def set_tonemap_view(self, view_name: str):
+        if self._settings.viewer.tonemap_view != view_name:
+            self._settings.viewer.tonemap_view = view_name
+            self._request_save()

@@ -69,6 +69,7 @@ class ScanConfigBuilder:
             max_visuals=int(self.settings.visuals.max_count),
             visuals_columns=self.settings.visuals.columns,
             tonemap_visuals=self.settings.visuals.tonemap_enabled,
+            tonemap_view=self.settings.viewer.tonemap_view,
             search_precision=self.settings.performance.search_precision,
             search_query=self.search_query if self.scan_mode == ScanMode.TEXT_SEARCH else None,
             sample_path=self.sample_path,

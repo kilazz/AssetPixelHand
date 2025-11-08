@@ -13,7 +13,7 @@ import time
 import pyarrow as pa
 from PySide6.QtCore import QObject, QThread, Slot
 
-from app.constants import CACHE_DIR, DB_TABLE_NAME, DUCKDB_AVAILABLE, LANCEDB_AVAILABLE, WIN32_AVAILABLE
+from app.constants import CACHE_DIR, DB_TABLE_NAME, DUCKDB_AVAILABLE, LANCEDB_AVAILABLE, PYWIN32_FEATURE_AVAILABLE
 from app.core.strategies import FindDuplicatesStrategy, SearchStrategy
 from app.data_models import ScanConfig, ScanMode, ScanState
 from app.services.signal_bus import APP_SIGNAL_BUS
@@ -22,7 +22,7 @@ if LANCEDB_AVAILABLE:
     import lancedb
 if DUCKDB_AVAILABLE:
     pass
-if WIN32_AVAILABLE:
+if PYWIN32_FEATURE_AVAILABLE:
     import win32api
     import win32con
     import win32process
@@ -85,7 +85,7 @@ class ScannerCore(QObject):
         if not self.config.perf.run_at_low_priority:
             return
         try:
-            if WIN32_AVAILABLE:
+            if PYWIN32_FEATURE_AVAILABLE:
                 pid = win32api.GetCurrentProcessId()
                 handle = win32api.OpenProcess(win32con.PROCESS_ALL_ACCESS, True, pid)
                 win32process.SetPriorityClass(handle, win32process.BELOW_NORMAL_PRIORITY_CLASS)

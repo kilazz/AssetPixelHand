@@ -133,7 +133,7 @@ class VisualizationTask(QRunnable):
 
         total_groups_to_process = min(len(sorted_groups), self.config.max_visuals)
 
-        tonemap_mode = TonemapMode.REINHARD.value if self.config.tonemap_visuals else TonemapMode.NONE.value
+        tonemap_mode = TonemapMode.ENABLED.value if self.config.tonemap_visuals else TonemapMode.NONE.value
 
         for i, (orig_fp, dups) in enumerate(sorted_groups):
             if report_count >= self.config.max_visuals or not dups:

@@ -41,12 +41,16 @@ MODELS_CONFIG_FILE = APP_DATA_DIR / "models.json"
 
 # --- Library Availability Checks ---
 WIN32_AVAILABLE = sys.platform == "win32"
+# Use find_spec to check for pywin32 availability without importing it here.
+PYWIN32_FEATURE_AVAILABLE = WIN32_AVAILABLE and bool(importlib.util.find_spec("win32api"))
+
 DEEP_LEARNING_AVAILABLE = all(importlib.util.find_spec(pkg) for pkg in ["onnxruntime", "transformers", "torch"])
 OIIO_AVAILABLE = bool(importlib.util.find_spec("OpenImageIO"))
 DIRECTXTEX_AVAILABLE = bool(importlib.util.find_spec("directxtex_decoder"))
 DUCKDB_AVAILABLE = bool(importlib.util.find_spec("duckdb"))
 LANCEDB_AVAILABLE = bool(importlib.util.find_spec("lancedb"))
 ZSTD_AVAILABLE = bool(importlib.util.find_spec("zstandard"))
+OCIO_AVAILABLE = bool(importlib.util.find_spec("simple_ocio"))
 
 Image.init()
 
@@ -197,8 +201,7 @@ class QuantizationMode(Enum):
 
 class TonemapMode(Enum):
     NONE = "none"
-    ACES = "aces"
-    REINHARD = "reinhard"
+    ENABLED = "enabled"
 
 
 # --- Data Model & UI Constants ---

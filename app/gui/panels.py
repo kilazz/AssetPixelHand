@@ -53,6 +53,7 @@ from app.constants import (
     UIConfig,
 )
 from app.data_models import AppSettings, FileOperation, ScanMode
+from app.image_io import TONE_MAPPER, set_active_tonemap_view
 from app.services.settings_manager import SettingsManager
 from app.view_models import ImageComparerState
 
@@ -1126,6 +1127,18 @@ class ImageViewerPanel(QGroupBox):
         top_controls.addWidget(self.back_button)
         top_controls.addWidget(self.compare_type_combo)
         top_controls.addStretch()
+
+        self.tonemap_view_label = QLabel("View:")
+        self.tonemap_view_combo = QComboBox()
+        if TONE_MAPPER and TONE_MAPPER.available_views:
+            self.tonemap_view_combo.addItems(TONE_MAPPER.available_views)
+        else:
+            self.tonemap_view_combo.setEnabled(False)
+            self.tonemap_view_label.setEnabled(False)
+
+        top_controls.addWidget(self.tonemap_view_label)
+        top_controls.addWidget(self.tonemap_view_combo)
+
         self.compare_tonemap_check = QCheckBox("HDR Tonemapping")
         self.compare_tonemap_check.setToolTip("Apply tonemapping for high-dynamic-range (HDR) images.")
         top_controls.addWidget(self.compare_tonemap_check)
@@ -1202,17 +1215,15 @@ class ImageViewerPanel(QGroupBox):
         self.state.image_loaded.connect(self._on_full_res_image_loaded)
         self.state.load_complete.connect(self._on_load_complete)
         self.state.load_error.connect(self.log_message.emit)
-
         self.preview_size_slider.sliderReleased.connect(self._update_preview_sizes)
-
         self.bg_alpha_check.toggled.connect(self._on_transparency_toggled)
         self.compare_bg_alpha_check.toggled.connect(self._on_transparency_toggled)
-
         self.thumbnail_tonemap_check.toggled.connect(self.settings_manager.set_thumbnail_tonemap_enabled)
         self.compare_tonemap_check.toggled.connect(self.settings_manager.set_compare_tonemap_enabled)
-
         self.thumbnail_tonemap_check.toggled.connect(self._on_thumbnail_tonemap_toggled)
         self.compare_tonemap_check.toggled.connect(self._on_compare_tonemap_changed)
+        self.tonemap_view_combo.currentTextChanged.connect(self.settings_manager.set_tonemap_view)
+        self.tonemap_view_combo.currentTextChanged.connect(self._on_tonemap_view_changed)
         self.list_view.customContextMenuRequested.connect(self._show_context_menu)
         self.open_action.triggered.connect(self._context_open_file)
         self.show_action.triggered.connect(self._context_show_in_explorer)
@@ -1256,19 +1267,30 @@ class ImageViewerPanel(QGroupBox):
 
     @Slot(bool)
     def _on_thumbnail_tonemap_toggled(self, checked: bool):
-        mode = TonemapMode.REINHARD.value if checked else TonemapMode.NONE.value
+        mode = TonemapMode.ENABLED.value if checked else TonemapMode.NONE.value
         self.model.set_tonemap_mode(mode)
 
-    @Slot()
-    def _on_compare_tonemap_changed(self):
+    @Slot(bool)
+    def _on_compare_tonemap_changed(self, checked: bool):
+        self.tonemap_view_combo.setEnabled(checked)
+        self.tonemap_view_label.setEnabled(checked)
         if self.compare_container.isVisible() and len(self.state.get_candidate_paths()) == 2:
             self._show_comparison_view()
+
+    @Slot(str)
+    def _on_tonemap_view_changed(self, view_name: str):
+        if set_active_tonemap_view(view_name):
+            self.model.clear_cache()
+            if self.compare_container.isVisible():
+                self._show_comparison_view()
 
     def load_settings(self, settings: AppSettings):
         self.preview_size_slider.setValue(settings.viewer.preview_size)
         self.bg_alpha_check.setChecked(settings.viewer.show_transparency)
         self.thumbnail_tonemap_check.setChecked(settings.viewer.thumbnail_tonemap_enabled)
         self.compare_tonemap_check.setChecked(settings.viewer.compare_tonemap_enabled)
+        if self.tonemap_view_combo.isEnabled():
+            self.tonemap_view_combo.setCurrentText(settings.viewer.tonemap_view)
         self._on_transparency_toggled(settings.viewer.show_transparency)
 
     def clear_viewer(self):
@@ -1339,7 +1361,7 @@ class ImageViewerPanel(QGroupBox):
         if len(self.state.get_candidate_paths()) != 2:
             return
         self._set_view_mode(is_list=False)
-        tonemap_mode = TonemapMode.REINHARD.value if self.compare_tonemap_check.isChecked() else TonemapMode.NONE.value
+        tonemap_mode = TonemapMode.ENABLED.value if self.compare_tonemap_check.isChecked() else TonemapMode.NONE.value
         self.compare_view_1.setPixmap(QPixmap())
         self.compare_view_2.setPixmap(QPixmap())
         self.state.load_full_res_images(tonemap_mode)

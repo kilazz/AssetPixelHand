@@ -24,12 +24,12 @@ from app.constants import (
     DEEP_LEARNING_AVAILABLE,
     FP16_MODEL_SUFFIX,
     MODELS_DIR,
-    WIN32_AVAILABLE,
+    PYWIN32_FEATURE_AVAILABLE,
 )
 from app.data_models import ImageFingerprint
 from app.image_io import get_image_metadata, load_image
 
-if WIN32_AVAILABLE:
+if PYWIN32_FEATURE_AVAILABLE:
     import win32api
     import win32con
     import win32process
@@ -121,7 +121,7 @@ class InferenceEngine:
 
 def _init_worker_process(config: dict):
     """Lowers the process priority on Windows if requested."""
-    if config.get("low_priority") and WIN32_AVAILABLE:
+    if config.get("low_priority") and PYWIN32_FEATURE_AVAILABLE:
         with contextlib.suppress(Exception):
             pid = win32api.GetCurrentProcessId()
             handle = win32api.OpenProcess(win32con.PROCESS_ALL_ACCESS, True, pid)
