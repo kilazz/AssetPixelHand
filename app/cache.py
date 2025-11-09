@@ -1,30 +1,22 @@
 # app/cache.py
 """Manages file and fingerprint caching to avoid reprocessing unchanged files.
-Also manages the optional, session-based thumbnail cache.
+Also manages the persistent thumbnail cache.
 """
 
 import abc
 import hashlib
 import logging
 import os
-import pickle
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from app.constants import (
-    CACHE_DIR,
-    CACHE_VERSION,
-    DUCKDB_AVAILABLE,
-    ZSTD_AVAILABLE,
-)
+from app.constants import CACHE_DIR, CACHE_VERSION, DUCKDB_AVAILABLE, THUMBNAIL_CACHE_DB
 from app.data_models import ImageFingerprint
 
 if DUCKDB_AVAILABLE:
     import duckdb
-if ZSTD_AVAILABLE:
-    import zstandard
 
 if TYPE_CHECKING:
     from app.data_models import ScanConfig
@@ -42,7 +34,7 @@ def _configure_db_connection(conn):
         # This setting is now primarily for the on-disk mode
         conn.execute("PRAGMA wal_autocheckpoint='256MB'")
         app_logger.debug("DuckDB performance PRAGMAs applied.")
-    except duckdb.Error as e:
+    except (duckdb.Error, AttributeError) as e:
         app_logger.warning(f"Could not apply DuckDB performance PRAGMAs: {e}")
 
 
@@ -54,13 +46,6 @@ class CacheManager:
         self.db_path = None
         self.in_memory_mode = in_memory
 
-        if ZSTD_AVAILABLE:
-            self.compressor = zstandard.ZstdCompressor(level=3, threads=-1)
-            self.decompressor = zstandard.ZstdDecompressor()
-            app_logger.debug("Zstandard compression is enabled for caching.")
-        else:
-            self.compressor, self.decompressor = None, None
-            app_logger.warning("Zstandard library not found. Caching will proceed without compression.")
         if not DUCKDB_AVAILABLE:
             app_logger.error("DuckDB library not found; file caching will be disabled.")
             return
@@ -93,7 +78,21 @@ class CacheManager:
         if self.conn:
             try:
                 self.conn.execute(
-                    "CREATE TABLE IF NOT EXISTS fingerprints (path VARCHAR PRIMARY KEY, mtime DOUBLE, size UBIGINT, fingerprint BLOB)"
+                    """
+                    CREATE TABLE IF NOT EXISTS fingerprints (
+                        path VARCHAR PRIMARY KEY,
+                        mtime DOUBLE,
+                        size UBIGINT,
+                        hashes BLOB,
+                        resolution_w INTEGER,
+                        resolution_h INTEGER,
+                        capture_date DOUBLE,
+                        format_str VARCHAR,
+                        format_details VARCHAR,
+                        has_alpha BOOLEAN,
+                        bit_depth INTEGER
+                    )
+                    """
                 )
             except duckdb.Error as e:
                 app_logger.error(f"Failed to create file cache table: {e}")
@@ -121,27 +120,31 @@ class CacheManager:
             valid_cache_paths = [row[0] for row in self.conn.execute(cached_paths_query).fetchall()]
             cached_fps = []
             if valid_cache_paths:
-                for i in range(0, len(valid_cache_paths), 4096):
-                    batch_paths = valid_cache_paths[i : i + 4096]
-                    placeholders = ", ".join("?" for _ in batch_paths)
-                    query = f"SELECT path, fingerprint FROM fingerprints WHERE path IN ({placeholders})"
-                    for path_str, blob in self.conn.execute(query, batch_paths).fetchall():
-                        try:
-                            fp_data = self.decompressor.decompress(blob) if self.decompressor else blob
-                            fp = pickle.loads(fp_data)
-                            if (
-                                isinstance(fp, ImageFingerprint)
-                                and hasattr(fp, "hashes")
-                                and isinstance(fp.hashes, np.ndarray)
-                            ):
-                                cached_fps.append(fp)
-                            else:
-                                to_process_paths.add(Path(path_str))
-                        except Exception as e:
-                            app_logger.warning(
-                                f"Could not load cached fingerprint for {path_str}, will re-process. Error: {e}"
-                            )
-                            to_process_paths.add(Path(path_str))
+                placeholders = ", ".join("?" for _ in valid_cache_paths)
+                query = f"SELECT * FROM fingerprints WHERE path IN ({placeholders})"
+                result = self.conn.execute(query, valid_cache_paths)
+                cols = [desc[0] for desc in result.description]
+                for row_tuple in result.fetchall():
+                    row_dict = dict(zip(cols, row_tuple, strict=False))
+                    try:
+                        fp = ImageFingerprint(
+                            path=Path(row_dict["path"]),
+                            hashes=np.frombuffer(row_dict["hashes"], dtype=np.float32),
+                            resolution=(row_dict["resolution_w"], row_dict["resolution_h"]),
+                            file_size=row_dict["size"],
+                            mtime=row_dict["mtime"],
+                            capture_date=row_dict["capture_date"],
+                            format_str=row_dict["format_str"],
+                            format_details=row_dict["format_details"],
+                            has_alpha=row_dict["has_alpha"],
+                            bit_depth=row_dict["bit_depth"],
+                        )
+                        cached_fps.append(fp)
+                    except Exception as e:
+                        app_logger.warning(
+                            f"Could not load cached fingerprint for {row_dict['path']}, will re-process. Error: {e}"
+                        )
+                        to_process_paths.add(Path(row_dict["path"]))
             return list(to_process_paths), cached_fps
         except duckdb.Error as e:
             app_logger.warning(f"Failed to read from file cache DB: {e}. Rebuilding cache.")
@@ -153,23 +156,43 @@ class CacheManager:
     def put_many(self, fingerprints: list[ImageFingerprint]):
         if not self.conn or not fingerprints:
             return
-        data_to_insert = [
+        data_to_insert: list[tuple[Any, ...]] = [
             (
                 str(fp.path),
                 fp.mtime,
                 fp.file_size,
-                self.compressor.compress(pickle.dumps(fp)) if self.compressor else pickle.dumps(fp),
+                fp.hashes.tobytes() if fp.hashes is not None else None,
+                fp.resolution[0],
+                fp.resolution[1],
+                fp.capture_date,
+                fp.format_str,
+                fp.format_details,
+                fp.has_alpha,
+                fp.bit_depth,
             )
             for fp in fingerprints
             if fp
         ]
         try:
-            self.conn.begin()
+            update_setters = [
+                "mtime = excluded.mtime",
+                "size = excluded.size",
+                "hashes = excluded.hashes",
+                "resolution_w = excluded.resolution_w",
+                "resolution_h = excluded.resolution_h",
+                "capture_date = excluded.capture_date",
+                "format_str = excluded.format_str",
+                "format_details = excluded.format_details",
+                "has_alpha = excluded.has_alpha",
+                "bit_depth = excluded.bit_depth",
+            ]
             sql = (
-                "INSERT INTO fingerprints (path, mtime, size, fingerprint) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(path) DO UPDATE SET "
-                "mtime = excluded.mtime, size = excluded.size, fingerprint = excluded.fingerprint"
+                "INSERT INTO fingerprints (path, mtime, size, hashes, resolution_w, resolution_h, "
+                "capture_date, format_str, format_details, has_alpha, bit_depth) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                f"ON CONFLICT(path) DO UPDATE SET {', '.join(update_setters)}"
             )
+            self.conn.begin()
             self.conn.executemany(sql, data_to_insert)
             self.conn.commit()
         except duckdb.Error as e:
@@ -183,14 +206,23 @@ class CacheManager:
 
         if self.in_memory_mode and self.db_path:
             try:
+                # 1. Remove the old cache file if it exists
                 self.db_path.unlink(missing_ok=True)
+
+                # 2. Attach the on-disk file path as a new database named 'disk_db'
                 self.conn.execute(f"ATTACH '{self.db_path!s}' AS disk_db;")
+
+                # 3. Create a table in the on-disk database by copying everything from the in-memory table
                 self.conn.execute("CREATE TABLE disk_db.fingerprints AS SELECT * FROM main.fingerprints;")
+
+                # 4. Detach the on-disk database, finalizing the write operation
                 self.conn.execute("DETACH disk_db;")
+
                 app_logger.info(f"Successfully wrote in-memory cache to '{self.db_path.name}'.")
             except duckdb.Error as e:
                 app_logger.error(f"Failed to write fingerprint cache to disk: {e}")
         else:
+            # For on-disk mode, just checkpoint
             try:
                 self.conn.execute("CHECKPOINT;")
             except duckdb.Error as e:
@@ -218,7 +250,7 @@ class AbstractThumbnailCache(abc.ABC):
 
 
 class DuckDBThumbnailCache(AbstractThumbnailCache):
-    """A session-based thumbnail cache using DuckDB, supports in-memory and on-disk modes."""
+    """A session-based, persistent thumbnail cache using DuckDB."""
 
     def __init__(self, in_memory: bool):
         self.conn = None
@@ -227,11 +259,11 @@ class DuckDBThumbnailCache(AbstractThumbnailCache):
             return
 
         try:
-            db_path = ":memory:" if in_memory else str(CACHE_DIR / "session_thumbnail_cache.duckdb")
+            db_path = ":memory:" if in_memory else str(THUMBNAIL_CACHE_DB)
             if in_memory:
                 app_logger.info("Using in-memory database for thumbnail cache.")
             else:
-                app_logger.info("Using on-disk database for thumbnail cache (HDD-friendly mode).")
+                app_logger.info(f"Using persistent on-disk database for thumbnail cache: {THUMBNAIL_CACHE_DB.name}")
 
             self.conn = duckdb.connect(database=db_path, read_only=False)
             _configure_db_connection(self.conn)
@@ -260,11 +292,10 @@ class DuckDBThumbnailCache(AbstractThumbnailCache):
     def close(self):
         if self.conn:
             try:
-                # No need to checkpoint an in-memory db, but doesn't hurt for on-disk
                 self.conn.execute("CHECKPOINT;")
                 self.conn.close()
             except duckdb.Error:
-                pass  # Ignore errors on close
+                pass
             finally:
                 self.conn = None
 
@@ -293,18 +324,14 @@ def get_thumbnail_cache_key(path_str: str, mtime: float, target_size: int, tonem
 
 
 def setup_caches(config: "ScanConfig"):
-    """Initializes both fingerprint and thumbnail caches based on scan settings."""
+    """Initializes the persistent thumbnail cache based on scan settings."""
     global thumbnail_cache
 
     # Close any old cache instance
     thumbnail_cache.close()
 
-    # Clean up the old persistent thumbnail cache file if it exists, as it's no longer used.
-    from app.constants import THUMBNAIL_CACHE_DB
-
-    THUMBNAIL_CACHE_DB.unlink(missing_ok=True)
-
-    # Create a new thumbnail cache instance in the correct mode for the current scan.
+    # Create a new thumbnail cache instance. It will be in-memory only if the
+    # main LanceDB database is also in-memory. Otherwise, it's persistent.
     thumbnail_cache = DuckDBThumbnailCache(in_memory=config.lancedb_in_memory)
 
 
