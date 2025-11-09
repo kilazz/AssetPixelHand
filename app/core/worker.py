@@ -44,6 +44,7 @@ g_free_buffers_q = None
 
 
 def normalize_vectors_numpy(embeddings: np.ndarray) -> np.ndarray:
+    """Normalizes a batch of vectors in-place using NumPy."""
     if embeddings.dtype != np.float32:
         embeddings = embeddings.astype(np.float32)
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
@@ -54,7 +55,7 @@ def normalize_vectors_numpy(embeddings: np.ndarray) -> np.ndarray:
 class InferenceEngine:
     """A heavyweight class that loads ONNX models for actual inference."""
 
-    def __init__(self, model_name: str, device: str = "cpu", threads_per_worker: int = 2):
+    def __init__(self, model_name: str, device: str = "CPUExecutionProvider", threads_per_worker: int = 2):
         if not DEEP_LEARNING_AVAILABLE:
             raise ImportError("Required deep learning libraries not found.")
         from transformers import AutoProcessor
@@ -69,51 +70,57 @@ class InferenceEngine:
         self._load_onnx_model(model_dir, device, threads_per_worker)
 
     def _load_onnx_model(self, model_dir: Path, device: str, threads_per_worker: int):
+        """Loads the ONNX models, using the specified execution provider with a fallback to CPU."""
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        providers = ["CPUExecutionProvider"]
-        provider_options = [{}]  # Corresponds to CPUExecutionProvider
+        requested_provider_id = device
+        available_providers = ort.get_available_providers()
 
-        if device == "gpu":
-            preferred_providers = ["CUDAExecutionProvider", "DmlExecutionProvider"]
-            available_providers = ort.get_available_providers()
+        # Safety Check: If the requested provider isn't available, log a warning and fall back to CPU.
+        if requested_provider_id not in available_providers:
+            app_logger.warning(
+                f"Provider '{requested_provider_id}' was requested but is not available. "
+                f"Available: {available_providers}. Falling back to CPUExecutionProvider."
+            )
+            provider_id = "CPUExecutionProvider"
+        else:
+            provider_id = requested_provider_id
 
-            chosen_provider = next((p for p in preferred_providers if p in available_providers), None)
+        providers = [provider_id]
 
-            if chosen_provider:
-                providers.insert(0, chosen_provider)
-                provider_options.insert(0, {})  # Placeholder for GPU options
+        # Apply provider-specific options
+        if provider_id == "DmlExecutionProvider" and self.is_fp16 and hasattr(opts, "enable_float16_for_dml"):
+            opts.enable_float16_for_dml = True
 
-                # Specific options for FP16 on DirectML
-                if (
-                    chosen_provider == "DmlExecutionProvider"
-                    and self.is_fp16
-                    and hasattr(opts, "enable_float16_for_dml")
-                ):
-                    opts.enable_float16_for_dml = True
-            else:
-                app_logger.warning(
-                    "GPU device selected, but no compatible provider (CUDA/DirectML) found. Falling back to CPU."
-                )
-        else:  # CPU-specific optimizations
+        if provider_id == "WebGPUExecutionProvider":
+            app_logger.info("Attempting to use experimental WebGPUExecutionProvider.")
+
+        # Apply CPU-specific threading optimizations only if CPU is the chosen provider
+        if provider_id == "CPUExecutionProvider":
             opts.inter_op_num_threads = 1
             opts.intra_op_num_threads = threads_per_worker
+        else:
+            # When using a GPU provider, also add CPU as a secondary option.
+            # ONNX Runtime will intelligently place ops (like Shape) on the CPU for better performance.
+            providers.append("CPUExecutionProvider")
 
-        self.visual_session = ort.InferenceSession(
-            str(model_dir / "visual.onnx"), opts, providers=providers, provider_options=provider_options
-        )
+        # Session creation will raise an exception if the chosen provider fails to initialize.
+        onnx_file = model_dir / "visual.onnx"
+        self.visual_session = ort.InferenceSession(str(onnx_file), opts, providers=providers)
+
         if (text_model_path := model_dir / "text.onnx").exists():
-            self.text_session = ort.InferenceSession(
-                str(text_model_path), opts, providers=providers, provider_options=provider_options
-            )
+            self.text_session = ort.InferenceSession(str(text_model_path), opts, providers=providers)
             self.text_input_names = {i.name for i in self.text_session.get_inputs()}
 
-        provider_name = self.visual_session.get_providers()[0]
-        thread_info = f"({threads_per_worker} threads/worker)" if "CPU" in provider_name else ""
-        app_logger.info(f"Worker PID {os.getpid()}: ONNX models loaded on '{provider_name}' {thread_info}")
+        # Log the provider that was actually used by the session for clarity
+        final_provider = self.visual_session.get_providers()[0]
+        log_message = f"Worker PID {os.getpid()}: ONNX models loaded. Requested: '{requested_provider_id}', Used: '{final_provider}'"
+        thread_info = f" ({threads_per_worker} threads/worker)" if "CPU" in final_provider else ""
+        app_logger.info(log_message + thread_info)
 
     def get_text_features(self, text: str) -> np.ndarray:
+        """Computes a feature vector for a given text string."""
         if not self.text_session:
             raise RuntimeError("Text model not loaded.")
         inputs = self.processor.tokenizer(
@@ -153,7 +160,9 @@ def init_worker(config: dict):
     try:
         threads = config.get("threads_per_worker", 2)
         g_inference_engine = InferenceEngine(
-            model_name=config["model_name"], device=config.get("device", "cpu"), threads_per_worker=threads
+            model_name=config["model_name"],
+            device=config.get("device", "CPUExecutionProvider"),
+            threads_per_worker=threads,
         )
     except Exception as e:
         _log_worker_crash(e, "init_worker")
@@ -176,7 +185,7 @@ def init_preprocessor_worker(config: dict, queue: "multiprocessing.Queue"):
 
 def _process_batch_from_paths(
     paths: list[Path], input_size
-) -> tuple[list, list[ImageFingerprint], list[tuple[str, str]]]:
+) -> tuple[list[Image.Image], list[ImageFingerprint], list[tuple[str, str]]]:
     """
     Loads images and metadata for a batch of paths using the centralized `load_image` function.
     """
@@ -184,18 +193,15 @@ def _process_batch_from_paths(
 
     for path in paths:
         try:
-            # 1. Get metadata first. If it fails, skip the file.
             metadata = get_image_metadata(path)
             if not metadata or not metadata.get("resolution") or metadata["resolution"][0] == 0:
                 skipped_tuples.append((str(path), "Metadata extraction failed"))
                 continue
 
-            # 2. Use the unified loading function from image_io.py
             pil_image = load_image(path)
 
             if pil_image:
                 pil_image.thumbnail(input_size, Image.Resampling.LANCZOS)
-                # Convert to RGB if needed for the model (most models require 3 channels)
                 processed_image = pil_image.convert("RGB") if pil_image.mode != "RGB" else pil_image
                 images.append(processed_image)
                 fingerprints.append(ImageFingerprint(path=path, hashes=np.array([]), **metadata))
@@ -203,41 +209,16 @@ def _process_batch_from_paths(
                 skipped_tuples.append((str(path), "Image loading failed"))
 
         except Exception as e:
-            # Log the error and add the file to the skipped list
             app_logger.error(f"Error processing {path.name} in batch", exc_info=True)
             skipped_tuples.append((str(path), f"{type(e).__name__}: {str(e).splitlines()[0]}"))
 
     return images, fingerprints, skipped_tuples
 
 
-def worker_wrapper_from_paths(paths: list[Path]) -> tuple[list[ImageFingerprint], list[tuple[str, str]]]:
-    if g_inference_engine is None:
-        return [], [(str(p), "Worker not initialized") for p in paths]
-    try:
-        images, fps, skipped_tuples = _process_batch_from_paths(paths, g_inference_engine.input_size)
-        if images:
-            inputs = g_inference_engine.processor(images=images, return_tensors="np")
-            pixel_values = inputs.pixel_values.astype(np.float16 if g_inference_engine.is_fp16 else np.float32)
-
-            io_binding = g_inference_engine.visual_session.io_binding()
-            io_binding.bind_cpu_input("pixel_values", pixel_values)
-            io_binding.bind_output("image_embeds")
-            g_inference_engine.visual_session.run_with_iobinding(io_binding)
-            embeddings = io_binding.get_outputs()[0].numpy()
-
-            if embeddings.size > 0:
-                embeddings = normalize_vectors_numpy(embeddings)
-                for i, fp in enumerate(fps):
-                    fp.hashes = embeddings[i].flatten()
-        return fps, skipped_tuples
-    except Exception as e:
-        _log_worker_crash(e, "worker_wrapper_from_paths")
-        return [], [(str(p), f"Batch failed: {type(e).__name__}") for p in paths]
-
-
 def worker_wrapper_from_paths_cpu_shared_mem(
     paths: list[Path], input_size: tuple[int, int], buffer_shape, dtype
 ) -> tuple:
+    """CPU worker function that preprocesses images and puts the resulting tensor into shared memory."""
     global g_free_buffers_q, g_preprocessor
     if g_free_buffers_q is None or g_preprocessor is None:
         raise RuntimeError("Preprocessor worker not initialized correctly.")
@@ -245,6 +226,7 @@ def worker_wrapper_from_paths_cpu_shared_mem(
         images, fps, skipped_tuples = _process_batch_from_paths(paths, input_size)
         if not images:
             return None, [], skipped_tuples
+
         pixel_values = g_preprocessor(images=images, return_tensors="np").pixel_values
 
         shm_name = g_free_buffers_q.get()
@@ -262,6 +244,7 @@ def worker_wrapper_from_paths_cpu_shared_mem(
 
 
 def inference_worker_loop(config: dict, tensor_q, results_q, free_buffers_q):
+    """The main loop for the dedicated inference process (GPU or CPU)."""
     init_worker(config)
     if g_inference_engine is None:
         results_q.put(None)
@@ -275,7 +258,7 @@ def inference_worker_loop(config: dict, tensor_q, results_q, free_buffers_q):
             except Empty:
                 continue
 
-            if item is None:
+            if item is None:  # Sentinel value indicates end of processing
                 results_q.put(None)
                 break
 
@@ -314,6 +297,7 @@ def inference_worker_loop(config: dict, tensor_q, results_q, free_buffers_q):
 
 
 def _log_worker_crash(e: Exception, context: str):
+    """Logs any unhandled exceptions from a worker process to a crash file."""
     pid = os.getpid()
     crash_log_dir = APP_DATA_DIR / "crash_logs"
     crash_log_dir.mkdir(parents=True, exist_ok=True)
@@ -323,6 +307,7 @@ def _log_worker_crash(e: Exception, context: str):
 
 
 def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
+    """Worker function to get a single vector, used for sample search."""
     if g_inference_engine is None:
         return None
     try:
@@ -346,6 +331,7 @@ def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
 
 
 def worker_get_text_vector(text: str) -> np.ndarray | None:
+    """Worker function to get a single vector for a text query."""
     if g_inference_engine is None:
         return None
     try:

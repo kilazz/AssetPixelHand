@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import duckdb
+import onnxruntime
 from PIL import Image, ImageChops
 from PIL.ImageQt import ImageQt
 from PySide6.QtCore import QModelIndex, QPoint, Qt, QThreadPool, QTimer, Signal, Slot
@@ -525,41 +526,61 @@ class PerformancePanel(QGroupBox):
         layout.addRow(self.num_workers_label, self.num_workers_spin)
 
     def _connect_signals(self):
-        self.device_combo.currentIndexChanged.connect(self._on_device_selection_changed)
+        self.device_combo.activated.connect(self._on_device_selection_changed)
         self.quant_combo.currentTextChanged.connect(self.settings_manager.set_quantization_mode)
         self.batch_size_spin.valueChanged.connect(self.settings_manager.set_batch_size)
         self.search_precision_combo.currentTextChanged.connect(self.settings_manager.set_search_precision)
         self.num_workers_spin.valueChanged.connect(self.settings_manager.set_num_workers)
-        self.device_combo.currentTextChanged.connect(lambda: self._on_device_change(self.device_combo.currentData()))
-
-    @Slot(int)
-    def _on_device_selection_changed(self, index: int):
-        """Gets the internal data ('gpu' or 'cpu') and sends it to the settings manager."""
-        device_data = self.device_combo.itemData(index)
-        if device_data:
-            self.settings_manager.set_device(device_data)
 
     def _detect_and_setup_devices(self):
-        self.device_combo.addItem("CPU", "cpu")
-        if DEEP_LEARNING_AVAILABLE:
-            try:
-                import onnxruntime
+        """Detects and populates the dropdown with ALL available ONNX Runtime providers."""
+        self.device_combo.clear()
 
-                if "DmlExecutionProvider" in onnxruntime.get_available_providers():
-                    self.device_combo.addItem("GPU (DirectML)", "gpu")
-                    self.log_message.emit("DirectML GPU detected.", "success")
-            except ImportError:
-                self.log_message.emit("ONNX Runtime not found, GPU support disabled.", "warning")
+        if not DEEP_LEARNING_AVAILABLE:
+            # If ONNX is unavailable, add CPU as a fallback
+            self.device_combo.addItem("CPUExecutionProvider", "CPUExecutionProvider")
+            self.log_message.emit("Deep learning libraries not found, GPU support disabled.", "warning")
+            return
+
+        try:
+            available_providers = onnxruntime.get_available_providers()
+
+            # Add CPU provider first if it exists, as it's the most common baseline
+            if "CPUExecutionProvider" in available_providers:
+                self.device_combo.addItem("CPUExecutionProvider", "CPUExecutionProvider")
+
+            # Add all other providers using their technical names
+            for provider_id in available_providers:
+                if provider_id == "CPUExecutionProvider":
+                    continue  # Skip, as it's already added
+                self.device_combo.addItem(provider_id, provider_id)
+
+            self.log_message.emit(f"Detected providers: {available_providers}", "info")
+
+        except Exception as e:
+            self.log_message.emit(f"Error detecting ONNX providers: {e}", "error")
+            if self.device_combo.count() == 0:
+                self.device_combo.addItem("CPUExecutionProvider", "CPUExecutionProvider")
 
         self._on_device_change(self.device_combo.currentData())
 
+    @Slot(int)
+    def _on_device_selection_changed(self, index: int):
+        """Handles user selection from the device dropdown."""
+        provider_id = self.device_combo.itemData(index)
+        if provider_id:
+            self.settings_manager.set_device(provider_id)
+            self._on_device_change(provider_id)
+
     @Slot(str)
-    def _on_device_change(self, device_key: str):
-        is_cpu = device_key == "cpu"
+    def _on_device_change(self, provider_id: str):
+        """Notifies other UI components if the selected device is CPU or not."""
+        is_cpu = provider_id == "CPUExecutionProvider"
         self.device_changed.emit(is_cpu)
 
     @Slot(str)
     def update_precision_presets(self, scan_mode_name: str):
+        """Updates the search precision dropdown based on the scan mode."""
         self.search_precision_combo.blockSignals(True)
         self.search_precision_combo.clear()
 
@@ -574,21 +595,28 @@ class PerformancePanel(QGroupBox):
 
         self.search_precision_combo.blockSignals(False)
 
+    def load_settings(self, s: AppSettings):
+        self._detect_and_setup_devices()
+
+        saved_provider_id = s.performance.device
+        index = self.device_combo.findData(saved_provider_id)
+
+        if index != -1:
+            self.device_combo.setCurrentIndex(index)
+        else:
+            self.device_combo.setCurrentIndex(0)
+
+        self.quant_combo.setCurrentText(s.performance.quantization_mode)
+        self.batch_size_spin.setValue(int(s.performance.batch_size))
+        self.search_precision_combo.setCurrentText(s.performance.search_precision)
+        self.num_workers_spin.setValue(int(s.performance.num_workers))
+        self._on_device_change(self.device_combo.currentData())
+
     def get_selected_quantization(self) -> QuantizationMode:
         return next(
             (q for q in QuantizationMode if q.value == self.quant_combo.currentText()),
             QuantizationMode.FP16,
         )
-
-    def load_settings(self, s: AppSettings):
-        device_value = s.performance.device
-        index = self.device_combo.findData(device_value)
-        if index != -1:
-            self.device_combo.setCurrentIndex(index)
-        self.quant_combo.setCurrentText(s.performance.quantization_mode)
-        self.batch_size_spin.setValue(int(s.performance.batch_size))
-        self.search_precision_combo.setCurrentText(s.performance.search_precision)
-        self.num_workers_spin.setValue(int(s.performance.num_workers))
 
 
 class SystemStatusPanel(QGroupBox):
