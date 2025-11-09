@@ -58,14 +58,18 @@ echo [OK] Virtual environment is active.
 echo.
 
 :: --- [3/5] Installing Dependencies ---
-if defined NEEDS_INSTALL or defined REINSTALL_MODE (
-    echo [3/5] Installing dependencies for [%ONNX_BACKEND%] backend...
-    pip install --upgrade pip
-    pip install --upgrade ".[%ONNX_BACKEND%]"
-    if errorlevel 1 ( goto :error "Failed to install dependencies." )
-) else (
+:: This block is corrected to handle the conditional installation properly.
+if not defined NEEDS_INSTALL if not defined REINSTALL_MODE (
     echo [3/5] Dependencies appear to be installed. Skipping.
+    goto :deps_done
 )
+
+echo [3/5] Installing dependencies for [%ONNX_BACKEND%] backend...
+pip install --upgrade pip
+pip install --upgrade ".[%ONNX_BACKEND%]"
+if errorlevel 1 ( goto :error "Failed to install dependencies." )
+
+:deps_done
 echo [OK] Dependencies are ready.
 echo.
 
