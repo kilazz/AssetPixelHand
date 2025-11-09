@@ -44,9 +44,6 @@ LOG_FILE = APP_DATA_DIR / "app_log.txt"
 CUSTOM_MODELS_CONFIG_FILE = APP_DATA_DIR / "custom_models.json"
 
 # --- Library Availability Checks ---
-WIN32_AVAILABLE = sys.platform == "win32"
-PYWIN32_FEATURE_AVAILABLE = WIN32_AVAILABLE and bool(importlib.util.find_spec("win32api"))
-
 DEEP_LEARNING_AVAILABLE = all(importlib.util.find_spec(pkg) for pkg in ["onnxruntime", "transformers", "torch"])
 OIIO_AVAILABLE = bool(importlib.util.find_spec("OpenImageIO"))
 DIRECTXTEX_AVAILABLE = bool(importlib.util.find_spec("directxtex_decoder"))

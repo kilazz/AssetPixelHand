@@ -4,7 +4,6 @@ This includes AI model inference and image preprocessing tasks, ensuring the mai
 thread remains responsive.
 """
 
-import contextlib
 import logging
 import multiprocessing
 import os
@@ -24,15 +23,9 @@ from app.constants import (
     DEEP_LEARNING_AVAILABLE,
     FP16_MODEL_SUFFIX,
     MODELS_DIR,
-    PYWIN32_FEATURE_AVAILABLE,
 )
 from app.data_models import ImageFingerprint
 from app.image_io import get_image_metadata, load_image
-
-if PYWIN32_FEATURE_AVAILABLE:
-    import win32api
-    import win32con
-    import win32process
 
 if TYPE_CHECKING:
     pass
@@ -77,7 +70,6 @@ class InferenceEngine:
         requested_provider_id = device
         available_providers = ort.get_available_providers()
 
-        # Safety Check: If the requested provider isn't available, log a warning and fall back to CPU.
         if requested_provider_id not in available_providers:
             app_logger.warning(
                 f"Provider '{requested_provider_id}' was requested but is not available. "
@@ -89,23 +81,18 @@ class InferenceEngine:
 
         providers = [provider_id]
 
-        # Apply provider-specific options
         if provider_id == "DmlExecutionProvider" and self.is_fp16 and hasattr(opts, "enable_float16_for_dml"):
             opts.enable_float16_for_dml = True
 
         if provider_id == "WebGPUExecutionProvider":
             app_logger.info("Attempting to use experimental WebGPUExecutionProvider.")
 
-        # Apply CPU-specific threading optimizations only if CPU is the chosen provider
         if provider_id == "CPUExecutionProvider":
             opts.inter_op_num_threads = 1
             opts.intra_op_num_threads = threads_per_worker
         else:
-            # When using a GPU provider, also add CPU as a secondary option.
-            # ONNX Runtime will intelligently place ops (like Shape) on the CPU for better performance.
             providers.append("CPUExecutionProvider")
 
-        # Session creation will raise an exception if the chosen provider fails to initialize.
         onnx_file = model_dir / "visual.onnx"
         self.visual_session = ort.InferenceSession(str(onnx_file), opts, providers=providers)
 
@@ -113,7 +100,6 @@ class InferenceEngine:
             self.text_session = ort.InferenceSession(str(text_model_path), opts, providers=providers)
             self.text_input_names = {i.name for i in self.text_session.get_inputs()}
 
-        # Log the provider that was actually used by the session for clarity
         final_provider = self.visual_session.get_providers()[0]
         log_message = f"Worker PID {os.getpid()}: ONNX models loaded. Requested: '{requested_provider_id}', Used: '{final_provider}'"
         thread_info = f" ({threads_per_worker} threads/worker)" if "CPU" in final_provider else ""
@@ -143,20 +129,10 @@ class InferenceEngine:
         return normalize_vectors_numpy(outputs[0]).flatten()
 
 
-def _init_worker_process(config: dict):
-    """Lowers the process priority on Windows if requested."""
-    if config.get("low_priority") and PYWIN32_FEATURE_AVAILABLE:
-        with contextlib.suppress(Exception):
-            pid = win32api.GetCurrentProcessId()
-            handle = win32api.OpenProcess(win32con.PROCESS_ALL_ACCESS, True, pid)
-            win32process.SetPriorityClass(handle, win32process.BELOW_NORMAL_PRIORITY_CLASS)
-            win32api.CloseHandle(handle)
-
-
 def init_worker(config: dict):
     """Initializes a full worker, creating the global inference engine."""
     global g_inference_engine
-    _init_worker_process(config)
+    # The call to _init_worker_process(config) has been removed.
     try:
         threads = config.get("threads_per_worker", 2)
         g_inference_engine = InferenceEngine(
@@ -171,7 +147,7 @@ def init_worker(config: dict):
 def init_preprocessor_worker(config: dict, queue: "multiprocessing.Queue"):
     """Initializes a CPU-only preprocessing worker."""
     global g_preprocessor, g_free_buffers_q
-    _init_worker_process(config)
+    # The call to _init_worker_process(config) has been removed.
     g_free_buffers_q = queue
     try:
         from transformers import AutoProcessor

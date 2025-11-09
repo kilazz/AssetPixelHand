@@ -23,7 +23,6 @@ from PySide6.QtWidgets import (
 from app.cache import thumbnail_cache
 from app.constants import (
     DEEP_LEARNING_AVAILABLE,
-    PYWIN32_FEATURE_AVAILABLE,
     SCRIPT_DIR,
     VISUALS_DIR,
 )
@@ -162,8 +161,6 @@ class App(QMainWindow):
         self.main_splitter.setSizes([int(self.width() * 0.25), int(self.width() * 0.75)])
         self.results_viewer_splitter.setSizes([int(self.width() * 0.4), int(self.width() * 0.35)])
 
-        self._update_low_priority_option(self.performance_panel.device_combo.currentData() == "cpu")
-
     def _create_menu_bar(self):
         self.menuBar().setVisible(False)
 
@@ -206,8 +203,6 @@ class App(QMainWindow):
         APP_SIGNAL_BUS.log_message.connect(self.log_panel.log_message)
         APP_SIGNAL_BUS.lock_ui.connect(lambda: self.set_ui_scan_state(is_scanning=True))
         APP_SIGNAL_BUS.unlock_ui.connect(lambda: self.set_ui_scan_state(is_scanning=False))
-
-        # CHANGE: Connect the new status bar signal.
         APP_SIGNAL_BUS.status_message_updated.connect(self.statusBar().showMessage)
 
         # Connect UI Panels to this window or each other (Mediator role)
@@ -216,8 +211,6 @@ class App(QMainWindow):
         self.options_panel.clear_models_cache_requested.connect(self._clear_models_cache)
         self.options_panel.clear_all_data_requested.connect(self._clear_app_data)
         self.options_panel.scan_context_changed.connect(self.performance_panel.update_precision_presets)
-
-        self.performance_panel.device_changed.connect(self._update_low_priority_option)
 
         self.results_panel.results_view.selectionModel().selectionChanged.connect(self._on_results_selection_changed)
         self.results_panel.visible_results_changed.connect(self.viewer_panel.display_results)
@@ -465,10 +458,6 @@ class App(QMainWindow):
                 QMessageBox.information(self, "Success", "All application data cleared.")
             else:
                 QMessageBox.critical(self, "Error", "Failed to clear all app data.")
-
-    @Slot(bool)
-    def _update_low_priority_option(self, is_cpu: bool):
-        self.scan_options_panel.low_priority_check.setEnabled(is_cpu and PYWIN32_FEATURE_AVAILABLE)
 
     def closeEvent(self, event):
         self.settings_manager.save()

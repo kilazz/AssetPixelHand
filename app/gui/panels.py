@@ -382,8 +382,6 @@ class ScanOptionsPanel(QGroupBox):
             "Stores caches and vector index in RAM. Fastest, but not persistent across runs."
         )
 
-        self.low_priority_check = QCheckBox("Run scan at lower priority")
-
         visuals_layout = QHBoxLayout()
         self.save_visuals_check = QCheckBox("Save visuals")
         self.visuals_tonemap_check = QCheckBox("TM HDR")
@@ -409,7 +407,6 @@ class ScanOptionsPanel(QGroupBox):
         visuals_layout.addWidget(self.open_visuals_folder_button)
 
         layout.addWidget(self.lancedb_in_memory_check)
-        layout.addWidget(self.low_priority_check)
         layout.addLayout(visuals_layout)
 
     def _connect_signals(self):
@@ -419,7 +416,6 @@ class ScanOptionsPanel(QGroupBox):
         self.perceptual_duplicates_check.toggled.connect(self.settings_manager.set_find_perceptual)
         self.phash_threshold_spin.valueChanged.connect(self.settings_manager.set_phash_threshold)
         self.lancedb_in_memory_check.toggled.connect(self.settings_manager.set_lancedb_in_memory)
-        self.low_priority_check.toggled.connect(self.settings_manager.set_low_priority)
         self.save_visuals_check.toggled.connect(self.settings_manager.set_save_visuals)
         self.visuals_tonemap_check.toggled.connect(self.settings_manager.set_visuals_tonemap)
         self.max_visuals_entry.textChanged.connect(self.settings_manager.set_max_visuals)
@@ -482,7 +478,6 @@ class ScanOptionsPanel(QGroupBox):
         self._update_hashing_options_state()
 
         self.lancedb_in_memory_check.setChecked(s.lancedb_in_memory)
-        self.low_priority_check.setChecked(s.performance.low_priority)
 
         self.save_visuals_check.setChecked(s.visuals.save)
         self.visuals_tonemap_check.setChecked(s.visuals.tonemap_enabled)
@@ -537,7 +532,6 @@ class PerformancePanel(QGroupBox):
         self.device_combo.clear()
 
         if not DEEP_LEARNING_AVAILABLE:
-            # If ONNX is unavailable, add CPU as a fallback
             self.device_combo.addItem("CPUExecutionProvider", "CPUExecutionProvider")
             self.log_message.emit("Deep learning libraries not found, GPU support disabled.", "warning")
             return
@@ -545,14 +539,12 @@ class PerformancePanel(QGroupBox):
         try:
             available_providers = onnxruntime.get_available_providers()
 
-            # Add CPU provider first if it exists, as it's the most common baseline
             if "CPUExecutionProvider" in available_providers:
                 self.device_combo.addItem("CPUExecutionProvider", "CPUExecutionProvider")
 
-            # Add all other providers using their technical names
             for provider_id in available_providers:
                 if provider_id == "CPUExecutionProvider":
-                    continue  # Skip, as it's already added
+                    continue
                 self.device_combo.addItem(provider_id, provider_id)
 
             self.log_message.emit(f"Detected providers: {available_providers}", "info")

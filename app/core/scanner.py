@@ -5,7 +5,6 @@ for controlling the scanner's lifecycle via a dedicated thread.
 
 import hashlib
 import logging
-import os
 import shutil
 import threading
 import time
@@ -13,7 +12,7 @@ import time
 import pyarrow as pa
 from PySide6.QtCore import QObject, QThread, Slot
 
-from app.constants import CACHE_DIR, DB_TABLE_NAME, DUCKDB_AVAILABLE, LANCEDB_AVAILABLE, PYWIN32_FEATURE_AVAILABLE
+from app.constants import CACHE_DIR, DB_TABLE_NAME, DUCKDB_AVAILABLE, LANCEDB_AVAILABLE
 from app.core.strategies import FindDuplicatesStrategy, SearchStrategy
 from app.data_models import ScanConfig, ScanMode, ScanState
 from app.services.signal_bus import APP_SIGNAL_BUS
@@ -22,10 +21,6 @@ if LANCEDB_AVAILABLE:
     import lancedb
 if DUCKDB_AVAILABLE:
     pass
-if PYWIN32_FEATURE_AVAILABLE:
-    import win32api
-    import win32con
-    import win32process
 
 app_logger = logging.getLogger("AssetPixelHand.scanner")
 
@@ -48,7 +43,10 @@ class ScannerCore(QObject):
         self.scan_has_finished = False
         start_time = time.time()
         self.all_skipped_files.clear()
-        self._set_process_priority()
+
+        # The call to _set_process_priority() has been removed here.
+        # If you still want niceness on Linux/macOS, you could add:
+        # if hasattr(os, "nice"): os.nice(10)
 
         try:
             setup_caches(self.config)
@@ -80,22 +78,6 @@ class ScannerCore(QObject):
             app_logger.info("Scan process finished.")
             if stop_event.is_set() and not self.scan_has_finished:
                 self._finalize_scan(None, 0, None, total_duration, self.all_skipped_files)
-
-    def _set_process_priority(self):
-        if not self.config.perf.run_at_low_priority:
-            return
-        try:
-            if PYWIN32_FEATURE_AVAILABLE:
-                pid = win32api.GetCurrentProcessId()
-                handle = win32api.OpenProcess(win32con.PROCESS_ALL_ACCESS, True, pid)
-                win32process.SetPriorityClass(handle, win32process.BELOW_NORMAL_PRIORITY_CLASS)
-                win32api.CloseHandle(handle)
-                APP_SIGNAL_BUS.log_message.emit("Process priority lowered.", "info")
-            elif hasattr(os, "nice"):
-                os.nice(10)
-                APP_SIGNAL_BUS.log_message.emit("Process priority lowered via nice().", "info")
-        except Exception as e:
-            APP_SIGNAL_BUS.log_message.emit(f"Could not set process priority: {e}", "warning")
 
     def _setup_lancedb(self) -> bool:
         try:

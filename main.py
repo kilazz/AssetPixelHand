@@ -9,18 +9,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 # --- SCRIPT PATH SETUP ---
+# Ensure the application's root directory is in the Python path.
 try:
     script_dir = Path(__file__).resolve().parent
 except NameError:
+    # Fallback for environments where __file__ is not defined (e.g., frozen executables)
     script_dir = Path(sys.executable).resolve().parent
 sys.path.insert(0, str(script_dir))
 
+# Enable OpenEXR support for relevant libraries if available.
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
-
-if sys.platform == "win32":
-    import pythoncom
-
-    pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
 
 from PySide6.QtWidgets import QApplication
 
@@ -42,6 +40,8 @@ def log_global_crash(exc_type, exc_value, exc_traceback):
         log_file = CRASH_LOG_DIR / f"crash_report_{datetime.now(UTC).strftime('%Y-%m-%d_%H-%M-%S')}.txt"
         with open(log_file, "w", encoding="utf-8") as f:
             f.write(error_message)
+
+        # If the Qt Application instance exists, show a message box.
         if QApplication.instance():
             from PySide6.QtWidgets import QMessageBox
 
@@ -51,6 +51,7 @@ def log_global_crash(exc_type, exc_value, exc_traceback):
                 f"An unhandled error occurred.\nDetails have been saved to:\n{log_file.resolve()}",
             )
     except Exception as e:
+        # Fallback to printing to stderr if logging or dialog fails
         print(f"Failed to save crash report or show dialog: {e}", file=sys.stderr)
     finally:
         sys.exit(1)
@@ -59,6 +60,7 @@ def log_global_crash(exc_type, exc_value, exc_traceback):
 def run_application():
     """Initializes and runs the Qt application."""
 
+    # Set the global exception hook to our custom logger.
     sys.excepthook = log_global_crash
 
     app = QApplication(sys.argv)
@@ -70,7 +72,6 @@ def run_application():
     app_logger.info("Starting AssetPixelHand application...")
 
     main_window = App()
-
     main_window.show()
     app_logger.info("Main window displayed.")
 
@@ -78,14 +79,19 @@ def run_application():
 
 
 if __name__ == "__main__":
+    # Required for creating frozen executables with multiprocessing.
     multiprocessing.freeze_support()
 
+    # Set the start method to "spawn" for better cross-platform stability,
+    # especially with GUI libraries and ONNX Runtime.
     if multiprocessing.get_start_method(allow_none=True) != "spawn":
         multiprocessing.set_start_method("spawn", force=True)
 
+    # Enable faulthandler to get a traceback on hard crashes (e.g., C-level segfaults).
     faulthandler.enable()
 
     try:
         run_application()
     except Exception:
+        # This is a final catch-all, but the sys.excepthook should handle most cases.
         log_global_crash(*sys.exc_info())

@@ -12,8 +12,10 @@ from pathlib import Path
 
 # --- Fallback Path Setup for standalone execution ---
 try:
+    # Attempt to import from the app structure if possible
     from app.constants import APP_DATA_DIR
 except ImportError:
+    # If run as a standalone script, determine paths relative to this file.
     _base_dir = Path(__file__).resolve().parent.parent
     APP_DATA_DIR = _base_dir / "app_data"
 
@@ -33,7 +35,7 @@ def print_status(message: str, is_ok: bool, details: str = ""):
     status = "[ OK ]" if is_ok else "[FAIL]"
     print(f"{status:6} {message}")
     if details:
-        print(f"-> {details}")
+        print(f" -> {details}")
 
 
 def check_python_version() -> bool:
@@ -41,8 +43,8 @@ def check_python_version() -> bool:
     print_header("1. Python Version Check")
     REQUIRED_MAJOR, REQUIRED_MINOR = 3, 13
     current_version = sys.version_info
-    print(f"- Found Python version: {platform.python_version()}")
-    print(f"- Python executable: {sys.executable}")
+    print(f" - Found Python version: {platform.python_version()}")
+    print(f" - Python executable: {sys.executable}")
     is_ok = current_version >= (REQUIRED_MAJOR, REQUIRED_MINOR)
     print_status(f"Python {REQUIRED_MAJOR}.{REQUIRED_MINOR} or newer is required.", is_ok)
     if not is_ok:
@@ -96,7 +98,6 @@ def check_library_imports() -> bool:
             "simple_ocio": "simple-ocio",
         },
         "Performance (Optional)": {"zstandard": "zstandard"},
-        "Windows Features (Optional)": {"win32api": "pywin32"},
     }
 
     overall_ok = True
@@ -104,9 +105,6 @@ def check_library_imports() -> bool:
         print(f"\n--- Checking {category} ---")
         is_optional = "Optional" in category
         for import_name, package_name in libs.items():
-            if "win32api" in import_name and sys.platform != "win32":
-                print_status(f"Skipping '{package_name}' (Windows only)", True)
-                continue
             try:
                 __import__(import_name)
                 print_status(f"Found '{package_name}'", True)
@@ -133,7 +131,7 @@ def check_onnx_backend() -> bool:
         import onnxruntime as ort
 
         available_providers = ort.get_available_providers()
-        print(f"- Available providers: {available_providers}")
+        print(f"       - Available providers: {available_providers}")
 
         is_cpu_ok = "CPUExecutionProvider" in available_providers
         print_status("CPU provider is available (required)", is_cpu_ok)
@@ -179,7 +177,7 @@ def check_onnx_model_compatibility() -> bool:
         return False
 
     DIAG_TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"- Using temporary directory: {DIAG_TEMP_DIR.resolve()}")
+    print(f" - Using temporary directory: {DIAG_TEMP_DIR.resolve()}")
 
     test_configs = {
         "FP32 (Required)": {"type": TensorProto.FLOAT, "numpy_type": np.float32},

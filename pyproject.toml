@@ -15,17 +15,12 @@ dependencies = [
     # Core Application & GUI
     "PySide6>=6.10.0",
     "send2trash>=1.8.3",
-    "pywin32>=311; sys_platform == 'win32'",
     # AI & Machine Learning
     "torch>=2.9.0",
     "transformers>=4.57.1",
     "sentencepiece>=0.2.1",
     "huggingface_hub[hf_xet]>=0.36.0", #transformers
     "onnx>=1.19.1",
-    #"onnxruntime>=1.23.2",
-    #"onnxruntime-gpu>=1.23.2",
-    #"onnxruntime-directml>=1.23.0",
-    "onnxruntime-webgpu>=1.24.0.dev20251031004",
     # Databases
     "lancedb>=0.25.2",
     "duckdb>=1.4.1",
@@ -47,6 +42,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# ONNX Runtime
+cpu      = ["onnxruntime>=1.23.2"]
+cuda     = ["onnxruntime-gpu>=1.23.2"]
+directml = ["onnxruntime-directml>=1.23.0"]
+webgpu   = ["onnxruntime-webgpu>=1.24.0.dev20251031004"]
+
 dev = [
     "ruff",
     "snakeviz",
