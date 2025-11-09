@@ -56,7 +56,7 @@ PILLOW_AVAILABLE = import_library("PIL", "Pillow")
 OIIO_AVAILABLE = import_library("OpenImageIO", "OpenImageIO")
 PYVIPS_AVAILABLE = import_library("pyvips", "pyvips")
 DIRECTXTEX_AVAILABLE = import_library("directxtex_decoder", "DirectXTex")
-TABULATE_AVAILABLE = import_library("tabulate", "tabulate")
+TABULATE_AVAILABLE = import_library("tabulate2", "tabulate2")
 print("-" * 40 + "\n")
 
 # Re-import for use in functions
@@ -71,27 +71,27 @@ if PYVIPS_AVAILABLE:
 if DIRECTXTEX_AVAILABLE:
     import directxtex_decoder
 if TABULATE_AVAILABLE:
-    from tabulate import tabulate
+    from tabulate2 import tabulate
 
 try:
     from app.constants import ALL_SUPPORTED_EXTENSIONS
 except ImportError:
     print(colorize("Warning: Could not import from 'app.constants'. Using fallback extension list.", Colors.YELLOW))
     ALL_SUPPORTED_EXTENSIONS = {
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".tga",
+        ".avif",
+        ".bmp",
         ".dds",
-        ".tif",
-        ".tiff",
         ".exr",
         ".hdr",
-        ".bmp",
-        ".webp",
-        ".psd",
-        ".avif",
         ".heic",
+        ".jpeg",
+        ".jpg",
+        ".png",
+        ".psd",
+        ".tga",
+        ".tif",
+        ".tiff",
+        ".webp",
     }
 
 
@@ -161,7 +161,7 @@ def main():
     args = parser.parse_args()
 
     if not TABULATE_AVAILABLE:
-        print(colorize("\nError: 'tabulate' is not installed. Please run: pip install tabulate", Colors.RED))
+        print(colorize("\nError: 'tabulate2' is not installed. Please run: pip install tabulate2", Colors.RED))
         sys.exit(1)
 
     image_folder = Path(args.folder)
