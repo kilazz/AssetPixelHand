@@ -277,17 +277,45 @@ class OptionsPanel(QGroupBox):
         self._update_scan_context()
 
     def _browse_for_folder(self):
-        path = QFileDialog.getExistingDirectory(self, "Select Folder", self.folder_path_entry.text())
+        """Opens a folder selection dialog with a fallback to the non-native version."""
+        path = ""
+        try:
+            # Attempt 1: Use the standard native Windows dialog
+            app_logger.debug("Attempting to open native folder dialog...")
+            path = QFileDialog.getExistingDirectory(self, "Select Folder", self.folder_path_entry.text())
+        except Exception as e:
+            # Attempt 2: If the native dialog fails (e.g., due to MS Store Python), use Qt's built-in dialog.
+            app_logger.warning(f"Native folder dialog failed: {e}. Falling back to non-native dialog.")
+            path = QFileDialog.getExistingDirectory(
+                self, "Select Folder", self.folder_path_entry.text(), options=QFileDialog.Option.DontUseNativeDialog
+            )
+
         if path:
             self.folder_path_entry.setText(path)
 
     def _browse_for_sample(self):
-        path_str, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Sample Image",
-            self.folder_path_entry.text(),
-            f"Images ({' '.join(['*' + e for e in ALL_SUPPORTED_EXTENSIONS])})",
-        )
+        """Opens a file selection dialog with a fallback to the non-native version."""
+        path_str, _ = "", ""
+        try:
+            # Attempt 1: Use the standard native Windows dialog
+            app_logger.debug("Attempting to open native file dialog...")
+            path_str, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Sample Image",
+                self.folder_path_entry.text(),
+                f"Images ({' '.join(['*' + e for e in ALL_SUPPORTED_EXTENSIONS])})",
+            )
+        except Exception as e:
+            # Attempt 2: Fallback to Qt's built-in dialog.
+            app_logger.warning(f"Native file dialog failed: {e}. Falling back to non-native dialog.")
+            path_str, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Sample Image",
+                self.folder_path_entry.text(),
+                f"Images ({' '.join(['*' + e for e in ALL_SUPPORTED_EXTENSIONS])})",
+                options=QFileDialog.Option.DontUseNativeDialog,
+            )
+
         if path_str:
             self._sample_path = Path(path_str)
             self.search_entry.clear()

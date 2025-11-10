@@ -1,8 +1,9 @@
 // =======================================================================================
 //  decoder.cpp - High-Performance C++ Python Module for DDS File Decoding
 // =======================================================================================
-// Provides Python bindings for the DirectXTex library to decode a wide variety of
-// DDS formats, including compressed, HDR, and legacy console variants (Xbox360, CryEngine).
+// Provides Python bindings for the DirectXTex library. This version relies on the
+// modern capabilities of the library to handle complex, legacy, and console formats,
+// removing the need for manual fallback logic.
 // =======================================================================================
 
 #include <pybind11/pybind11.h>
@@ -17,7 +18,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cmath>
-#include <limits> // Required for std::numeric_limits
+#include <limits>
 
 #define NOMINMAX
 #include <Windows.h>
@@ -27,107 +28,8 @@
 namespace py = pybind11;
 using namespace DirectX;
 
-// =======================================================================================
-// Constants and Macros
-// =======================================================================================
-
-// Guard against redefinition from Windows headers
-#ifndef MAKEFOURCC
-#define MAKEFOURCC(ch0, ch1, ch2, ch3) \
-    ((uint32_t)(uint8_t)(ch0) | ((uint32_t)(uint8_t)(ch1) << 8) | \
-    ((uint32_t)(uint8_t)(ch2) << 16) | ((uint32_t)(uint8_t)(ch3) << 24))
-#endif
-
-// DDS pixel format flags
-constexpr uint32_t DDPF_ALPHAPIXELS = 0x00000001;
-constexpr uint32_t DDPF_ALPHA       = 0x00000002;
-constexpr uint32_t DDPF_FOURCC      = 0x00000004;
-constexpr uint32_t DDPF_RGB         = 0x00000040;
-constexpr uint32_t DDPF_LUMINANCE   = 0x00020000;
-
-// DDS header flags
-constexpr uint32_t DDSD_CAPS        = 0x00000001;
-constexpr uint32_t DDSD_HEIGHT      = 0x00000002;
-constexpr uint32_t DDSD_WIDTH       = 0x00000004;
-constexpr uint32_t DDSD_PITCH       = 0x00000008;
-constexpr uint32_t DDSD_PIXELFORMAT = 0x00001000;
-constexpr uint32_t DDSD_MIPMAPCOUNT = 0x00020000;
-constexpr uint32_t DDSD_LINEARSIZE  = 0x00080000;
-constexpr uint32_t DDSD_DEPTH       = 0x00800000;
-
-// DDS caps2 flags
-constexpr uint32_t DDSCAPS2_CUBEMAP = 0x00000200;
-constexpr uint32_t DDSCAPS2_VOLUME  = 0x00200000;
-
-// Standard FourCC codes
-constexpr uint32_t FOURCC_DXT1 = MAKEFOURCC('D', 'X', 'T', '1');
-constexpr uint32_t FOURCC_DXT2 = MAKEFOURCC('D', 'X', 'T', '2');
-constexpr uint32_t FOURCC_DXT3 = MAKEFOURCC('D', 'X', 'T', '3');
-constexpr uint32_t FOURCC_DXT4 = MAKEFOURCC('D', 'X', 'T', '4');
-constexpr uint32_t FOURCC_DXT5 = MAKEFOURCC('D', 'X', 'T', '5');
-constexpr uint32_t FOURCC_DX10 = MAKEFOURCC('D', 'X', '1', '0');
-constexpr uint32_t FOURCC_ATI1 = MAKEFOURCC('A', 'T', 'I', '1');
-constexpr uint32_t FOURCC_BC4U = MAKEFOURCC('B', 'C', '4', 'U');
-constexpr uint32_t FOURCC_BC4S = MAKEFOURCC('B', 'C', '4', 'S');
-constexpr uint32_t FOURCC_ATI2 = MAKEFOURCC('A', 'T', 'I', '2');
-constexpr uint32_t FOURCC_BC5U = MAKEFOURCC('B', 'C', '5', 'U');
-constexpr uint32_t FOURCC_BC5S = MAKEFOURCC('B', 'C', '5', 'S');
-
-// Xbox360 FourCC codes
-constexpr uint32_t FOURCC_DXT1_XBOX = MAKEFOURCC('1', 'T', 'X', 'D');
-constexpr uint32_t FOURCC_DXT3_XBOX = MAKEFOURCC('3', 'T', 'X', 'D');
-constexpr uint32_t FOURCC_DXT5_XBOX = MAKEFOURCC('5', 'T', 'X', 'D');
-constexpr uint32_t FOURCC_DX10_XBOX = MAKEFOURCC('0', '1', 'X', 'D');
-
-// CryEngine marker
-constexpr uint32_t FOURCC_CRYF = MAKEFOURCC('C', 'R', 'Y', 'F');
-
-// HRESULT codes
-constexpr HRESULT CUSTOM_ERROR_NOT_SUPPORTED = static_cast<HRESULT>(0x80070032);
-constexpr HRESULT CUSTOM_ERROR_INVALID_DATA  = static_cast<HRESULT>(0x80070026);
+// HRESULT codes - kept for COM initialization
 constexpr HRESULT CUSTOM_RPC_E_CHANGED_MODE  = static_cast<HRESULT>(0x80010106);
-
-// =======================================================================================
-// DDS Structures
-// =======================================================================================
-
-#pragma pack(push, 1)
-struct DDS_PIXELFORMAT {
-    uint32_t dwSize;
-    uint32_t dwFlags;
-    uint32_t dwFourCC;
-    uint32_t dwRGBBitCount;
-    uint32_t dwRBitMask;
-    uint32_t dwGBitMask;
-    uint32_t dwBBitMask;
-    uint32_t dwABitMask;
-};
-
-struct DDS_HEADER {
-    uint32_t dwSize;
-    uint32_t dwFlags;
-    uint32_t dwHeight;
-    uint32_t dwWidth;
-    uint32_t dwPitchOrLinearSize;
-    uint32_t dwDepth;
-    uint32_t dwMipMapCount;
-    uint32_t dwReserved1[11];
-    DDS_PIXELFORMAT ddspf;
-    uint32_t dwCaps;
-    uint32_t dwCaps2;
-    uint32_t dwCaps3;
-    uint32_t dwCaps4;
-    uint32_t dwReserved2;
-};
-
-struct DDS_HEADER_DXT10 {
-    DXGI_FORMAT dxgiFormat;
-    uint32_t resourceDimension;
-    uint32_t miscFlag;
-    uint32_t arraySize;
-    uint32_t miscFlags2;
-};
-#pragma pack(pop)
 
 // =======================================================================================
 // Utility Functions
@@ -135,29 +37,6 @@ struct DDS_HEADER_DXT10 {
 
 // Forward declaration
 std::string DXGIFormatToString(DXGI_FORMAT format);
-
-template<typename T>
-T SwapBytes(T value) {
-    static_assert(std::is_integral<T>::value, "SwapBytes can only be used with integral types");
-    T result{};
-    auto* src = reinterpret_cast<uint8_t*>(&value);
-    auto* dst = reinterpret_cast<uint8_t*>(&result);
-    for (size_t i = 0; i < sizeof(T); ++i) {
-        dst[i] = src[sizeof(T) - 1 - i];
-    }
-    return result;
-}
-
-void EndianSwapBuffer(uint8_t* data, size_t dataSize, size_t elementSize) {
-    if (elementSize <= 1) {
-        return;
-    }
-    for (size_t i = 0; i + elementSize <= dataSize; i += elementSize) {
-        for (size_t j = 0; j < elementSize / 2; ++j) {
-            std::swap(data[i + j], data[i + elementSize - 1 - j]);
-        }
-    }
-}
 
 class CoInitializer {
 public:
@@ -238,178 +117,6 @@ float half_to_float(uint16_t half) {
     float result;
     memcpy(&result, &result_bits, sizeof(result));
     return result;
-}
-
-// =======================================================================================
-// Xbox 360 & CryEngine Specific Logic
-// =======================================================================================
-
-bool IsXbox360Format(uint32_t fourCC) {
-    switch (fourCC) {
-        case FOURCC_DXT1_XBOX:
-        case FOURCC_DXT3_XBOX:
-        case FOURCC_DXT5_XBOX:
-        case FOURCC_DX10_XBOX:
-        case MAKEFOURCC('1', 'I', 'T', 'A'):
-        case MAKEFOURCC('2', 'I', 'T', 'A'):
-        case MAKEFOURCC('U', '4', 'C', 'B'):
-        case MAKEFOURCC('U', '5', 'C', 'B'):
-            return true;
-        default:
-            return false;
-    }
-}
-
-uint32_t Xbox360ToStandardFourCC(uint32_t fourCC) {
-    switch (fourCC) {
-        case FOURCC_DXT1_XBOX: return FOURCC_DXT1;
-        case FOURCC_DXT3_XBOX: return FOURCC_DXT3;
-        case FOURCC_DXT5_XBOX: return FOURCC_DXT5;
-        case FOURCC_DX10_XBOX: return FOURCC_DX10;
-        case MAKEFOURCC('1', 'I', 'T', 'A'): return FOURCC_ATI1;
-        case MAKEFOURCC('2', 'I', 'T', 'A'): return FOURCC_ATI2;
-        case MAKEFOURCC('U', '4', 'C', 'B'): return FOURCC_BC4U;
-        case MAKEFOURCC('U', '5', 'C', 'B'): return FOURCC_BC5U;
-        default: return fourCC;
-    }
-}
-
-void PerformXboxEndianSwap(uint8_t* data, size_t dataSize, DXGI_FORMAT format) {
-    if (!data || dataSize == 0) return;
-
-    if (DirectX::IsCompressed(format)) {
-        size_t blockSize = (format == DXGI_FORMAT_BC1_UNORM || format == DXGI_FORMAT_BC4_UNORM) ? 8 : 16;
-        for (size_t i = 0; i + blockSize <= dataSize; i += blockSize) {
-            auto* block16 = reinterpret_cast<uint16_t*>(data + i);
-            switch (format) {
-                case DXGI_FORMAT_BC1_UNORM:
-                case DXGI_FORMAT_BC4_UNORM:
-                    block16[0] = SwapBytes(block16[0]);
-                    block16[1] = SwapBytes(block16[1]);
-                    break;
-                case DXGI_FORMAT_BC2_UNORM:
-                    block16[4] = SwapBytes(block16[4]);
-                    block16[5] = SwapBytes(block16[5]);
-                    break;
-                case DXGI_FORMAT_BC3_UNORM:
-                    block16[4] = SwapBytes(block16[4]);
-                    block16[5] = SwapBytes(block16[5]);
-                    block16[1] = SwapBytes(block16[1]);
-                    block16[2] = SwapBytes(block16[2]);
-                    block16[3] = SwapBytes(block16[3]);
-                    break;
-                case DXGI_FORMAT_BC5_UNORM:
-                    block16[1] = SwapBytes(block16[1]);
-                    block16[2] = SwapBytes(block16[2]);
-                    block16[3] = SwapBytes(block16[3]);
-                    block16[5] = SwapBytes(block16[5]);
-                    block16[6] = SwapBytes(block16[6]);
-                    block16[7] = SwapBytes(block16[7]);
-                    break;
-                default:
-                    break;
-            }
-        }
-    } else {
-        size_t bpp = DirectX::BitsPerPixel(format);
-        if (bpp >= 16) {
-            EndianSwapBuffer(data, dataSize, bpp / 8);
-        }
-    }
-}
-
-void UnswizzleBlockLinear(const uint8_t* src, uint8_t* dst, uint32_t width, uint32_t height, uint32_t blockBytes, size_t srcSize, size_t dstSize) {
-    uint32_t blockWidth = (width + 3) / 4;
-    uint32_t blockHeight = (height + 3) / 4;
-    size_t requiredSize = static_cast<size_t>(blockWidth) * blockHeight * blockBytes;
-    if (srcSize < requiredSize || dstSize < requiredSize) {
-        throw std::runtime_error("Buffer too small for unswizzle operation.");
-    }
-
-    uint32_t logW = (blockWidth > 1) ? static_cast<uint32_t>(floor(log2(blockWidth - 1))) + 1 : 0;
-    uint32_t logH = (blockHeight > 1) ? static_cast<uint32_t>(floor(log2(blockHeight - 1))) + 1 : 0;
-    uint32_t min_log = std::min(logW, logH);
-
-    for (uint32_t y = 0; y < blockHeight; ++y) {
-        for (uint32_t x = 0; x < blockWidth; ++x) {
-            uint32_t swizzledIndex = 0;
-            for (uint32_t i = 0; i < min_log; ++i) {
-                swizzledIndex |= ((x >> i) & 1) << (2 * i);
-                swizzledIndex |= ((y >> i) & 1) << (2 * i + 1);
-            }
-
-            if (logW > logH) {
-                for (uint32_t i = min_log; i < logW; ++i) { swizzledIndex |= ((x >> i) & 1) << (i + min_log); }
-            } else {
-                for (uint32_t i = min_log; i < logH; ++i) { swizzledIndex |= ((y >> i) & 1) << (i + min_log); }
-            }
-
-            size_t srcOffset = static_cast<size_t>(swizzledIndex) * blockBytes;
-            size_t dstOffset = (static_cast<size_t>(y) * blockWidth + x) * blockBytes;
-
-            if (srcOffset + blockBytes <= srcSize && dstOffset + blockBytes <= dstSize) {
-                memcpy(dst + dstOffset, src + srcOffset, blockBytes);
-            }
-        }
-    }
-}
-
-// =======================================================================================
-// DDS Header Parsing
-// =======================================================================================
-
-DXGI_FORMAT GetDXGIFormatFromHeader(const DDS_HEADER& header, const uint8_t* file_end, bool isXbox360) {
-    if (header.ddspf.dwSize != sizeof(DDS_PIXELFORMAT)) return DXGI_FORMAT_UNKNOWN;
-    const DDS_PIXELFORMAT& pf = header.ddspf;
-    if (pf.dwFlags & DDPF_FOURCC) {
-        uint32_t fourCC = isXbox360 ? Xbox360ToStandardFourCC(pf.dwFourCC) : pf.dwFourCC;
-        switch (fourCC) {
-            case FOURCC_DXT1: return DXGI_FORMAT_BC1_UNORM;
-            case FOURCC_DXT2: case FOURCC_DXT3: return DXGI_FORMAT_BC2_UNORM;
-            case FOURCC_DXT4: case FOURCC_DXT5: return DXGI_FORMAT_BC3_UNORM;
-            case FOURCC_ATI1: case FOURCC_BC4U: return DXGI_FORMAT_BC4_UNORM;
-            case FOURCC_BC4S: return DXGI_FORMAT_BC4_SNORM;
-            case FOURCC_ATI2: case FOURCC_BC5U: return DXGI_FORMAT_BC5_UNORM;
-            case FOURCC_BC5S: return DXGI_FORMAT_BC5_SNORM;
-            case FOURCC_DX10: {
-                const auto* ext = reinterpret_cast<const DDS_HEADER_DXT10*>(reinterpret_cast<const uint8_t*>(&header) + sizeof(DDS_HEADER));
-                if (reinterpret_cast<const uint8_t*>(ext) + sizeof(DDS_HEADER_DXT10) > file_end) {
-                    return DXGI_FORMAT_UNKNOWN;
-                }
-                return ext->dxgiFormat;
-            }
-            default: return static_cast<DXGI_FORMAT>(pf.dwFourCC);
-        }
-    }
-
-    if (pf.dwFlags & DDPF_RGB) {
-        switch (pf.dwRGBBitCount) {
-            case 32:
-                if (pf.dwRBitMask == 0x00ff0000 && pf.dwGBitMask == 0x0000ff00 && pf.dwBBitMask == 0x000000ff) return DXGI_FORMAT_R8G8B8A8_UNORM;
-                if (pf.dwRBitMask == 0x000000ff && pf.dwGBitMask == 0x0000ff00 && pf.dwBBitMask == 0x00ff0000) return DXGI_FORMAT_B8G8R8A8_UNORM;
-                break;
-            case 24:
-                if (pf.dwRBitMask == 0x00ff0000 && pf.dwGBitMask == 0x0000ff00 && pf.dwBBitMask == 0x000000ff) return DXGI_FORMAT_R8G8B8A8_UNORM;
-                break;
-            case 16:
-                if (pf.dwRBitMask == 0xf800 && pf.dwGBitMask == 0x07e0 && pf.dwBBitMask == 0x001f) return DXGI_FORMAT_B5G6R5_UNORM;
-                if (pf.dwRBitMask == 0x7c00 && pf.dwGBitMask == 0x03e0 && pf.dwBBitMask == 0x001f) return DXGI_FORMAT_B5G5R5A1_UNORM;
-                if (pf.dwRBitMask == 0x0f00 && pf.dwGBitMask == 0x00f0 && pf.dwBBitMask == 0x000f) return DXGI_FORMAT_B4G4R4A4_UNORM;
-                break;
-        }
-    }
-
-    if ((pf.dwFlags & DDPF_ALPHAPIXELS) && pf.dwRGBBitCount == 8) {
-        if (pf.dwRBitMask == 0 && pf.dwGBitMask == 0 && pf.dwBBitMask == 0 && pf.dwABitMask == 0xff) {
-            return DXGI_FORMAT_A8_UNORM;
-        }
-    }
-
-    if ((pf.dwFlags & DDPF_LUMINANCE) && pf.dwRGBBitCount == 8) {
-        return DXGI_FORMAT_R8_UNORM;
-    }
-
-    return DXGI_FORMAT_UNKNOWN;
 }
 
 // =======================================================================================
@@ -678,7 +385,8 @@ py::object CreateNumpyArrayFromImage(const DirectX::Image* image) {
 
 py::dict decode_dds(const py::bytes& dds_bytes, size_t mip_level = 0, py::ssize_t array_index = -1, bool force_rgba8 = false) {
     py::buffer_info info(py::buffer(dds_bytes).request());
-    if (info.size < sizeof(DDS_HEADER) + 4) {
+    // Basic validation
+    if (info.size < 4) {
         throw py::value_error("Input data too small for a DDS file");
     }
     if (memcmp(info.ptr, "DDS ", 4) != 0) {
@@ -695,86 +403,16 @@ py::dict decode_dds(const py::bytes& dds_bytes, size_t mip_level = 0, py::ssize_
     const auto* dds_data_ptr = static_cast<const uint8_t*>(info.ptr);
     const size_t dds_data_size = static_cast<size_t>(info.size);
     auto image = std::make_unique<ScratchImage>();
-    std::vector<uint8_t> persistent_buffer;
 
-    HRESULT hr = LoadFromDDSMemory(dds_data_ptr, dds_data_size, DDS_FLAGS_NONE, nullptr, *image);
+    // Use permissive flags to allow DirectXTex to handle legacy/console formats automatically.
+    DDS_FLAGS flags = DDS_FLAGS_PERMISSIVE | DDS_FLAGS_ALLOW_LARGE_FILES;
+    HRESULT hr = LoadFromDDSMemory(dds_data_ptr, dds_data_size, flags, nullptr, *image);
 
     if (FAILED(hr)) {
-        if (hr != CUSTOM_ERROR_NOT_SUPPORTED && hr != CUSTOM_ERROR_INVALID_DATA) {
-            py::gil_scoped_acquire gil_acquire;
-            throw std::runtime_error("DirectXTex failed to load DDS memory: " + HResultToString(hr));
-        }
-
-        const auto* header = reinterpret_cast<const DDS_HEADER*>(dds_data_ptr + 4);
-        const uint8_t* file_end = dds_data_ptr + dds_data_size;
-        if (header->dwSize != 124) {
-            py::gil_scoped_acquire gil_acquire;
-            throw std::runtime_error("Invalid DDS header size. Expected 124, got " + std::to_string(header->dwSize));
-        }
-
-        bool isXbox360 = IsXbox360Format(header->ddspf.dwFourCC);
-        DXGI_FORMAT manual_format = GetDXGIFormatFromHeader(*header, file_end, isXbox360);
-
-        if (isXbox360 && header->ddspf.dwFourCC == FOURCC_DX10_XBOX) {
-            const auto* ext = reinterpret_cast<const DDS_HEADER_DXT10*>(reinterpret_cast<const uint8_t*>(header) + sizeof(DDS_HEADER));
-            if (reinterpret_cast<const uint8_t*>(ext) + sizeof(DDS_HEADER_DXT10) <= file_end) {
-                manual_format = static_cast<DXGI_FORMAT>(SwapBytes(static_cast<uint32_t>(ext->dxgiFormat)));
-            }
-        }
-        if (manual_format == DXGI_FORMAT_UNKNOWN) {
-            py::gil_scoped_acquire gil_acquire;
-            throw std::runtime_error("Could not determine DDS format from header in fallback mode");
-        }
-
-        const uint8_t* image_data_start = dds_data_ptr + 4 + sizeof(DDS_HEADER);
-        if (header->ddspf.dwFourCC == FOURCC_DX10 || header->ddspf.dwFourCC == FOURCC_DX10_XBOX) {
-            image_data_start += sizeof(DDS_HEADER_DXT10);
-        }
-        bool isCryEngine = (image_data_start + 8 <= file_end) && (*reinterpret_cast<const uint32_t*>(image_data_start) == FOURCC_CRYF);
-        if (isCryEngine) {
-            image_data_start += 8;
-        }
-        if (image_data_start >= file_end) {
-            py::gil_scoped_acquire gil_acquire;
-            throw std::runtime_error("Invalid DDS file structure: image data offset is out of bounds");
-        }
-
-        size_t row_pitch, slice_pitch;
-        hr = ComputePitch(manual_format, header->dwWidth, header->dwHeight, row_pitch, slice_pitch);
-        if (FAILED(hr)) {
-            py::gil_scoped_acquire gil_acquire;
-            throw std::runtime_error("ComputePitch failed: " + HResultToString(hr));
-        }
-        if (static_cast<size_t>(file_end - image_data_start) < slice_pitch) {
-            py::gil_scoped_acquire gil_acquire;
-            throw std::runtime_error("Insufficient pixel data in file for specified dimensions");
-        }
-
-        persistent_buffer.resize(slice_pitch);
-        uint8_t* mutable_pixel_data = persistent_buffer.data();
-
-        if (isCryEngine && DirectX::IsCompressed(manual_format)) {
-             try {
-                size_t blockBytes = (manual_format == DXGI_FORMAT_BC1_UNORM || manual_format == DXGI_FORMAT_BC4_UNORM) ? 8 : 16;
-                UnswizzleBlockLinear(image_data_start, mutable_pixel_data, header->dwWidth, header->dwHeight, blockBytes, file_end - image_data_start, slice_pitch);
-            } catch (const std::exception& e) {
-                py::gil_scoped_acquire gil_acquire;
-                throw std::runtime_error(std::string("Unswizzle failed: ") + e.what());
-            }
-        } else {
-            memcpy(mutable_pixel_data, image_data_start, slice_pitch);
-        }
-
-        if (isXbox360) {
-            PerformXboxEndianSwap(mutable_pixel_data, slice_pitch, manual_format);
-        }
-
-        Image manual_image{ header->dwWidth, header->dwHeight, manual_format, row_pitch, slice_pitch, mutable_pixel_data };
-        hr = image->InitializeFromImage(manual_image);
-        if (FAILED(hr)) {
-            py::gil_scoped_acquire gil_acquire;
-            throw std::runtime_error("Manual processing/initialization failed: " + HResultToString(hr));
-        }
+        // If the modern loader fails, there's no need for a manual fallback.
+        // The library is now robust enough to be the single source of truth.
+        py::gil_scoped_acquire gil_acquire;
+        throw std::runtime_error("DirectXTex failed to load DDS memory: " + HResultToString(hr));
     }
 
     const auto& metadata = image->GetMetadata();
@@ -884,7 +522,7 @@ py::dict decode_dds(const py::bytes& dds_bytes, size_t mip_level = 0, py::ssize_
 
 py::dict get_dds_metadata(const py::bytes& dds_bytes) {
     py::buffer_info info(py::buffer(dds_bytes).request());
-    if (info.size < sizeof(DDS_HEADER) + 4) {
+    if (info.size < 4) {
         throw py::value_error("Input data too small for DDS header.");
     }
     if (memcmp(info.ptr, "DDS ", 4) != 0) {
@@ -897,40 +535,13 @@ py::dict get_dds_metadata(const py::bytes& dds_bytes) {
     TexMetadata metadata;
     {
         py::gil_scoped_release release;
-        HRESULT hr = GetMetadataFromDDSMemory(dds_data_ptr, dds_data_size, DDS_FLAGS_NONE, metadata);
+        // Use permissive flags to allow DirectXTex to handle legacy/console formats automatically.
+        DDS_FLAGS flags = DDS_FLAGS_PERMISSIVE | DDS_FLAGS_ALLOW_LARGE_FILES;
+        HRESULT hr = GetMetadataFromDDSMemory(dds_data_ptr, dds_data_size, flags, metadata);
 
-        if (FAILED(hr) && (hr == CUSTOM_ERROR_NOT_SUPPORTED || hr == CUSTOM_ERROR_INVALID_DATA)) {
-            const auto* header = reinterpret_cast<const DDS_HEADER*>(dds_data_ptr + 4);
-            const uint8_t* file_end = dds_data_ptr + dds_data_size;
-            bool isXbox360 = IsXbox360Format(header->ddspf.dwFourCC);
-
-            metadata.width = header->dwWidth;
-            metadata.height = header->dwHeight;
-            metadata.depth = (header->dwFlags & DDSD_DEPTH) ? header->dwDepth : 1;
-            metadata.mipLevels = (header->dwFlags & DDSD_MIPMAPCOUNT) ? header->dwMipMapCount : 1;
-            metadata.arraySize = (header->dwCaps2 & DDSCAPS2_CUBEMAP) ? 6 : 1;
-            metadata.format = GetDXGIFormatFromHeader(*header, file_end, isXbox360);
-
-            if (isXbox360 && header->ddspf.dwFourCC == FOURCC_DX10_XBOX) {
-                const auto* ext = reinterpret_cast<const DDS_HEADER_DXT10*>(reinterpret_cast<const uint8_t*>(header) + sizeof(DDS_HEADER));
-                if (reinterpret_cast<const uint8_t*>(ext) + sizeof(DDS_HEADER_DXT10) <= file_end) {
-                    metadata.format = static_cast<DXGI_FORMAT>(SwapBytes(static_cast<uint32_t>(ext->dxgiFormat)));
-                }
-            }
-
-            metadata.miscFlags = (header->dwCaps2 & DDSCAPS2_CUBEMAP) ? TEX_MISC_TEXTURECUBE : 0;
-            metadata.miscFlags2 = 0;
-
-            if (header->dwCaps2 & DDSCAPS2_VOLUME) {
-                metadata.dimension = TEX_DIMENSION_TEXTURE3D;
-            } else if (header->dwHeight > 0) {
-                 metadata.dimension = TEX_DIMENSION_TEXTURE2D;
-            } else {
-                 metadata.dimension = TEX_DIMENSION_TEXTURE1D;
-            }
-        } else if (FAILED(hr)) {
+        if (FAILED(hr)) {
             py::gil_scoped_acquire acquire;
-            throw std::runtime_error("Failed to get metadata: " + HResultToString(hr));
+            throw std::runtime_error("Failed to get metadata from DDS memory: " + HResultToString(hr));
         }
     }
 
@@ -950,7 +561,6 @@ py::dict get_dds_metadata(const py::bytes& dds_bytes) {
 // =======================================================================================
 // DXGI Format to String Conversion
 // =======================================================================================
-
 std::string DXGIFormatToString(DXGI_FORMAT format) {
     switch (format) {
         case DXGI_FORMAT_UNKNOWN: return "UNKNOWN";
@@ -1067,7 +677,7 @@ std::string DXGIFormatToString(DXGI_FORMAT format) {
 // =======================================================================================
 
 PYBIND11_MODULE(directxtex_decoder, m) {
-    m.doc() = "High-performance DDS decoder with support for CryEngine, Xbox360, HDR, and complex structures (cubemaps, arrays).";
+    m.doc() = "High-performance DDS decoder using modern DirectXTex library. Supports legacy, console, and HDR formats.";
 
     m.def("decode_dds", &decode_dds,
           "Decodes a DDS file from bytes.",
@@ -1080,5 +690,5 @@ PYBIND11_MODULE(directxtex_decoder, m) {
           "Extracts DDS metadata without decoding pixel data.",
           py::arg("dds_bytes"));
 
-    m.attr("__version__") = "16.0.0";
+    m.attr("__version__") = "17.0.0";
 }

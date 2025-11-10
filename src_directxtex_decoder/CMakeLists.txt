@@ -23,7 +23,6 @@ add_subdirectory(external/DirectXTex)
 # Create the Python module "directxtex_decoder" from its source file.
 pybind11_add_module(directxtex_decoder directxtex_decoder/decoder.cpp)
 
-# --- CRITICAL FIX FOR THE PYTHON BUILD PROCESS ---
 # This block corrects the output path for the final compiled library (.pyd).
 # Without it, Visual Studio would create extra /Debug or /Release subfolders,
 # breaking the setuptools build process.

@@ -307,19 +307,43 @@ def _load_with_pyvips(path: str | Path, tonemap_mode: str) -> Image.Image | None
 def _load_with_directxtex(dds_bytes: bytes, tonemap_mode: str) -> Image.Image | None:
     decoded = directxtex_decoder.decode_dds(dds_bytes)
     numpy_array, dtype = decoded["data"], decoded["data"].dtype
+
+    pil_image = None
     if np.issubdtype(dtype, np.floating):
         if tonemap_mode != TonemapMode.NONE.value:
-            return Image.fromarray(_tonemap_float_array(numpy_array.astype(np.float32), tonemap_mode))
-        return Image.fromarray((np.clip(numpy_array, 0.0, 1.0) * 255).astype(np.uint8))
+            pil_image = Image.fromarray(_tonemap_float_array(numpy_array.astype(np.float32), tonemap_mode))
+        else:
+            pil_image = Image.fromarray((np.clip(numpy_array, 0.0, 1.0) * 255).astype(np.uint8))
     elif np.issubdtype(dtype, np.uint16):
-        return Image.fromarray((numpy_array // 257).astype(np.uint8))
+        pil_image = Image.fromarray((numpy_array // 257).astype(np.uint8))
     elif np.issubdtype(dtype, np.signedinteger):
         info = np.iinfo(dtype)
         norm = (numpy_array.astype(np.float32) - info.min) / (info.max - info.min)
-        return Image.fromarray((norm * 255).astype(np.uint8))
+        pil_image = Image.fromarray((norm * 255).astype(np.uint8))
     elif np.issubdtype(dtype, np.uint8):
-        return Image.fromarray(numpy_array)
-    raise TypeError(f"Unhandled NumPy dtype from DirectXTex decoder: {dtype}")
+        pil_image = Image.fromarray(numpy_array)
+
+    if pil_image is None:
+        raise TypeError(f"Unhandled NumPy dtype from DirectXTex decoder: {dtype}")
+
+    # This block converts the image from premultiplied to straight alpha,
+    # which solves the thumbnail generation issue for semi-transparent textures.
+    if pil_image.mode == "RGBA":
+        # Create a new, fully transparent image of the same size.
+        canvas = Image.new("RGBA", pil_image.size, (0, 0, 0, 0))
+
+        # Extract the RGB channels from the original image (without alpha).
+        rgb_channels = pil_image.convert("RGB")
+
+        # Extract the alpha channel to use as a mask.
+        alpha_mask = pil_image.getchannel("A")
+
+        # Paste the RGB data onto the transparent canvas, using the alpha channel as a mask.
+        # This effectively "un-premultiplies" the alpha.
+        canvas.paste(rgb_channels, (0, 0), mask=alpha_mask)
+        return canvas
+
+    return pil_image
 
 
 def _load_with_oiio(path: str | Path, tonemap_mode: str) -> Image.Image | None:
