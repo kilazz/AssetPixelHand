@@ -99,6 +99,12 @@ class SettingsManager(QObject):
             self._request_save()
 
     @Slot(bool)
+    def set_compare_by_luminance(self, checked: bool):
+        if self._settings.hashing.compare_by_luminance != checked:
+            self._settings.hashing.compare_by_luminance = checked
+            self._request_save()
+
+    @Slot(bool)
     def set_lancedb_in_memory(self, checked: bool):
         if self._settings.lancedb_in_memory != checked:
             self._settings.lancedb_in_memory = checked

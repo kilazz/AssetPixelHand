@@ -176,6 +176,7 @@ class ScanConfig:
     dhash_threshold: int
     find_perceptual_duplicates: bool
     phash_threshold: int
+    compare_by_luminance: bool
     lancedb_in_memory: bool
     visuals_columns: int
     tonemap_visuals: bool
@@ -192,6 +193,7 @@ class HashingSettings:
     dhash_threshold: int = 8
     find_perceptual: bool = True
     phash_threshold: int = 8
+    compare_by_luminance: bool = False
 
 
 @dataclass
@@ -255,6 +257,7 @@ class AppSettings:
                     "dhash_threshold": data.pop("dhash_threshold", 8),
                     "find_perceptual": data.pop("find_perceptual_duplicates", True),
                     "phash_threshold": data.pop("phash_threshold", 8),
+                    "compare_by_luminance": data.pop("compare_by_luminance", False),
                 }
             if "perf_num_workers" in data:
                 data["performance"] = {

@@ -28,7 +28,8 @@ from app.data_models import ImageFingerprint
 from app.image_io import get_image_metadata, load_image
 
 if TYPE_CHECKING:
-    pass
+    from app.data_models import ScanConfig
+
 
 app_logger = logging.getLogger("AssetPixelHand.worker")
 g_inference_engine = None
@@ -132,7 +133,6 @@ class InferenceEngine:
 def init_worker(config: dict):
     """Initializes a full worker, creating the global inference engine."""
     global g_inference_engine
-    # The call to _init_worker_process(config) has been removed.
     try:
         threads = config.get("threads_per_worker", 2)
         g_inference_engine = InferenceEngine(
@@ -147,7 +147,6 @@ def init_worker(config: dict):
 def init_preprocessor_worker(config: dict, queue: "multiprocessing.Queue"):
     """Initializes a CPU-only preprocessing worker."""
     global g_preprocessor, g_free_buffers_q
-    # The call to _init_worker_process(config) has been removed.
     g_free_buffers_q = queue
     try:
         from transformers import AutoProcessor
@@ -192,7 +191,7 @@ def _process_batch_from_paths(
 
 
 def worker_wrapper_from_paths_cpu_shared_mem(
-    paths: list[Path], input_size: tuple[int, int], buffer_shape, dtype
+    paths: list[Path], input_size: tuple[int, int], buffer_shape, dtype, config: "ScanConfig"
 ) -> tuple:
     """CPU worker function that preprocesses images and puts the resulting tensor into shared memory."""
     global g_free_buffers_q, g_preprocessor
@@ -202,6 +201,12 @@ def worker_wrapper_from_paths_cpu_shared_mem(
         images, fps, skipped_tuples = _process_batch_from_paths(paths, input_size)
         if not images:
             return None, [], skipped_tuples
+
+        # If compare_by_luminance is enabled, convert images to grayscale before processing.
+        if config.compare_by_luminance:
+            # Convert to 'L' (luminance), then back to 'RGB' to create a 3-channel
+            # grayscale image that the AI model expects.
+            images = [img.convert("L").convert("RGB") for img in images]
 
         pixel_values = g_preprocessor(images=images, return_tensors="np").pixel_values
 

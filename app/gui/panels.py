@@ -403,6 +403,12 @@ class ScanOptionsPanel(QGroupBox):
         hashing_grid.addWidget(self.perceptual_duplicates_check, 2, 0, 1, 2)
         hashing_grid.addWidget(self.phash_threshold_spin, 2, 2)
 
+        self.luminance_check = QCheckBox("Compare by luminance only (Grayscale)")
+        self.luminance_check.setToolTip(
+            "Analyzes image structure without color. Ideal for finding reskinned assets or textures with packed channels."
+        )
+        hashing_grid.addWidget(self.luminance_check, 3, 0, 1, 3)
+
         layout.addLayout(hashing_grid)
 
         self.lancedb_in_memory_check = QCheckBox("Use in-memory database (fastest)")
@@ -443,6 +449,7 @@ class ScanOptionsPanel(QGroupBox):
         self.dhash_threshold_spin.valueChanged.connect(self.settings_manager.set_dhash_threshold)
         self.perceptual_duplicates_check.toggled.connect(self.settings_manager.set_find_perceptual)
         self.phash_threshold_spin.valueChanged.connect(self.settings_manager.set_phash_threshold)
+        self.luminance_check.toggled.connect(self.settings_manager.set_compare_by_luminance)
         self.lancedb_in_memory_check.toggled.connect(self.settings_manager.set_lancedb_in_memory)
         self.save_visuals_check.toggled.connect(self.settings_manager.set_save_visuals)
         self.visuals_tonemap_check.toggled.connect(self.settings_manager.set_visuals_tonemap)
@@ -503,6 +510,7 @@ class ScanOptionsPanel(QGroupBox):
         self.perceptual_duplicates_check.setChecked(s.hashing.find_perceptual)
         self.dhash_threshold_spin.setValue(s.hashing.dhash_threshold)
         self.phash_threshold_spin.setValue(s.hashing.phash_threshold)
+        self.luminance_check.setChecked(s.hashing.compare_by_luminance)
         self._update_hashing_options_state()
 
         self.lancedb_in_memory_check.setChecked(s.lancedb_in_memory)

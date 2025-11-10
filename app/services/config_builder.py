@@ -10,8 +10,6 @@ from app.constants import FP16_MODEL_SUFFIX, SUPPORTED_MODELS, QuantizationMode
 from app.data_models import AppSettings, PerformanceConfig, ScanConfig, ScanMode
 
 if TYPE_CHECKING:
-    # This block is for type hinting only and is not executed at runtime.
-    # We no longer need direct panel imports here.
     pass
 
 
@@ -64,6 +62,7 @@ class ScanConfigBuilder:
             dhash_threshold=self.settings.hashing.dhash_threshold,
             find_perceptual_duplicates=self.settings.hashing.find_perceptual,
             phash_threshold=self.settings.hashing.phash_threshold,
+            compare_by_luminance=self.settings.hashing.compare_by_luminance,
             lancedb_in_memory=self.settings.lancedb_in_memory,
             save_visuals=self.settings.visuals.save,
             max_visuals=int(self.settings.visuals.max_count),

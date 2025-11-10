@@ -150,6 +150,7 @@ class PipelineManager(QObject):
             input_size=input_size,
             buffer_shape=buffer_shape,
             dtype=dtype,
+            config=self.config,  # Pass the full config to the worker
         )
         with self.ctx.Pool(
             processes=self.num_workers,
