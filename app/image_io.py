@@ -110,41 +110,63 @@ def load_image(
 
     pil_image = None
 
-    if PYVIPS_AVAILABLE:
-        app_logger.debug(f"Attempting to load '{filename}' with pyvips.")
-        try:
-            pil_image = _load_with_pyvips(path, tonemap_mode)
-            app_logger.debug(f"Successfully loaded '{filename}' with pyvips.")
-        except Exception as e:
-            app_logger.debug(f"pyvips failed for '{filename}': {e}. Falling back.")
+    # --- DDS-specific loading chain ---
+    if ext == ".dds":
+        app_logger.debug(f"DDS file detected. Using specialized loading chain for '{filename}'.")
+        if DIRECTXTEX_AVAILABLE:
+            try:
+                pil_image = _load_with_directxtex(path.read_bytes(), tonemap_mode)
+                app_logger.debug(f"Successfully loaded '{filename}' with DirectXTex.")
+            except Exception as e:
+                app_logger.debug(f"DirectXTex failed for '{filename}': {e}. Falling back.")
 
-    if pil_image is None and ext == ".dds" and DIRECTXTEX_AVAILABLE:
-        app_logger.debug(f"Attempting to load '{filename}' with DirectXTex.")
-        try:
-            pil_image = _load_with_directxtex(path.read_bytes(), tonemap_mode)
-            app_logger.debug(f"Successfully loaded '{filename}' with DirectXTex.")
-        except Exception as e:
-            app_logger.debug(f"DirectXTex failed for '{filename}': {e}. Falling back.")
+        if pil_image is None and OIIO_AVAILABLE:
+            app_logger.debug(f"Attempting to load DDS '{filename}' with OpenImageIO (fallback).")
+            try:
+                pil_image = _load_with_oiio(path, tonemap_mode)
+                app_logger.debug(f"Successfully loaded DDS '{filename}' with OpenImageIO.")
+            except Exception as e:
+                app_logger.debug(f"OIIO fallback for DDS failed for '{filename}': {e}. Falling back.")
 
-    if pil_image is None and OIIO_AVAILABLE:
-        app_logger.debug(f"Attempting to load '{filename}' with OpenImageIO.")
-        try:
-            pil_image = _load_with_oiio(path, tonemap_mode)
-            app_logger.debug(f"Successfully loaded '{filename}' with OpenImageIO.")
-        except Exception as e:
-            app_logger.debug(f"OIIO failed for '{filename}': {e}. Falling back.")
+        if pil_image is None and PILLOW_AVAILABLE:
+            app_logger.debug(f"Attempting to load DDS '{filename}' with Pillow (final fallback).")
+            try:
+                with Image.open(path) as img:
+                    img.load()
+                pil_image = img
+                app_logger.debug(f"Successfully loaded DDS '{filename}' with Pillow.")
+            except Exception as e:
+                app_logger.error(f"All DDS loaders failed for '{filename}'. Final Pillow error: {e}")
 
-    if pil_image is None and PILLOW_AVAILABLE:
-        app_logger.debug(f"Attempting to load '{filename}' with Pillow.")
-        try:
-            with Image.open(path) as img:
-                img.load()
-            pil_image = img
-            app_logger.debug(f"Successfully loaded '{filename}' with Pillow.")
-        except Exception as e:
-            app_logger.error(f"All loaders failed for '{filename}'. Final Pillow error: {e}")
-            return None
+    # --- General loading chain for all other formats ---
+    else:
+        if PYVIPS_AVAILABLE:
+            app_logger.debug(f"Attempting to load '{filename}' with pyvips.")
+            try:
+                pil_image = _load_with_pyvips(path, tonemap_mode)
+                app_logger.debug(f"Successfully loaded '{filename}' with pyvips.")
+            except Exception as e:
+                app_logger.debug(f"pyvips failed for '{filename}': {e}. Falling back.")
 
+        if pil_image is None and OIIO_AVAILABLE:
+            app_logger.debug(f"Attempting to load '{filename}' with OpenImageIO.")
+            try:
+                pil_image = _load_with_oiio(path, tonemap_mode)
+                app_logger.debug(f"Successfully loaded '{filename}' with OpenImageIO.")
+            except Exception as e:
+                app_logger.debug(f"OIIO failed for '{filename}': {e}. Falling back.")
+
+        if pil_image is None and PILLOW_AVAILABLE:
+            app_logger.debug(f"Attempting to load '{filename}' with Pillow.")
+            try:
+                with Image.open(path) as img:
+                    img.load()
+                pil_image = img
+                app_logger.debug(f"Successfully loaded '{filename}' with Pillow.")
+            except Exception as e:
+                app_logger.error(f"All loaders failed for '{filename}'. Final Pillow error: {e}")
+
+    # --- Final processing for any successfully loaded image ---
     if pil_image:
         if target_size:
             pil_image.thumbnail(target_size, Image.Resampling.LANCZOS)
@@ -168,94 +190,49 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
         ext = path.suffix.lower()
         filename = path.name
 
+        # --- DDS-specific metadata chain ---
+        if ext == ".dds":
+            if DIRECTXTEX_AVAILABLE:
+                app_logger.debug(f"Getting metadata for '{filename}' with DirectXTex.")
+                try:
+                    with path.open("rb") as f:
+                        meta = directxtex_decoder.get_dds_metadata(f.read())
+                    format_str = meta["format_str"].upper()
+                    _, bit_depth = is_dds_hdr(format_str)
+                    has_alpha = any(s in format_str for s in ["A8", "BC2", "BC3", "BC7", "DXT", "RGBA"])
+                    return {
+                        "resolution": (meta["width"], meta["height"]),
+                        "file_size": stat.st_size,
+                        "mtime": stat.st_mtime,
+                        "format_str": "DDS",
+                        "format_details": f"DDS ({format_str})",
+                        "has_alpha": has_alpha,
+                        "capture_date": None,
+                        "bit_depth": bit_depth,
+                    }
+                except Exception as e:
+                    app_logger.debug(f"DirectXTex metadata failed for '{filename}': {e}. Falling back.")
+
+            if OIIO_AVAILABLE:
+                app_logger.debug(f"Getting metadata for DDS '{filename}' with OpenImageIO (fallback).")
+                try:
+                    # OIIO can provide some basic info even if directxtex fails
+                    return _get_metadata_with_oiio(path, stat)
+                except Exception as e:
+                    app_logger.debug(f"OIIO fallback for DDS failed for '{filename}': {e}. Falling back.")
+
+        # --- General metadata chain for non-DDS or failed DDS ---
         if PYVIPS_AVAILABLE:
             app_logger.debug(f"Getting metadata for '{filename}' with pyvips.")
             try:
-                img = pyvips.Image.new_from_file(str(path), access="sequential")
-
-                if img.width > MAX_PIXEL_DIMENSION or img.height > MAX_PIXEL_DIMENSION:
-                    app_logger.warning(f"Skipping abnormally large image: {filename} ({img.width}x{img.height}).")
-                    return None
-
-                format_map = {
-                    "uchar": 8,
-                    "char": 8,
-                    "ushort": 16,
-                    "short": 16,
-                    "uint": 32,
-                    "int": 32,
-                    "float": 32,
-                    "double": 64,
-                    "complex": 64,
-                    "dpcomplex": 128,
-                }
-                bit_depth = format_map.get(img.format, 8)
-                ch_str = {1: "Grayscale", 2: "GA", 3: "RGB", 4: "RGBA"}.get(img.bands, f"{img.bands}ch")
-                has_alpha = img.hasalpha()
-                capture_date = None
-                if "exif-ifd0-DateTime" in img.get_fields():
-                    dt_str = img.get("exif-ifd0-DateTime")
-                    with contextlib.suppress(ValueError, TypeError):
-                        capture_date = datetime.strptime(dt_str.split("\0", 1)[0], "%Y:%m:%d %H:%M:%S").timestamp()
-                return {
-                    "resolution": (img.width, img.height),
-                    "file_size": stat.st_size,
-                    "mtime": stat.st_mtime,
-                    "format_str": img.get("vips-loader").upper() or ext.strip(".").upper(),
-                    "format_details": f"{bit_depth}-bit {ch_str}",
-                    "has_alpha": has_alpha,
-                    "capture_date": capture_date,
-                    "bit_depth": bit_depth,
-                }
+                return _get_metadata_with_pyvips(path, stat)
             except Exception as e:
                 app_logger.debug(f"pyvips metadata failed for '{filename}': {e}. Falling back.")
-
-        if ext == ".dds" and DIRECTXTEX_AVAILABLE:
-            app_logger.debug(f"Getting metadata for '{filename}' with DirectXTex.")
-            try:
-                with path.open("rb") as f:
-                    meta = directxtex_decoder.get_dds_metadata(f.read())
-                format_str = meta["format_str"].upper()
-                _, bit_depth = is_dds_hdr(format_str)
-                has_alpha = any(s in format_str for s in ["A8", "BC2", "BC3", "BC7", "DXT", "RGBA"])
-                return {
-                    "resolution": (meta["width"], meta["height"]),
-                    "file_size": stat.st_size,
-                    "mtime": stat.st_mtime,
-                    "format_str": "DDS",
-                    "format_details": f"DDS ({format_str})",
-                    "has_alpha": has_alpha,
-                    "capture_date": None,
-                    "bit_depth": bit_depth,
-                }
-            except Exception as e:
-                app_logger.debug(f"DirectXTex metadata failed for '{filename}': {e}. Falling back.")
 
         if OIIO_AVAILABLE:
             app_logger.debug(f"Getting metadata for '{filename}' with OpenImageIO.")
             try:
-                buf = oiio.ImageBuf(str(path))
-                if buf.has_error:
-                    raise RuntimeError(f"OIIO Error: {buf.geterror(autoclear=1)}")
-                spec = buf.spec()
-                bit_depth = {oiio.UINT8: 8, oiio.UINT16: 16, oiio.HALF: 16, oiio.FLOAT: 32, oiio.DOUBLE: 64}.get(
-                    spec.format.basetype, 8
-                )
-                ch_str = {1: "Grayscale", 2: "GA", 3: "RGB", 4: "RGBA"}.get(spec.nchannels, f"{spec.nchannels}ch")
-                result = {
-                    "resolution": (spec.width, spec.height),
-                    "file_size": stat.st_size,
-                    "mtime": stat.st_mtime,
-                    "format_str": buf.file_format_name.upper(),
-                    "format_details": f"{bit_depth}-bit {ch_str}",
-                    "has_alpha": spec.alpha_channel != -1,
-                    "capture_date": None,
-                    "bit_depth": bit_depth,
-                }
-                if dt := spec.get_string_attribute("DateTime"):
-                    with contextlib.suppress(ValueError, TypeError):
-                        result["capture_date"] = datetime.strptime(dt, "%Y:%m:%d %H:%M:%S").timestamp()
-                return result
+                return _get_metadata_with_oiio(path, stat)
             except Exception as e:
                 app_logger.debug(f"OIIO metadata failed for '{filename}': {e}. Falling back.")
 
@@ -291,6 +268,76 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
     return None
 
 
+# --- Private Helper Functions for Metadata ---
+
+
+def _get_metadata_with_pyvips(path: Path, stat) -> dict | None:
+    img = pyvips.Image.new_from_file(str(path), access="sequential")
+
+    if img.width > MAX_PIXEL_DIMENSION or img.height > MAX_PIXEL_DIMENSION:
+        app_logger.warning(f"Skipping abnormally large image: {path.name} ({img.width}x{img.height}).")
+        return None
+
+    format_map = {
+        "uchar": 8,
+        "char": 8,
+        "ushort": 16,
+        "short": 16,
+        "uint": 32,
+        "int": 32,
+        "float": 32,
+        "double": 64,
+        "complex": 64,
+        "dpcomplex": 128,
+    }
+    bit_depth = format_map.get(img.format, 8)
+    ch_str = {1: "Grayscale", 2: "GA", 3: "RGB", 4: "RGBA"}.get(img.bands, f"{img.bands}ch")
+    has_alpha = img.hasalpha()
+    capture_date = None
+    if "exif-ifd0-DateTime" in img.get_fields():
+        dt_str = img.get("exif-ifd0-DateTime")
+        with contextlib.suppress(ValueError, TypeError):
+            capture_date = datetime.strptime(dt_str.split("\0", 1)[0], "%Y:%m:%d %H:%M:%S").timestamp()
+    return {
+        "resolution": (img.width, img.height),
+        "file_size": stat.st_size,
+        "mtime": stat.st_mtime,
+        "format_str": img.get("vips-loader").upper() or path.suffix.strip(".").upper(),
+        "format_details": f"{bit_depth}-bit {ch_str}",
+        "has_alpha": has_alpha,
+        "capture_date": capture_date,
+        "bit_depth": bit_depth,
+    }
+
+
+def _get_metadata_with_oiio(path: Path, stat) -> dict | None:
+    buf = oiio.ImageBuf(str(path))
+    if buf.has_error:
+        raise RuntimeError(f"OIIO Error: {buf.geterror(autoclear=1)}")
+    spec = buf.spec()
+    bit_depth = {oiio.UINT8: 8, oiio.UINT16: 16, oiio.HALF: 16, oiio.FLOAT: 32, oiio.DOUBLE: 64}.get(
+        spec.format.basetype, 8
+    )
+    ch_str = {1: "Grayscale", 2: "GA", 3: "RGB", 4: "RGBA"}.get(spec.nchannels, f"{spec.nchannels}ch")
+    result = {
+        "resolution": (spec.width, spec.height),
+        "file_size": stat.st_size,
+        "mtime": stat.st_mtime,
+        "format_str": buf.file_format_name.upper(),
+        "format_details": f"{bit_depth}-bit {ch_str}",
+        "has_alpha": spec.alpha_channel != -1,
+        "capture_date": None,
+        "bit_depth": bit_depth,
+    }
+    if dt := spec.get_string_attribute("DateTime"):
+        with contextlib.suppress(ValueError, TypeError):
+            result["capture_date"] = datetime.strptime(dt, "%Y:%m:%d %H:%M:%S").timestamp()
+    return result
+
+
+# --- Private Helper Functions for Loading ---
+
+
 def _load_with_pyvips(path: str | Path, tonemap_mode: str) -> Image.Image | None:
     image = pyvips.Image.new_from_file(str(path), access="sequential")
     is_float = "float" in image.format or "double" in image.format
@@ -309,48 +356,32 @@ def _load_with_directxtex(dds_bytes: bytes, tonemap_mode: str) -> Image.Image | 
     numpy_array, dtype = decoded["data"], decoded["data"].dtype
 
     # This block handles various non-standard channel usages common in DDS game assets.
-
-    # Check if the data is in a format that could have alpha issues (RGBA, 8-bit per channel)
     if numpy_array.ndim == 3 and numpy_array.shape[2] == 4 and np.issubdtype(dtype, np.uint8):
         app_logger.debug("Analyzing RGBA texture for special channel formats.")
         arr = numpy_array.astype(np.float32)
+        rgb, alpha = arr[:, :, :3], arr[:, :, 3]
+        alpha_max, rgb_max = np.max(alpha), np.max(rgb)
 
-        rgb = arr[:, :, :3]
-        alpha = arr[:, :, 3]
-
-        alpha_max = np.max(alpha)
-        rgb_max = np.max(rgb)
-
-        # CASE 1: Additive texture (e.g., fire, explosions). RGB has content, Alpha is black.
-        if alpha_max < 5 and rgb_max > 0:
+        if alpha_max < 5 and rgb_max > 0:  # Additive texture
             app_logger.debug("Detected additive texture. Using luminance as alpha.")
-            # Create a new alpha channel from the luminance (brightness) of the RGB channels.
-            luminance_alpha = np.maximum(rgb[:, :, 0], np.maximum(rgb[:, :, 1], rgb[:, :, 2]))
+            luminance_alpha = np.maximum.reduce(rgb, axis=2)
             arr[:, :, 3] = luminance_alpha
             return Image.fromarray(arr.astype(np.uint8))
-
-        # CASE 2: Grayscale mask stored in Alpha channel. RGB is black, Alpha has content.
-        elif rgb_max < 5 and alpha_max > 0:
+        elif rgb_max < 5 and alpha_max > 0:  # Grayscale in alpha
             app_logger.debug("Detected grayscale mask in alpha channel.")
-            # Copy the alpha channel data into all three RGB channels to make it visible.
             arr[:, :, 0] = alpha
             arr[:, :, 1] = alpha
             arr[:, :, 2] = alpha
-            # Set the alpha channel to full opacity so the grayscale image is visible.
             arr[:, :, 3] = 255
             return Image.fromarray(arr.astype(np.uint8))
-
-        # CASE 3: Standard premultiplied alpha (for semi-transparent objects).
-        else:
+        else:  # Standard premultiplied alpha
             app_logger.debug("Applying standard un-premultiply logic.")
             mask = alpha > 0
             alpha_scaled = alpha[mask, np.newaxis] / 255.0
             rgb[mask] /= alpha_scaled
-            rgb = np.clip(rgb, 0, 255)
-            arr[:, :, :3] = rgb
+            arr[:, :, :3] = np.clip(rgb, 0, 255)
             return Image.fromarray(arr.astype(np.uint8))
 
-    # For all other formats (HDR, compressed, non-alpha), handle as before
     pil_image = None
     if np.issubdtype(dtype, np.floating):
         if tonemap_mode != TonemapMode.NONE.value:
@@ -368,7 +399,6 @@ def _load_with_directxtex(dds_bytes: bytes, tonemap_mode: str) -> Image.Image | 
 
     if pil_image is None:
         raise TypeError(f"Unhandled NumPy dtype from DirectXTex decoder: {dtype}")
-
     return pil_image
 
 
@@ -402,23 +432,18 @@ def _tonemap_float_array(float_array: np.ndarray, mode: str) -> np.ndarray:
         rgb = float_array
 
     alpha = float_array[..., 3:4] if float_array.ndim > 2 and float_array.shape[-1] > 3 else None
-
     rgb = np.maximum(rgb, 0.0)
 
-    # Use OCIO if tonemapping is enabled and the TONE_MAPPER is available
     if mode == TonemapMode.ENABLED.value and TONE_MAPPER:
         try:
             exposure = 1.5
             rgb *= exposure
-            # Use the hdr_to_ldr method from the initialized ToneMapper
             rgb_tonemapped = TONE_MAPPER.hdr_to_ldr(rgb.astype(np.float32), clip=True)
             final_rgb = (rgb_tonemapped * 255).astype(np.uint8)
         except Exception as e:
             app_logger.error(f"simple-ocio tonemapping failed with view '{TONE_MAPPER.view}': {e}")
-            # If tonemapping fails, just clip the values to prevent a crash.
             final_rgb = (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
     else:
-        # If tonemapping is disabled or OCIO is unavailable, simply clip the values.
         final_rgb = (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
 
     if alpha is not None:

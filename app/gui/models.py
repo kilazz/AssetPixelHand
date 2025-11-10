@@ -46,6 +46,58 @@ app_logger = logging.getLogger("AssetPixelHand.gui.models")
 SortRole = Qt.ItemDataRole.UserRole + 1
 
 
+def _format_metadata_string(node: ResultNode) -> str:
+    """A centralized helper function to create the detailed metadata string."""
+    res = f"{node.resolution_w}x{node.resolution_h}"
+    size_mb = node.file_size / (1024**2)
+    size_str = f"{size_mb:.2f} MB"
+    general_format = node.format_str
+    bit_depth_str = f"{node.bit_depth}-bit"
+    compression_format = ""
+    active_channels = ""
+
+    if general_format == "DDS":
+        # Robustly handle different metadata sources
+        if node.format_details.startswith("DDS ("):
+            # Case 1: Detailed metadata from directxtex_decoder
+            format_spec = node.format_details.replace("DDS (", "").replace(")", "")
+            spec_upper = format_spec.upper()
+            compression_format = spec_upper
+
+            if any(
+                s in spec_upper
+                for s in ["R32G32B32A32", "R16G16B16A16", "R10G10B10A2", "R8G8B8A8", "B8G8R8A8", "BC2", "BC3", "BC7"]
+            ):
+                active_channels = "RGBA"
+            elif any(s in spec_upper for s in ["R32G32B32", "R11G11B10", "B5G6R5"]):
+                active_channels = "RGB"
+            elif any(s in spec_upper for s in ["BC1", "DXT1"]):
+                active_channels = "RGBA" if node.has_alpha else "RGB"
+            elif any(s in spec_upper for s in ["R32G32", "R16G16", "R8G8", "BC5", "ATI2"]):
+                active_channels = "RG"
+            elif any(s in spec_upper for s in ["R32", "R16", "R8", "A8", "BC4", "ATI1"]):
+                active_channels = "A" if "A8" in spec_upper else "R"
+            else:
+                active_channels = "Unknown"
+        else:
+            # Case 2: Generic metadata from pyvips or other loaders
+            compression_format = "Unknown"  # Cannot know original compression
+            if "-bit" in node.format_details:
+                # Extracts "RGBA" from "8-bit RGBA"
+                active_channels = node.format_details.split("-bit")[1].strip()
+            else:
+                active_channels = "RGBA" if node.has_alpha else "RGB"
+
+    else:  # For other common image types like PNG, JPG
+        compression_format = general_format
+        if "-bit" in node.format_details:
+            active_channels = node.format_details.split("-bit")[1].strip()
+        else:
+            active_channels = "RGB" if not node.has_alpha else "RGBA"
+
+    return f"{res} | {size_str} | {general_format} | {compression_format} | {bit_depth_str} | {active_channels}"
+
+
 class ResultsTreeModel(QAbstractItemModel):
     """Data model for the results tree view, with asynchronous data fetching."""
 
@@ -319,9 +371,7 @@ class ResultsTreeModel(QAbstractItemModel):
         elif col == 2:
             return str(path.parent)
         elif col == 3:
-            res = f"{node.resolution_w}x{node.resolution_h}"
-            size_mb = node.file_size / (1024**2)
-            return f"{res} | {node.bit_depth}-bit | {size_mb:.2f} MB | {node.format_details}"
+            return _format_metadata_string(node)
         return ""
 
     def setData(self, index, value, role):
@@ -731,17 +781,15 @@ class ImageItemDelegate(QStyledItemDelegate):
         else:
             method = item_data.found_by
             dist = item_data.distance
-            if method == "xxHash":
-                dist_text = "Exact Match | "
-            elif method == "dHash":
-                dist_text = "Simple Match | "
-            elif method == "pHash":
-                dist_text = "Near-Identical | "
+            if method_display := METHOD_DISPLAY_NAMES.get(method):
+                dist_text = f"{method_display} | "
             elif dist >= 0:
                 dist_text = f"Score: {dist}% | "
 
-        meta_text = f"{dist_text}{item_data.resolution_w}x{item_data.resolution_h} | {item_data.format_details}"
-        painter.drawText(x, y, self.regular_font_metrics.elidedText(meta_text, Qt.ElideRight, text_rect.width()))
+        meta_text = _format_metadata_string(item_data)
+        full_text = f"{dist_text}{meta_text}"
+
+        painter.drawText(x, y, self.regular_font_metrics.elidedText(full_text, Qt.ElideRight, text_rect.width()))
 
         y += line_height
         painter.drawText(
