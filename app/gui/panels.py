@@ -1531,29 +1531,50 @@ class ImageViewerPanel(QGroupBox):
         if len(images) != 2:
             return
 
+        # Count how many channels are currently selected by the user
+        active_channels = [ch for ch, is_active in self.channel_states.items() if is_active]
+        num_active_channels = len(active_channels)
+
         def get_processed_pixmap(pil_image: Image.Image) -> QPixmap:
             if pil_image.mode != "RGBA":
                 pil_image = pil_image.convert("RGBA")
-            if all(self.channel_states.values()):
-                return QPixmap.fromImage(ImageQt(pil_image))
-            r, g, b, a = pil_image.split()
-            if not self.channel_states["R"]:
-                r = r.point(lambda _: 0)
-            if not self.channel_states["G"]:
-                g = g.point(lambda _: 0)
-            if not self.channel_states["B"]:
-                b = b.point(lambda _: 0)
-            if not self.channel_states["A"]:
-                a = a.point(lambda _: 255)
-            processed_pil = Image.merge("RGBA", (r, g, b, a))
-            return QPixmap.fromImage(ImageQt(processed_pil))
+
+            # SCENARIO 1: Single channel selected (Analysis Mode)
+            # Display the selected channel as a grayscale image.
+            if num_active_channels == 1:
+                channel_name = active_channels[0]
+                channel = pil_image.getchannel(channel_name)
+                # Create a new RGB image where all three channels are the selected one.
+                grayscale_img = Image.merge("RGB", (channel, channel, channel))
+                # Add a fully opaque alpha channel to make it visible.
+                grayscale_img.putalpha(Image.new("L", grayscale_img.size, 255))
+                return QPixmap.fromImage(ImageQt(grayscale_img))
+
+            # SCENARIO 2: Multiple channels selected (Standard Composite View)
+            # Show a colored image with the selected channels enabled/disabled.
+            else:
+                r, g, b, a = pil_image.split()
+                if not self.channel_states["R"]:
+                    r = r.point(lambda _: 0)
+                if not self.channel_states["G"]:
+                    g = g.point(lambda _: 0)
+                if not self.channel_states["B"]:
+                    b = b.point(lambda _: 0)
+                if not self.channel_states["A"]:
+                    a = a.point(lambda _: 255)
+
+                processed_pil = Image.merge("RGBA", (r, g, b, a))
+                return QPixmap.fromImage(ImageQt(processed_pil))
 
         current_mode = CompareMode(self.compare_type_combo.currentText())
         if current_mode == CompareMode.DIFF:
+            # The diff logic already handles channels correctly
             self.diff_view.setPixmap(self._calculate_diff_pixmap())
             return
+
         p1 = get_processed_pixmap(images[0])
         p2 = get_processed_pixmap(images[1])
+
         if current_mode == CompareMode.SIDE_BY_SIDE:
             self.compare_view_1.setPixmap(p1)
             self.compare_view_2.setPixmap(p2)
@@ -1567,6 +1588,7 @@ class ImageViewerPanel(QGroupBox):
         for i, name in enumerate(["R", "G", "B", "A"]):
             try:
                 extrema = img.getchannel(i).getextrema()
+                # A channel is active if its min and max values are different.
                 activity[name] = extrema[0] != extrema[1]
             except Exception:
                 activity[name] = False
