@@ -308,6 +308,49 @@ def _load_with_directxtex(dds_bytes: bytes, tonemap_mode: str) -> Image.Image | 
     decoded = directxtex_decoder.decode_dds(dds_bytes)
     numpy_array, dtype = decoded["data"], decoded["data"].dtype
 
+    # This block handles various non-standard channel usages common in DDS game assets.
+
+    # Check if the data is in a format that could have alpha issues (RGBA, 8-bit per channel)
+    if numpy_array.ndim == 3 and numpy_array.shape[2] == 4 and np.issubdtype(dtype, np.uint8):
+        app_logger.debug("Analyzing RGBA texture for special channel formats.")
+        arr = numpy_array.astype(np.float32)
+
+        rgb = arr[:, :, :3]
+        alpha = arr[:, :, 3]
+
+        alpha_max = np.max(alpha)
+        rgb_max = np.max(rgb)
+
+        # CASE 1: Additive texture (e.g., fire, explosions). RGB has content, Alpha is black.
+        if alpha_max < 5 and rgb_max > 0:
+            app_logger.debug("Detected additive texture. Using luminance as alpha.")
+            # Create a new alpha channel from the luminance (brightness) of the RGB channels.
+            luminance_alpha = np.maximum(rgb[:, :, 0], np.maximum(rgb[:, :, 1], rgb[:, :, 2]))
+            arr[:, :, 3] = luminance_alpha
+            return Image.fromarray(arr.astype(np.uint8))
+
+        # CASE 2: Grayscale mask stored in Alpha channel. RGB is black, Alpha has content.
+        elif rgb_max < 5 and alpha_max > 0:
+            app_logger.debug("Detected grayscale mask in alpha channel.")
+            # Copy the alpha channel data into all three RGB channels to make it visible.
+            arr[:, :, 0] = alpha
+            arr[:, :, 1] = alpha
+            arr[:, :, 2] = alpha
+            # Set the alpha channel to full opacity so the grayscale image is visible.
+            arr[:, :, 3] = 255
+            return Image.fromarray(arr.astype(np.uint8))
+
+        # CASE 3: Standard premultiplied alpha (for semi-transparent objects).
+        else:
+            app_logger.debug("Applying standard un-premultiply logic.")
+            mask = alpha > 0
+            alpha_scaled = alpha[mask, np.newaxis] / 255.0
+            rgb[mask] /= alpha_scaled
+            rgb = np.clip(rgb, 0, 255)
+            arr[:, :, :3] = rgb
+            return Image.fromarray(arr.astype(np.uint8))
+
+    # For all other formats (HDR, compressed, non-alpha), handle as before
     pil_image = None
     if np.issubdtype(dtype, np.floating):
         if tonemap_mode != TonemapMode.NONE.value:
@@ -325,23 +368,6 @@ def _load_with_directxtex(dds_bytes: bytes, tonemap_mode: str) -> Image.Image | 
 
     if pil_image is None:
         raise TypeError(f"Unhandled NumPy dtype from DirectXTex decoder: {dtype}")
-
-    # This block converts the image from premultiplied to straight alpha,
-    # which solves the thumbnail generation issue for semi-transparent textures.
-    if pil_image.mode == "RGBA":
-        # Create a new, fully transparent image of the same size.
-        canvas = Image.new("RGBA", pil_image.size, (0, 0, 0, 0))
-
-        # Extract the RGB channels from the original image (without alpha).
-        rgb_channels = pil_image.convert("RGB")
-
-        # Extract the alpha channel to use as a mask.
-        alpha_mask = pil_image.getchannel("A")
-
-        # Paste the RGB data onto the transparent canvas, using the alpha channel as a mask.
-        # This effectively "un-premultiplies" the alpha.
-        canvas.paste(rgb_channels, (0, 0), mask=alpha_mask)
-        return canvas
 
     return pil_image
 
