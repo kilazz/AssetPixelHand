@@ -42,6 +42,7 @@ from app.constants import (
     ALL_SUPPORTED_EXTENSIONS,
     DEEP_LEARNING_AVAILABLE,
     DEFAULT_SEARCH_PRECISION,
+    DIRECTXTEX_AVAILABLE,
     OIIO_AVAILABLE,
     PYVIPS_AVAILABLE,
     SCRIPT_DIR,
@@ -657,10 +658,12 @@ class SystemStatusPanel(QGroupBox):
         self.dl_status_label = QLabel("...")
         self.oiio_status_label = QLabel("...")
         self.pyvips_status_label = QLabel("...")
+        self.directxtex_status_label = QLabel("...")
 
         layout.addRow(self.dl_status_label)
         layout.addRow(self.oiio_status_label)
         layout.addRow(self.pyvips_status_label)
+        layout.addRow(self.directxtex_status_label)
 
         def fmt(label, available):
             color = UIConfig.Colors.SUCCESS if available else UIConfig.Colors.WARNING
@@ -670,6 +673,7 @@ class SystemStatusPanel(QGroupBox):
         self.dl_status_label.setText(fmt("DL Backend (ONNX)", DEEP_LEARNING_AVAILABLE))
         self.oiio_status_label.setText(fmt("Image Engine (OIIO)", OIIO_AVAILABLE))
         self.pyvips_status_label.setText(fmt("Image Engine (PyVips)", PYVIPS_AVAILABLE))
+        self.directxtex_status_label.setText(fmt("DDS Engine (DirectXTex)", DIRECTXTEX_AVAILABLE))
 
 
 class LogPanel(QGroupBox):

@@ -63,8 +63,10 @@ def worker_collect_all_data(path: Path) -> dict[str, Any] | None:
             "phash": phash,
         }
     except OSError:
-        # File might have been deleted or become unreadable during the process.
         return None
-    except Exception:
-        # Catch any other unexpected errors to prevent worker crashes.
+    except Exception as e:
+        import traceback
+
+        print(f"!!! WORKER CRASH on {path.name}: {e}")
+        traceback.print_exc()
         return None

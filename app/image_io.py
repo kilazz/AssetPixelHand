@@ -18,34 +18,12 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from app.constants import OCIO_AVAILABLE, TonemapMode
+from app.constants import OCIO_AVAILABLE, OIIO_AVAILABLE, PILLOW_AVAILABLE, PYVIPS_AVAILABLE, TonemapMode
 
 # --- Initialize Libraries and Constants ---
 Image.MAX_IMAGE_PIXELS = None
 app_logger = logging.getLogger("AssetPixelHand.image_io")
 MAX_PIXEL_DIMENSION = 32767
-
-try:
-    import pyvips
-
-    PYVIPS_AVAILABLE = True
-except (ImportError, OSError):
-    pyvips = None
-    PYVIPS_AVAILABLE = False
-
-try:
-    import OpenImageIO as oiio
-
-    OIIO_AVAILABLE = True
-except ImportError:
-    oiio = None
-    OIIO_AVAILABLE = False
-
-try:
-    Image.init()
-    PILLOW_AVAILABLE = True
-except ImportError:
-    PILLOW_AVAILABLE = False
 
 
 # --- OCIO Setup (simple-ocio) ---
@@ -69,6 +47,14 @@ def set_active_tonemap_view(view_name: str):
         app_logger.info(f"Switched active tonemapping view to: {view_name}")
         return True
     return False
+
+
+# Late import pyvips if available to avoid top-level errors if not installed
+if PYVIPS_AVAILABLE:
+    import pyvips
+# Late import oiio if available
+if OIIO_AVAILABLE:
+    import OpenImageIO as oiio
 
 
 # --- Public API Functions ---

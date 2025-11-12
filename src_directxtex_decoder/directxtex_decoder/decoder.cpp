@@ -1,14 +1,16 @@
 // =======================================================================================
 //  decoder.cpp - High-Performance C++ Python Module for DDS File Decoding
 // =======================================================================================
-// Provides Python bindings for the DirectXTex library. This version includes:
+// Provides Python bindings for the DirectXTex library.
 //
-// 1.  A hybrid loading architecture using the standard library with a manual fallback
-//     for legacy console (Xbox 360) and PC (CryEngine) variants.
-// 2.  Advanced handling for CryEngine tiled textures ('CRYF'/'FYRC') via unswizzling.
-// 3.  Advanced handling for Xbox 360 big-endian formats via byte-swapping.
-// 4.  Robust, size-based heuristics to correct malformed CryEngine headers (e.g.,
-//     uncompressed headers on DXT1-compressed data).
+// Key Features:
+// 1.  Centralized Header Analysis: A single `analyze_header` function now contains
+//     all heuristics for legacy Xbox, CryEngine, and malformed headers.
+// 2.  Improved Error Handling: A custom `DDSLoadError` exception provides more
+//     structured and informative error messages.
+// 3.  Namespace Grouping: Related utility functions are grouped into namespaces
+//     (XboxUtils, CryEngineUtils, NumpyUtils) for better readability.
+// 4.  Robust, size-based heuristics to correct malformed CryEngine headers.
 // 5.  Comprehensive NumPy conversion for a wide variety of pixel formats.
 // =======================================================================================
 
@@ -36,7 +38,7 @@ namespace py = pybind11;
 using namespace DirectX;
 
 // =======================================================================================
-// Constants and Macros
+// Global Constants and Type Definitions
 // =======================================================================================
 
 #ifndef MAKEFOURCC
@@ -53,13 +55,7 @@ constexpr uint32_t DDPF_RGB         = 0x00000040;
 constexpr uint32_t DDPF_LUMINANCE   = 0x00020000;
 
 // DDS header flags
-constexpr uint32_t DDSD_CAPS        = 0x00000001;
-constexpr uint32_t DDSD_HEIGHT      = 0x00000002;
-constexpr uint32_t DDSD_WIDTH       = 0x00000004;
-constexpr uint32_t DDSD_PITCH       = 0x00000008;
-constexpr uint32_t DDSD_PIXELFORMAT = 0x00001000;
 constexpr uint32_t DDSD_MIPMAPCOUNT = 0x00020000;
-constexpr uint32_t DDSD_LINEARSIZE  = 0x00080000;
 constexpr uint32_t DDSD_DEPTH       = 0x00800000;
 
 // DDS caps2 flags
@@ -80,18 +76,12 @@ constexpr uint32_t FOURCC_ATI2 = MAKEFOURCC('A', 'T', 'I', '2');
 constexpr uint32_t FOURCC_BC5U = MAKEFOURCC('B', 'C', '5', 'U');
 constexpr uint32_t FOURCC_BC5S = MAKEFOURCC('B', 'C', '5', 'S');
 
-// Xbox360 FourCC codes
-constexpr uint32_t FOURCC_DXT1_XBOX = MAKEFOURCC('1', 'T', 'X', 'D');
-constexpr uint32_t FOURCC_DXT3_XBOX = MAKEFOURCC('3', 'T', 'X', 'D');
-constexpr uint32_t FOURCC_DXT5_XBOX = MAKEFOURCC('5', 'T', 'X', 'D');
-constexpr uint32_t FOURCC_DX10_XBOX = MAKEFOURCC('0', '1', 'X', 'D');
-
 // CryEngine markers
 constexpr uint32_t FOURCC_CRYF = MAKEFOURCC('C', 'R', 'Y', 'F');
 constexpr uint32_t FOURCC_FYRC = MAKEFOURCC('F', 'Y', 'R', 'C');
 
-// HRESULT codes
-constexpr HRESULT CUSTOM_RPC_E_CHANGED_MODE  = static_cast<HRESULT>(0x80010106);
+// HRESULT for COM mode change
+constexpr HRESULT CUSTOM_RPC_E_CHANGED_MODE = static_cast<HRESULT>(0x80010106);
 
 #pragma pack(push, 1)
 struct DDS_PIXELFORMAT {
@@ -109,46 +99,16 @@ struct DDS_HEADER_DXT10 {
 };
 #pragma pack(pop)
 
+// Forward declarations
 std::string DXGIFormatToString(DXGI_FORMAT format);
+std::string HResultToString(HRESULT hr);
 
-// Byte-swapping utilities for Xbox 360 support
-template<typename T>
-T SwapBytes(T value) {
-    static_assert(std::is_integral<T>::value, "SwapBytes can only be used with integral types");
-    T result{};
-    auto* src = reinterpret_cast<uint8_t*>(&value);
-    auto* dst = reinterpret_cast<uint8_t*>(&result);
-    for (size_t i = 0; i < sizeof(T); ++i) {
-        dst[i] = src[sizeof(T) - 1 - i];
-    }
-    return result;
-}
 
-void EndianSwapBuffer(uint8_t* data, size_t dataSize, size_t elementSize) {
-    if (elementSize <= 1) return;
-    for (size_t i = 0; i + elementSize <= dataSize; i += elementSize) {
-        for (size_t j = 0; j < elementSize / 2; ++j) {
-            std::swap(data[i + j], data[i + elementSize - 1 - j]);
-        }
-    }
-}
+// =======================================================================================
+// Error Handling & COM Initialization
+// =======================================================================================
 
-class CoInitializer {
-public:
-    CoInitializer() {
-        hr_ = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        if (hr_ == CUSTOM_RPC_E_CHANGED_MODE) hr_ = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-        should_uninit_ = SUCCEEDED(hr_);
-        if (hr_ == S_FALSE) { hr_ = S_OK; should_uninit_ = false; }
-    }
-    ~CoInitializer() { if (should_uninit_) CoUninitialize(); }
-    bool IsValid() const { return SUCCEEDED(hr_); }
-    HRESULT GetResult() const { return hr_; }
-private:
-    HRESULT hr_;
-    bool should_uninit_ = true;
-};
-
+// Converts a Windows HRESULT to a readable string.
 std::string HResultToString(HRESULT hr) {
     char* msg_buf = nullptr;
     DWORD result = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, hr, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), reinterpret_cast<LPSTR>(&msg_buf), 0, nullptr);
@@ -165,511 +125,569 @@ std::string HResultToString(HRESULT hr) {
     return msg;
 }
 
-float half_to_float(uint16_t half) {
-    uint32_t sign = (half >> 15) & 0x0001;
-    uint32_t exponent = (half >> 10) & 0x001F;
-    uint32_t mantissa = half & 0x03FF;
-    if (exponent == 0) {
-        if (mantissa == 0) return sign ? -0.0f : 0.0f;
-        while (!(mantissa & 0x0400)) { mantissa <<= 1; exponent--; }
-        exponent++; mantissa &= ~0x0400;
-    } else if (exponent == 31) {
-        return mantissa == 0 ? (sign ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity()) : std::numeric_limits<float>::quiet_NaN();
-    }
-    exponent = exponent + (127 - 15);
-    mantissa = mantissa << 13;
-    uint32_t result_bits = (sign << 31) | (exponent << 23) | mantissa;
-    float result;
-    memcpy(&result, &result_bits, sizeof(result));
-    return result;
-}
+// Custom exception for cleaner error propagation to Python.
+class DDSLoadError : public std::runtime_error {
+public:
+    DDSLoadError(const std::string& message, HRESULT hr = S_OK)
+        : std::runtime_error(message + (FAILED(hr) ? " (" + HResultToString(hr) + ")" : "")), hresult_(hr) {}
+    HRESULT get_hresult() const { return hresult_; }
+private:
+    HRESULT hresult_;
+};
 
-// Xbox 360 format detection and conversion helpers
-bool IsXbox360Format(uint32_t fourCC) {
-    switch (fourCC) {
-        case FOURCC_DXT1_XBOX: case FOURCC_DXT3_XBOX: case FOURCC_DXT5_XBOX:
-        case FOURCC_DX10_XBOX: case MAKEFOURCC('1', 'I', 'T', 'A'): case MAKEFOURCC('2', 'I', 'T', 'A'):
-        case MAKEFOURCC('U', '4', 'C', 'B'): case MAKEFOURCC('U', '5', 'C', 'B'):
-            return true;
-        default:
-            return false;
+// Helper to throw our custom exception if an HRESULT is a failure code.
+inline void ThrowIfFailed(HRESULT hr, const std::string& message) {
+    if (FAILED(hr)) {
+        throw DDSLoadError(message, hr);
     }
 }
 
-uint32_t Xbox360ToStandardFourCC(uint32_t fourCC) {
-    switch (fourCC) {
-        case FOURCC_DXT1_XBOX: return FOURCC_DXT1;
-        case FOURCC_DXT3_XBOX: return FOURCC_DXT3;
-        case FOURCC_DXT5_XBOX: return FOURCC_DXT5;
-        case FOURCC_DX10_XBOX: return FOURCC_DX10;
-        case MAKEFOURCC('1', 'I', 'T', 'A'): return FOURCC_ATI1;
-        case MAKEFOURCC('2', 'I', 'T', 'A'): return FOURCC_ATI2;
-        case MAKEFOURCC('U', '4', 'C', 'B'): return FOURCC_BC4U;
-        case MAKEFOURCC('U', '5', 'C', 'B'): return FOURCC_BC5U;
-        default: return fourCC;
+// RAII wrapper for COM initialization/uninitialization.
+class CoInitializer {
+public:
+    CoInitializer() {
+        hr_ = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (hr_ == CUSTOM_RPC_E_CHANGED_MODE) hr_ = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        should_uninit_ = SUCCEEDED(hr_);
+        if (hr_ == S_FALSE) { hr_ = S_OK; should_uninit_ = false; }
     }
-}
+    ~CoInitializer() { if (should_uninit_) CoUninitialize(); }
+    bool IsValid() const { return SUCCEEDED(hr_); }
+    HRESULT GetResult() const { return hr_; }
+private:
+    HRESULT hr_;
+    bool should_uninit_ = true;
+};
 
-void PerformXboxEndianSwap(uint8_t* data, size_t dataSize, DXGI_FORMAT format) {
-    if (!data || dataSize == 0) return;
-    if (DirectX::IsCompressed(format)) {
-        size_t blockSize = (format == DXGI_FORMAT_BC1_UNORM || format == DXGI_FORMAT_BC4_UNORM) ? 8 : 16;
-        for (size_t i = 0; i + blockSize <= dataSize; i += blockSize) {
-            auto* block16 = reinterpret_cast<uint16_t*>(data + i);
-            if (format == DXGI_FORMAT_BC1_UNORM || format == DXGI_FORMAT_BC4_UNORM) {
-                block16[0] = SwapBytes(block16[0]); block16[1] = SwapBytes(block16[1]);
-            } else if (format == DXGI_FORMAT_BC2_UNORM || format == DXGI_FORMAT_BC3_UNORM) {
-                block16[4] = SwapBytes(block16[4]); block16[5] = SwapBytes(block16[5]);
-                if (format == DXGI_FORMAT_BC3_UNORM) {
-                    block16[1] = SwapBytes(block16[1]); block16[2] = SwapBytes(block16[2]); block16[3] = SwapBytes(block16[3]);
-                }
-            } else if (format == DXGI_FORMAT_BC5_UNORM) {
-                block16[1] = SwapBytes(block16[1]); block16[2] = SwapBytes(block16[2]); block16[3] = SwapBytes(block16[3]);
-                block16[5] = SwapBytes(block16[5]); block16[6] = SwapBytes(block16[6]); block16[7] = SwapBytes(block16[7]);
-            }
+// =======================================================================================
+//  Xbox 360 Utilities Namespace
+// =======================================================================================
+namespace XboxUtils {
+    template<typename T>
+    T SwapBytes(T value) {
+        static_assert(std::is_integral<T>::value, "SwapBytes can only be used with integral types");
+        T result{};
+        auto* src = reinterpret_cast<uint8_t*>(&value);
+        auto* dst = reinterpret_cast<uint8_t*>(&result);
+        for (size_t i = 0; i < sizeof(T); ++i) {
+            dst[i] = src[sizeof(T) - 1 - i];
         }
-    } else {
-        size_t bpp = DirectX::BitsPerPixel(format);
-        if (bpp >= 16) {
-            EndianSwapBuffer(data, dataSize, bpp / 8);
-        }
+        return result;
     }
-}
 
-void UnswizzleBlockLinear(const uint8_t* src, uint8_t* dst, uint32_t width, uint32_t height, uint32_t blockBytes, size_t srcSize, size_t dstSize) {
-    uint32_t blockWidth = (width + 3) / 4;
-    uint32_t blockHeight = (height + 3) / 4;
-    size_t requiredSize = static_cast<size_t>(blockWidth) * blockHeight * blockBytes;
-    if (srcSize < requiredSize || dstSize < requiredSize) throw std::runtime_error("Buffer too small for unswizzle operation.");
-
-    uint32_t logW = (blockWidth > 1) ? static_cast<uint32_t>(floor(log2(blockWidth - 1))) + 1 : 0;
-    uint32_t logH = (blockHeight > 1) ? static_cast<uint32_t>(floor(log2(blockHeight - 1))) + 1 : 0;
-    uint32_t min_log = std::min(logW, logH);
-
-    for (uint32_t y = 0; y < blockHeight; ++y) {
-        for (uint32_t x = 0; x < blockWidth; ++x) {
-            uint32_t swizzledIndex = 0;
-            for (uint32_t i = 0; i < min_log; ++i) {
-                swizzledIndex |= ((x >> i) & 1) << (2 * i);
-                swizzledIndex |= ((y >> i) & 1) << (2 * i + 1);
-            }
-            if (logW > logH) {
-                for (uint32_t i = min_log; i < logW; ++i) swizzledIndex |= ((x >> i) & 1) << (i + min_log);
-            } else {
-                for (uint32_t i = min_log; i < logH; ++i) swizzledIndex |= ((y >> i) & 1) << (i + min_log);
-            }
-            size_t srcOffset = static_cast<size_t>(swizzledIndex) * blockBytes;
-            size_t dstOffset = (static_cast<size_t>(y) * blockWidth + x) * blockBytes;
-            if (srcOffset + blockBytes <= srcSize && dstOffset + blockBytes <= dstSize) {
-                memcpy(dst + dstOffset, src + srcOffset, blockBytes);
+    void EndianSwapBuffer(uint8_t* data, size_t dataSize, size_t elementSize) {
+        if (elementSize <= 1) return;
+        for (size_t i = 0; i + elementSize <= dataSize; i += elementSize) {
+            for (size_t j = 0; j < elementSize / 2; ++j) {
+                std::swap(data[i + j], data[i + elementSize - 1 - j]);
             }
         }
     }
-}
 
-// More robust format detection function
-DXGI_FORMAT GetDXGIFormatFromHeader(const DDS_HEADER& header, const uint8_t* file_end, bool isXbox360) {
-    if (header.ddspf.dwSize != sizeof(DDS_PIXELFORMAT)) return DXGI_FORMAT_UNKNOWN;
-    const DDS_PIXELFORMAT& pf = header.ddspf;
-    if (pf.dwFlags & DDPF_FOURCC) {
-        uint32_t fourCC = isXbox360 ? Xbox360ToStandardFourCC(pf.dwFourCC) : pf.dwFourCC;
+    bool IsXbox360Format(uint32_t fourCC) {
         switch (fourCC) {
-            case FOURCC_DXT1: return DXGI_FORMAT_BC1_UNORM;
-            case FOURCC_DXT2: case FOURCC_DXT3: return DXGI_FORMAT_BC2_UNORM;
-            case FOURCC_DXT4: case FOURCC_DXT5: return DXGI_FORMAT_BC3_UNORM;
-            case FOURCC_ATI1: case FOURCC_BC4U: return DXGI_FORMAT_BC4_UNORM;
-            case FOURCC_BC4S: return DXGI_FORMAT_BC4_SNORM;
-            case FOURCC_ATI2: case FOURCC_BC5U: return DXGI_FORMAT_BC5_UNORM;
-            case FOURCC_BC5S: return DXGI_FORMAT_BC5_SNORM;
-            case FOURCC_DX10: {
-                const auto* ext = reinterpret_cast<const DDS_HEADER_DXT10*>(reinterpret_cast<const uint8_t*>(&header) + sizeof(DDS_HEADER));
-                if (reinterpret_cast<const uint8_t*>(ext) + sizeof(DDS_HEADER_DXT10) > file_end) return DXGI_FORMAT_UNKNOWN;
-                return ext->dxgiFormat;
-            }
-            default: return static_cast<DXGI_FORMAT>(pf.dwFourCC);
+            case MAKEFOURCC('1','T','X','D'):
+			case MAKEFOURCC('3','T','X','D'):
+			case MAKEFOURCC('5','T','X','D'):
+            case MAKEFOURCC('0','1','X','D'):
+			case MAKEFOURCC('1','I','T','A'):
+			case MAKEFOURCC('2','I','T','A'):
+            case MAKEFOURCC('U','4','C','B'):
+			case MAKEFOURCC('U','5','C','B'):
+                return true;
+            default: return false;
         }
     }
-    if (pf.dwFlags & DDPF_RGB) {
+
+    uint32_t Xbox360ToStandardFourCC(uint32_t fourCC) {
+        switch (fourCC) {
+            case MAKEFOURCC('1','T','X','D'): return MAKEFOURCC('D','X','T','1');
+            case MAKEFOURCC('3','T','X','D'): return MAKEFOURCC('D','X','T','3');
+            case MAKEFOURCC('5','T','X','D'): return MAKEFOURCC('D','X','T','5');
+            case MAKEFOURCC('0','1','X','D'): return MAKEFOURCC('D','X','1','0');
+            case MAKEFOURCC('1','I','T','A'): return MAKEFOURCC('A','T','I','1');
+            case MAKEFOURCC('2','I','T','A'): return MAKEFOURCC('A','T','I','2');
+            case MAKEFOURCC('U','4','C','B'): return MAKEFOURCC('B','C','4','U');
+            case MAKEFOURCC('U','5','C','B'): return MAKEFOURCC('B','C','5','U');
+            default: return fourCC;
+        }
+    }
+
+    void PerformXboxEndianSwap(uint8_t* data, size_t dataSize, DXGI_FORMAT format) {
+        if (!data || dataSize == 0) return;
+        if (DirectX::IsCompressed(format)) {
+            size_t blockSize = (format == DXGI_FORMAT_BC1_UNORM || format == DXGI_FORMAT_BC4_UNORM) ? 8 : 16;
+            for (size_t i = 0; i + blockSize <= dataSize; i += blockSize) {
+                auto* block16 = reinterpret_cast<uint16_t*>(data + i);
+                if (format == DXGI_FORMAT_BC1_UNORM || format == DXGI_FORMAT_BC4_UNORM) {
+                    block16[0] = SwapBytes(block16[0]); block16[1] = SwapBytes(block16[1]);
+                } else if (format == DXGI_FORMAT_BC2_UNORM || format == DXGI_FORMAT_BC3_UNORM) {
+                    block16[4] = SwapBytes(block16[4]); block16[5] = SwapBytes(block16[5]);
+                    if (format == DXGI_FORMAT_BC3_UNORM) {
+                        block16[1] = SwapBytes(block16[1]); block16[2] = SwapBytes(block16[2]); block16[3] = SwapBytes(block16[3]);
+                    }
+                } else if (format == DXGI_FORMAT_BC5_UNORM) {
+                    block16[1] = SwapBytes(block16[1]); block16[2] = SwapBytes(block16[2]); block16[3] = SwapBytes(block16[3]);
+                    block16[5] = SwapBytes(block16[5]); block16[6] = SwapBytes(block16[6]); block16[7] = SwapBytes(block16[7]);
+                }
+            }
+        } else {
+            size_t bpp = DirectX::BitsPerPixel(format);
+            if (bpp >= 16) {
+                EndianSwapBuffer(data, dataSize, bpp / 8);
+            }
+        }
+    }
+} // namespace XboxUtils
+
+// =======================================================================================
+// CryEngine Utilities Namespace
+// =======================================================================================
+namespace CryEngineUtils {
+    void UnswizzleBlockLinear(const uint8_t* src, uint8_t* dst, uint32_t width, uint32_t height, uint32_t blockBytes, size_t srcSize, size_t dstSize) {
+        uint32_t blockWidth = (width + 3) / 4;
+        uint32_t blockHeight = (height + 3) / 4;
+        size_t requiredSize = static_cast<size_t>(blockWidth) * blockHeight * blockBytes;
+        if (srcSize < requiredSize || dstSize < requiredSize) throw DDSLoadError("Buffer too small for unswizzle operation.");
+
+        uint32_t logW = (blockWidth > 1) ? static_cast<uint32_t>(floor(log2(blockWidth - 1))) + 1 : 0;
+        uint32_t logH = (blockHeight > 1) ? static_cast<uint32_t>(floor(log2(blockHeight - 1))) + 1 : 0;
+        uint32_t min_log = std::min(logW, logH);
+
+        for (uint32_t y = 0; y < blockHeight; ++y) {
+            for (uint32_t x = 0; x < blockWidth; ++x) {
+                uint32_t swizzledIndex = 0;
+                for (uint32_t i = 0; i < min_log; ++i) {
+                    swizzledIndex |= ((x >> i) & 1) << (2 * i);
+                    swizzledIndex |= ((y >> i) & 1) << (2 * i + 1);
+                }
+                if (logW > logH) {
+                    for (uint32_t i = min_log; i < logW; ++i) swizzledIndex |= ((x >> i) & 1) << (i + min_log);
+                } else {
+                    for (uint32_t i = min_log; i < logH; ++i) swizzledIndex |= ((y >> i) & 1) << (i + min_log);
+                }
+                size_t srcOffset = static_cast<size_t>(swizzledIndex) * blockBytes;
+                size_t dstOffset = (static_cast<size_t>(y) * blockWidth + x) * blockBytes;
+                if (srcOffset + blockBytes <= srcSize && dstOffset + blockBytes <= dstSize) {
+                    memcpy(dst + dstOffset, src + srcOffset, blockBytes);
+                }
+            }
+        }
+    }
+} // namespace CryEngineUtils
+
+// =======================================================================================
+// NumPy Conversion Utilities Namespace
+// =======================================================================================
+namespace NumpyUtils {
+    float half_to_float(uint16_t half) {
+        uint32_t sign = (half >> 15) & 0x0001;
+        uint32_t exponent = (half >> 10) & 0x001F;
+        uint32_t mantissa = half & 0x03FF;
+        if (exponent == 0) {
+            if (mantissa == 0) return sign ? -0.0f : 0.0f;
+            while (!(mantissa & 0x0400)) { mantissa <<= 1; exponent--; }
+            exponent++; mantissa &= ~0x0400;
+        } else if (exponent == 31) {
+            return mantissa == 0 ? (sign ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity()) : std::numeric_limits<float>::quiet_NaN();
+        }
+        exponent = exponent + (127 - 15);
+        mantissa = mantissa << 13;
+        uint32_t result_bits = (sign << 31) | (exponent << 23) | mantissa;
+        float result;
+        memcpy(&result, &result_bits, sizeof(result));
+        return result;
+    }
+
+    template <typename T>
+    py::object direct_copy_to_numpy(const DirectX::Image* image, int channels) {
+        std::vector<py::ssize_t> shape = {(py::ssize_t)image->height, (py::ssize_t)image->width};
+        if (channels > 0) {
+            shape.push_back(channels);
+        }
+        auto arr = py::array_t<T>(shape);
+        py::buffer_info buf = arr.request();
+        size_t numpy_row_pitch = image->width * sizeof(T) * (channels > 0 ? channels : 1);
+        if (image->rowPitch == numpy_row_pitch) {
+            memcpy(buf.ptr, image->pixels, image->slicePitch);
+        } else {
+            auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
+            const auto* src_ptr = image->pixels;
+            for (size_t y = 0; y < image->height; ++y) {
+                memcpy(dst_ptr + y * numpy_row_pitch, src_ptr + y * image->rowPitch, numpy_row_pitch);
+            }
+        }
+        return arr;
+    }
+
+    py::object convert_half_to_float_numpy(const DirectX::Image* image, size_t num_components) {
+        std::vector<py::ssize_t> shape = {(py::ssize_t)image->height, (py::ssize_t)image->width};
+        if (num_components > 1) {
+            shape.push_back(num_components);
+        }
+        auto numpy_array = py::array_t<float>(shape);
+        py::buffer_info buf = numpy_array.request();
+        auto* dst_ptr = static_cast<float*>(buf.ptr);
+        const auto* src_ptr_base = image->pixels;
+        for (size_t y = 0; y < image->height; ++y) {
+            const auto* src_row_ptr = reinterpret_cast<const uint16_t*>(src_ptr_base + y * image->rowPitch);
+            float* dst_row_ptr = dst_ptr + y * image->width * num_components;
+            for (size_t i = 0; i < image->width * num_components; ++i) {
+                dst_row_ptr[i] = half_to_float(src_row_ptr[i]);
+            }
+        }
+        return py::object(numpy_array);
+    }
+
+    py::object CreateNumpyArrayFromImage(const DirectX::Image* image) {
+        if (!image || !image->pixels) {
+            throw DDSLoadError("Cannot create NumPy array from an invalid image.");
+        }
+        switch (image->format) {
+            case DXGI_FORMAT_R32G32B32A32_FLOAT: return direct_copy_to_numpy<float>(image, 4);
+            case DXGI_FORMAT_R32G32B32_FLOAT:    return direct_copy_to_numpy<float>(image, 3);
+            case DXGI_FORMAT_R32G32_FLOAT:       return direct_copy_to_numpy<float>(image, 2);
+            case DXGI_FORMAT_R32_FLOAT:          return direct_copy_to_numpy<float>(image, 1);
+            case DXGI_FORMAT_R16G16B16A16_FLOAT: return convert_half_to_float_numpy(image, 4);
+            case DXGI_FORMAT_R16G16_FLOAT:       return convert_half_to_float_numpy(image, 2);
+            case DXGI_FORMAT_R16_FLOAT:          return convert_half_to_float_numpy(image, 1);
+            case DXGI_FORMAT_R16G16B16A16_UNORM: return direct_copy_to_numpy<uint16_t>(image, 4);
+            case DXGI_FORMAT_R16G16_UNORM:       return direct_copy_to_numpy<uint16_t>(image, 2);
+            case DXGI_FORMAT_R16_UNORM:          return direct_copy_to_numpy<uint16_t>(image, 1);
+            case DXGI_FORMAT_R16G16B16A16_UINT:  return direct_copy_to_numpy<uint16_t>(image, 4);
+            case DXGI_FORMAT_R16G16_UINT:        return direct_copy_to_numpy<uint16_t>(image, 2);
+            case DXGI_FORMAT_R16_UINT:           return direct_copy_to_numpy<uint16_t>(image, 1);
+            case DXGI_FORMAT_R16G16B16A16_SINT:  return direct_copy_to_numpy<int16_t>(image, 4);
+            case DXGI_FORMAT_R16G16_SINT:        return direct_copy_to_numpy<int16_t>(image, 2);
+            case DXGI_FORMAT_R16_SINT:           return direct_copy_to_numpy<int16_t>(image, 1);
+            case DXGI_FORMAT_R8G8B8A8_UNORM:
+            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+                return direct_copy_to_numpy<uint8_t>(image, 4);
+            case DXGI_FORMAT_B8G8R8A8_UNORM:
+            case DXGI_FORMAT_B8G8R8X8_UNORM:
+            case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: {
+                auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+                py::buffer_info buf = arr.request();
+                auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
+                const auto* src_ptr = image->pixels;
+                for (size_t y = 0; y < image->height; ++y) {
+                    const uint8_t* src_row = src_ptr + y * image->rowPitch;
+                    uint8_t* dst_row = dst_ptr + y * image->width * 4;
+                    for (size_t x = 0; x < image->width; ++x) {
+                        dst_row[x * 4 + 0] = src_row[x * 4 + 2]; // B -> R
+                        dst_row[x * 4 + 1] = src_row[x * 4 + 1]; // G -> G
+                        dst_row[x * 4 + 2] = src_row[x * 4 + 0]; // R -> B
+                        dst_row[x * 4 + 3] = src_row[x * 4 + 3]; // A -> A
+                    }
+                }
+                return arr;
+            }
+            case DXGI_FORMAT_R8G8B8A8_UINT: return direct_copy_to_numpy<uint8_t>(image, 4);
+            case DXGI_FORMAT_R8G8_UINT:     return direct_copy_to_numpy<uint8_t>(image, 2);
+            case DXGI_FORMAT_R8_UINT:       return direct_copy_to_numpy<uint8_t>(image, 1);
+            case DXGI_FORMAT_R8G8B8A8_SINT: return direct_copy_to_numpy<int8_t>(image, 4);
+            case DXGI_FORMAT_R8G8_SINT:     return direct_copy_to_numpy<int8_t>(image, 2);
+            case DXGI_FORMAT_R8_SINT:       return direct_copy_to_numpy<int8_t>(image, 1);
+            case DXGI_FORMAT_R8G8B8A8_SNORM:
+            case DXGI_FORMAT_R8G8_SNORM:
+            case DXGI_FORMAT_R8_SNORM:
+            case DXGI_FORMAT_R16G16B16A16_SNORM:
+            case DXGI_FORMAT_R16G16_SNORM:
+            case DXGI_FORMAT_R16_SNORM: {
+                int channels = (image->format == DXGI_FORMAT_R8G8B8A8_SNORM || image->format == DXGI_FORMAT_R16G16B16A16_SNORM) ? 4 : ((image->format == DXGI_FORMAT_R8G8_SNORM || image->format == DXGI_FORMAT_R16G16_SNORM) ? 2 : 1);
+                bool is16bit = (image->format == DXGI_FORMAT_R16G16B16A16_SNORM || image->format == DXGI_FORMAT_R16G16_SNORM || image->format == DXGI_FORMAT_R16_SNORM);
+                auto arr = py::array_t<float>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, (py::ssize_t)channels});
+                py::buffer_info buf = arr.request();
+                auto* dst_ptr = static_cast<float*>(buf.ptr);
+                const auto* src_ptr = image->pixels;
+                for (size_t y = 0; y < image->height; ++y) {
+                    const void* src_row = src_ptr + y * image->rowPitch;
+                    float* dst_row = dst_ptr + y * image->width * channels;
+                    for (size_t x = 0; x < image->width * channels; ++x) {
+                        dst_row[x] = std::max(-1.f, (is16bit ? static_cast<float>(reinterpret_cast<const int16_t*>(src_row)[x]) / 32767.f : static_cast<float>(reinterpret_cast<const int8_t*>(src_row)[x]) / 127.f));
+                    }
+                }
+                return arr;
+            }
+            case DXGI_FORMAT_B5G6R5_UNORM: {
+                auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+                py::buffer_info buf = arr.request();
+                auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
+                for (size_t y = 0; y < image->height; ++y) {
+                    const auto* src_row = reinterpret_cast<const uint16_t*>(image->pixels + y * image->rowPitch);
+                    uint8_t* dst_row = dst_ptr + y * image->width * 4;
+                    for (size_t x = 0; x < image->width; ++x) {
+                        uint16_t p = src_row[x];
+                        dst_row[x * 4 + 0] = static_cast<uint8_t>(((p >> 11) & 0x1F) * 255/31);
+                        dst_row[x * 4 + 1] = static_cast<uint8_t>(((p >> 5)  & 0x3F) * 255/63);
+                        dst_row[x * 4 + 2] = static_cast<uint8_t>(( p        & 0x1F) * 255/31);
+                        dst_row[x * 4 + 3] = 255;
+                    }
+                }
+                return arr;
+            }
+            case DXGI_FORMAT_B5G5R5A1_UNORM: {
+                auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+                py::buffer_info buf = arr.request();
+                auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
+                for (size_t y = 0; y < image->height; ++y) {
+                    const auto* src_row = reinterpret_cast<const uint16_t*>(image->pixels + y * image->rowPitch);
+                    uint8_t* dst_row = dst_ptr + y * image->width * 4;
+                    for (size_t x = 0; x < image->width; ++x) {
+                        uint16_t p = src_row[x];
+                        dst_row[x * 4 + 0] = static_cast<uint8_t>(((p>>10) & 0x1F) * 255/31);
+                        dst_row[x * 4 + 1] = static_cast<uint8_t>(((p>>5)  & 0x1F) * 255/31);
+                        dst_row[x * 4 + 2] = static_cast<uint8_t>((p&0x1F) * 255/31);
+                        dst_row[x * 4 + 3] = static_cast<uint8_t>(((p>>15) & 0x01) * 255);
+                    }
+                }
+                return arr;
+            }
+            case DXGI_FORMAT_B4G4R4A4_UNORM: {
+                auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+                py::buffer_info buf = arr.request();
+                auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
+                for (size_t y = 0; y < image->height; ++y) {
+                    const auto* src_row = reinterpret_cast<const uint16_t*>(image->pixels + y * image->rowPitch);
+                    uint8_t* dst_row = dst_ptr + y * image->width * 4;
+                    for (size_t x = 0; x < image->width; ++x) {
+                        uint16_t p = src_row[x];
+                        uint8_t r = (p>>8) & 0x0F, g = (p>>4) & 0x0F, b=p&0x0F, a = (p>>12) & 0x0F;
+                        dst_row[x * 4 + 0] = (r << 4) | r;
+                        dst_row[x * 4 + 1] = (g << 4) | g;
+                        dst_row[x * 4 + 2] = (b << 4) | b;
+                        dst_row[x * 4 + 3] = (a << 4) | a;
+                    }
+                }
+                return arr;
+            }
+            case DXGI_FORMAT_R8G8_UNORM: {
+                auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+                py::buffer_info buf = arr.request();
+                auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
+                for (size_t y = 0; y < image->height; ++y) {
+                    const uint8_t* src_row = image->pixels + y * image->rowPitch;
+                    uint8_t* dst_row = dst_ptr + y * image->width * 4;
+                    for (size_t x = 0; x < image->width; ++x) {
+                        dst_row[x * 4 + 0] = src_row[x * 2 + 0];
+                        dst_row[x * 4 + 1] = src_row[x * 2 + 1];
+                        dst_row[x * 4 + 2] = 0;
+                        dst_row[x * 4 + 3] = 255;
+                    }
+                }
+                return arr;
+            }
+            case DXGI_FORMAT_R8_UNORM: {
+                auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+                py::buffer_info buf = arr.request();
+                auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
+                for (size_t y = 0; y < image->height; ++y) {
+                    const uint8_t* src_row = image->pixels + y * image->rowPitch;
+                    uint8_t* dst_row = dst_ptr + y * image->width * 4;
+                    for (size_t x = 0; x < image->width; ++x) {
+                        uint8_t val = src_row[x];
+                        dst_row[x * 4 + 0] = val;
+                        dst_row[x * 4 + 1] = val;
+                        dst_row[x * 4 + 2] = val;
+                        dst_row[x * 4 + 3] = 255;
+                    }
+                }
+                return arr;
+            }
+            case DXGI_FORMAT_A8_UNORM: {
+                auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+                py::buffer_info buf = arr.request();
+                auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
+                for (size_t y = 0; y < image->height; ++y) {
+                    const uint8_t* src_row = image->pixels + y * image->rowPitch;
+                    uint8_t* dst_row = dst_ptr + y * image->width * 4;
+                    for (size_t x = 0; x < image->width; ++x) {
+                        dst_row[x * 4 + 0] = 255;
+                        dst_row[x * 4 + 1] = 255;
+                        dst_row[x * 4 + 2] = 255;
+                        dst_row[x * 4 + 3] = src_row[x];
+                    }
+                }
+                return arr;
+            }
+            default:
+                throw DDSLoadError("Unsupported DXGI_FORMAT for NumPy conversion: " + DXGIFormatToString(image->format));
+        }
+    }
+} // namespace NumpyUtils
+
+
+// =======================================================================================
+// Core Loading and Decoding Logic
+// =======================================================================================
+
+// Centralized structure to hold results of header analysis.
+struct AnalyzedHeaderInfo {
+    DDS_HEADER header;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    const uint8_t* data_ptr = nullptr;
+    size_t data_size = 0;
+    bool is_swizzled = false;
+    bool is_xbox = false;
+};
+
+// Centralized function to analyze and correct DDS headers.
+AnalyzedHeaderInfo analyze_header(const uint8_t* dds_data_ptr, size_t dds_data_size) {
+    if (dds_data_size < sizeof(DDS_HEADER) + 4) throw DDSLoadError("Input data too small for a DDS file");
+    if (memcmp(dds_data_ptr, "DDS ", 4) != 0) throw DDSLoadError("Not a DDS file (missing 'DDS ' magic number)");
+
+    AnalyzedHeaderInfo info;
+    info.header = *reinterpret_cast<const DDS_HEADER*>(dds_data_ptr + 4);
+    const uint8_t* file_end = dds_data_ptr + dds_data_size;
+    if (info.header.dwSize != sizeof(DDS_HEADER)) throw DDSLoadError("Invalid DDS header size.");
+
+    info.is_xbox = XboxUtils::IsXbox360Format(info.header.ddspf.dwFourCC);
+
+    const DDS_PIXELFORMAT& pf = info.header.ddspf;
+    if (pf.dwSize != sizeof(DDS_PIXELFORMAT)) throw DDSLoadError("Invalid DDS_PIXELFORMAT size.");
+
+    // Determine initial format from FourCC
+    if (pf.dwFlags & DDPF_FOURCC) {
+        uint32_t fourCC = info.is_xbox ? XboxUtils::Xbox360ToStandardFourCC(pf.dwFourCC) : pf.dwFourCC;
+
+        switch (fourCC) {
+            case FOURCC_DXT1: info.format = DXGI_FORMAT_BC1_UNORM; break;
+            case FOURCC_DXT2: case FOURCC_DXT3: info.format = DXGI_FORMAT_BC2_UNORM; break;
+            case FOURCC_DXT4: case FOURCC_DXT5: info.format = DXGI_FORMAT_BC3_UNORM; break;
+            case FOURCC_ATI1: case FOURCC_BC4U: info.format = DXGI_FORMAT_BC4_UNORM; break;
+            case FOURCC_BC4S: info.format = DXGI_FORMAT_BC4_SNORM; break;
+            case FOURCC_ATI2: case FOURCC_BC5U: info.format = DXGI_FORMAT_BC5_UNORM; break;
+            case FOURCC_BC5S: info.format = DXGI_FORMAT_BC5_SNORM; break;
+
+            case FOURCC_DX10: {
+                const auto* ext = reinterpret_cast<const DDS_HEADER_DXT10*>(&info.header + 1);
+                if (reinterpret_cast<const uint8_t*>(ext) + sizeof(DDS_HEADER_DXT10) > file_end) throw DDSLoadError("DX10 header is out of bounds.");
+                info.format = ext->dxgiFormat;
+                break;
+            }
+        }
+    }
+    // Determine format from RGB bitmasks for uncompressed data
+    else if (pf.dwFlags & DDPF_RGB) {
         switch (pf.dwRGBBitCount) {
             case 32:
-                if (pf.dwRBitMask == 0x00ff0000 && pf.dwGBitMask == 0x0000ff00 && pf.dwBBitMask == 0x000000ff) return DXGI_FORMAT_R8G8B8A8_UNORM;
-                if (pf.dwRBitMask == 0x000000ff && pf.dwGBitMask == 0x0000ff00 && pf.dwBBitMask == 0x00ff0000) return DXGI_FORMAT_B8G8R8A8_UNORM;
+                if (pf.dwRBitMask == 0x00ff0000 && pf.dwGBitMask == 0x0000ff00 && pf.dwBBitMask == 0x000000ff) info.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                else if (pf.dwRBitMask == 0x000000ff && pf.dwGBitMask == 0x0000ff00 && pf.dwBBitMask == 0x00ff0000) info.format = DXGI_FORMAT_B8G8R8A8_UNORM;
                 break;
             case 16:
-                if (pf.dwRBitMask == 0xf800 && pf.dwGBitMask == 0x07e0 && pf.dwBBitMask == 0x001f) return DXGI_FORMAT_B5G6R5_UNORM;
-                if (pf.dwRBitMask == 0x7c00 && pf.dwGBitMask == 0x03e0 && pf.dwBBitMask == 0x001f) return DXGI_FORMAT_B5G5R5A1_UNORM;
-                if (pf.dwRBitMask == 0x0f00 && pf.dwGBitMask == 0x00f0 && pf.dwBBitMask == 0x000f) return DXGI_FORMAT_B4G4R4A4_UNORM;
+                if (pf.dwRBitMask == 0xf800 && pf.dwGBitMask == 0x07e0 && pf.dwBBitMask == 0x001f) info.format = DXGI_FORMAT_B5G6R5_UNORM;
+                if (pf.dwRBitMask == 0x7c00 && pf.dwGBitMask == 0x03e0 && pf.dwBBitMask == 0x001f) info.format = DXGI_FORMAT_B5G5R5A1_UNORM;
+                if (pf.dwRBitMask == 0x0f00 && pf.dwGBitMask == 0x00f0 && pf.dwBBitMask == 0x000f) info.format = DXGI_FORMAT_B4G4R4A4_UNORM;
                 break;
         }
     }
-    if ((pf.dwFlags & DDPF_LUMINANCE) && pf.dwRGBBitCount == 8) return DXGI_FORMAT_R8_UNORM;
-    if ((pf.dwFlags & DDPF_ALPHAPIXELS) && pf.dwRGBBitCount == 8) return DXGI_FORMAT_A8_UNORM;
+    else if ((pf.dwFlags & DDPF_LUMINANCE) && pf.dwRGBBitCount == 8) info.format = DXGI_FORMAT_R8_UNORM;
+    else if ((pf.dwFlags & DDPF_ALPHAPIXELS) && pf.dwRGBBitCount == 8) info.format = DXGI_FORMAT_A8_UNORM;
 
-    return DXGI_FORMAT_UNKNOWN;
+    // Calculate data offset, accounting for the DX10 header if present
+    info.data_ptr = dds_data_ptr + 4 + sizeof(DDS_HEADER);
+    if (pf.dwFourCC == FOURCC_DX10 || (info.is_xbox && XboxUtils::Xbox360ToStandardFourCC(pf.dwFourCC) == FOURCC_DX10)) {
+        info.data_ptr += sizeof(DDS_HEADER_DXT10);
+    }
+
+    // Check for CryEngine markers and apply heuristics
+    if (info.data_ptr + 4 <= file_end) {
+        const uint32_t* marker = reinterpret_cast<const uint32_t*>(info.data_ptr);
+        bool marker_found = (*marker == FOURCC_CRYF || *marker == FOURCC_FYRC);
+
+        if (marker_found) {
+            info.is_swizzled = (*marker == FOURCC_CRYF);
+            info.data_ptr += (*marker == FOURCC_CRYF) ? 8 : 4;
+
+            if (pf.dwFlags & DDPF_RGB) {
+                const size_t actual_data_size = file_end - info.data_ptr;
+                size_t expected_size_dxt1 = std::max(1u, (info.header.dwWidth + 3) / 4) * std::max(1u, (info.header.dwHeight + 3) / 4) * 8;
+                if (actual_data_size >= expected_size_dxt1) {
+                    info.format = DXGI_FORMAT_BC1_UNORM;
+                }
+            }
+        }
+    }
+
+    if (info.data_ptr >= file_end) throw DDSLoadError("Image data offset is out of bounds.");
+    info.data_size = file_end - info.data_ptr;
+
+    return info;
 }
 
-// Template helper for direct copy to NumPy array
-template <typename T>
-py::object direct_copy_to_numpy(const DirectX::Image* image, int channels) {
-    std::vector<py::ssize_t> shape = {(py::ssize_t)image->height, (py::ssize_t)image->width};
-    if (channels > 0) {
-        shape.push_back(channels);
-    }
-    auto arr = py::array_t<T>(shape);
-    py::buffer_info buf = arr.request();
-    size_t numpy_row_pitch = image->width * sizeof(T) * (channels > 0 ? channels : 1);
-    if (image->rowPitch == numpy_row_pitch) {
-        memcpy(buf.ptr, image->pixels, image->slicePitch);
-    } else {
-        auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
-        const auto* src_ptr = image->pixels;
-        for (size_t y = 0; y < image->height; ++y) {
-            memcpy(dst_ptr + y * numpy_row_pitch, src_ptr + y * image->rowPitch, numpy_row_pitch);
-        }
-    }
-    return arr;
-}
 
-// Helper for converting half-float to float and creating a NumPy array
-py::object convert_half_to_float_numpy(const DirectX::Image* image, size_t num_components) {
-    std::vector<py::ssize_t> shape = {(py::ssize_t)image->height, (py::ssize_t)image->width};
-    if (num_components > 1) {
-        shape.push_back(num_components);
-    }
-    auto numpy_array = py::array_t<float>(shape);
-    py::buffer_info buf = numpy_array.request();
-    auto* dst_ptr = static_cast<float*>(buf.ptr);
-    const auto* src_ptr_base = image->pixels;
-    for (size_t y = 0; y < image->height; ++y) {
-        const auto* src_row_ptr = reinterpret_cast<const uint16_t*>(src_ptr_base + y * image->rowPitch);
-        float* dst_row_ptr = dst_ptr + y * image->width * num_components;
-        for (size_t i = 0; i < image->width * num_components; ++i) {
-            dst_row_ptr[i] = half_to_float(src_row_ptr[i]);
-        }
-    }
-    return py::object(numpy_array);
-}
-
-py::object CreateNumpyArrayFromImage(const DirectX::Image* image) {
-    if (!image || !image->pixels) {
-        throw std::runtime_error("Cannot create NumPy array from an invalid image.");
-    }
-    switch (image->format) {
-        case DXGI_FORMAT_R32G32B32A32_FLOAT: return direct_copy_to_numpy<float>(image, 4);
-        case DXGI_FORMAT_R32G32B32_FLOAT:    return direct_copy_to_numpy<float>(image, 3);
-        case DXGI_FORMAT_R32G32_FLOAT:       return direct_copy_to_numpy<float>(image, 2);
-        case DXGI_FORMAT_R32_FLOAT:          return direct_copy_to_numpy<float>(image, 1);
-        case DXGI_FORMAT_R16G16B16A16_FLOAT: return convert_half_to_float_numpy(image, 4);
-        case DXGI_FORMAT_R16G16_FLOAT:       return convert_half_to_float_numpy(image, 2);
-        case DXGI_FORMAT_R16_FLOAT:          return convert_half_to_float_numpy(image, 1);
-        case DXGI_FORMAT_R16G16B16A16_UNORM: return direct_copy_to_numpy<uint16_t>(image, 4);
-        case DXGI_FORMAT_R16G16_UNORM:       return direct_copy_to_numpy<uint16_t>(image, 2);
-        case DXGI_FORMAT_R16_UNORM:          return direct_copy_to_numpy<uint16_t>(image, 1);
-        case DXGI_FORMAT_R16G16B16A16_UINT:  return direct_copy_to_numpy<uint16_t>(image, 4);
-        case DXGI_FORMAT_R16G16_UINT:        return direct_copy_to_numpy<uint16_t>(image, 2);
-        case DXGI_FORMAT_R16_UINT:           return direct_copy_to_numpy<uint16_t>(image, 1);
-        case DXGI_FORMAT_R16G16B16A16_SINT:  return direct_copy_to_numpy<int16_t>(image, 4);
-        case DXGI_FORMAT_R16G16_SINT:        return direct_copy_to_numpy<int16_t>(image, 2);
-        case DXGI_FORMAT_R16_SINT:           return direct_copy_to_numpy<int16_t>(image, 1);
-        case DXGI_FORMAT_R8G8B8A8_UNORM:
-        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-            return direct_copy_to_numpy<uint8_t>(image, 4);
-        case DXGI_FORMAT_B8G8R8A8_UNORM:
-        case DXGI_FORMAT_B8G8R8X8_UNORM:
-        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: {
-            auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
-            py::buffer_info buf = arr.request();
-            auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
-            const auto* src_ptr = image->pixels;
-            for (size_t y = 0; y < image->height; ++y) {
-                const uint8_t* src_row = src_ptr + y * image->rowPitch;
-                uint8_t* dst_row = dst_ptr + y * image->width * 4;
-                for (size_t x = 0; x < image->width; ++x) {
-                    dst_row[x * 4 + 0] = src_row[x * 4 + 2];
-                    dst_row[x * 4 + 1] = src_row[x * 4 + 1];
-                    dst_row[x * 4 + 2] = src_row[x * 4 + 0];
-                    dst_row[x * 4 + 3] = src_row[x * 4 + 3];
-                }
-            }
-            return arr;
-        }
-        case DXGI_FORMAT_R8G8B8A8_UINT: return direct_copy_to_numpy<uint8_t>(image, 4);
-        case DXGI_FORMAT_R8G8_UINT:     return direct_copy_to_numpy<uint8_t>(image, 2);
-        case DXGI_FORMAT_R8_UINT:       return direct_copy_to_numpy<uint8_t>(image, 1);
-        case DXGI_FORMAT_R8G8B8A8_SINT: return direct_copy_to_numpy<int8_t>(image, 4);
-        case DXGI_FORMAT_R8G8_SINT:     return direct_copy_to_numpy<int8_t>(image, 2);
-        case DXGI_FORMAT_R8_SINT:       return direct_copy_to_numpy<int8_t>(image, 1);
-        case DXGI_FORMAT_R8G8B8A8_SNORM:
-        case DXGI_FORMAT_R8G8_SNORM:
-        case DXGI_FORMAT_R8_SNORM:
-        case DXGI_FORMAT_R16G16B16A16_SNORM:
-        case DXGI_FORMAT_R16G16_SNORM:
-        case DXGI_FORMAT_R16_SNORM: {
-            int channels = (image->format == DXGI_FORMAT_R8G8B8A8_SNORM || image->format == DXGI_FORMAT_R16G16B16A16_SNORM) ? 4 : ((image->format == DXGI_FORMAT_R8G8_SNORM || image->format == DXGI_FORMAT_R16G16_SNORM) ? 2 : 1);
-            bool is16bit = (image->format == DXGI_FORMAT_R16G16B16A16_SNORM || image->format == DXGI_FORMAT_R16G16_SNORM || image->format == DXGI_FORMAT_R16_SNORM);
-            auto arr = py::array_t<float>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, (py::ssize_t)channels});
-            py::buffer_info buf = arr.request();
-            auto* dst_ptr = static_cast<float*>(buf.ptr);
-            const auto* src_ptr = image->pixels;
-            for (size_t y = 0; y < image->height; ++y) {
-                const void* src_row = src_ptr + y * image->rowPitch;
-                float* dst_row = dst_ptr + y * image->width * channels;
-                for (size_t x = 0; x < image->width * channels; ++x) {
-                    dst_row[x] = std::max(-1.f, (is16bit ? static_cast<float>(reinterpret_cast<const int16_t*>(src_row)[x]) / 32767.f : static_cast<float>(reinterpret_cast<const int8_t*>(src_row)[x]) / 127.f));
-                }
-            }
-            return arr;
-        }
-        case DXGI_FORMAT_B5G6R5_UNORM: {
-            auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
-            py::buffer_info buf = arr.request();
-            auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
-            for (size_t y = 0; y < image->height; ++y) {
-                const auto* src_row = reinterpret_cast<const uint16_t*>(image->pixels + y * image->rowPitch);
-                uint8_t* dst_row = dst_ptr + y * image->width * 4;
-                for (size_t x = 0; x < image->width; ++x) {
-                    uint16_t p = src_row[x];
-                    dst_row[x * 4 + 0] = static_cast<uint8_t>(((p >> 11) & 0x1F) * 255/31);
-                    dst_row[x * 4 + 1] = static_cast<uint8_t>(((p >> 5)  & 0x3F) * 255/63);
-                    dst_row[x * 4 + 2] = static_cast<uint8_t>(( p        & 0x1F) * 255/31);
-                    dst_row[x * 4 + 3] = 255;
-                }
-            }
-            return arr;
-        }
-        case DXGI_FORMAT_B5G5R5A1_UNORM: {
-            auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
-            py::buffer_info buf = arr.request();
-            auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
-            for (size_t y = 0; y < image->height; ++y) {
-                const auto* src_row = reinterpret_cast<const uint16_t*>(image->pixels + y * image->rowPitch);
-                uint8_t* dst_row = dst_ptr + y * image->width * 4;
-                for (size_t x = 0; x < image->width; ++x) {
-                    uint16_t p = src_row[x];
-                    dst_row[x * 4 + 0] = static_cast<uint8_t>(((p>>10) & 0x1F) * 255/31);
-                    dst_row[x * 4 + 1] = static_cast<uint8_t>(((p>>5)  & 0x1F) * 255/31);
-                    dst_row[x * 4 + 2] = static_cast<uint8_t>((p&0x1F) * 255/31);
-                    dst_row[x * 4 + 3] = static_cast<uint8_t>(((p>>15) & 0x01) * 255);
-                }
-            }
-            return arr;
-        }
-        case DXGI_FORMAT_B4G4R4A4_UNORM: {
-            auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
-            py::buffer_info buf = arr.request();
-            auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
-            for (size_t y = 0; y < image->height; ++y) {
-                const auto* src_row = reinterpret_cast<const uint16_t*>(image->pixels + y * image->rowPitch);
-                uint8_t* dst_row = dst_ptr + y * image->width * 4;
-                for (size_t x = 0; x < image->width; ++x) {
-                    uint16_t p = src_row[x];
-                    uint8_t r = (p>>8) & 0x0F, g = (p>>4) & 0x0F, b=p&0x0F, a = (p>>12) & 0x0F;
-                    dst_row[x * 4 + 0] = (r << 4) | r;
-                    dst_row[x * 4 + 1] = (g << 4) | g;
-                    dst_row[x * 4 + 2] = (b << 4) | b;
-                    dst_row[x * 4 + 3] = (a << 4) | a;
-                }
-            }
-            return arr;
-        }
-        case DXGI_FORMAT_R8G8_UNORM: {
-            auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
-            py::buffer_info buf = arr.request();
-            auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
-            for (size_t y = 0; y < image->height; ++y) {
-                const uint8_t* src_row = image->pixels + y * image->rowPitch;
-                uint8_t* dst_row = dst_ptr + y * image->width * 4;
-                for (size_t x = 0; x < image->width; ++x) {
-                    dst_row[x * 4 + 0] = src_row[x * 2 + 0];
-                    dst_row[x * 4 + 1] = src_row[x * 2 + 1];
-                    dst_row[x * 4 + 2] = 0;
-                    dst_row[x * 4 + 3] = 255;
-                }
-            }
-            return arr;
-        }
-        case DXGI_FORMAT_R8_UNORM: {
-            auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
-            py::buffer_info buf = arr.request();
-            auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
-            for (size_t y = 0; y < image->height; ++y) {
-                const uint8_t* src_row = image->pixels + y * image->rowPitch;
-                uint8_t* dst_row = dst_ptr + y * image->width * 4;
-                for (size_t x = 0; x < image->width; ++x) {
-                    uint8_t val = src_row[x];
-                    dst_row[x * 4 + 0] = val;
-                    dst_row[x * 4 + 1] = val;
-                    dst_row[x * 4 + 2] = val;
-                    dst_row[x * 4 + 3] = 255;
-                }
-            }
-            return arr;
-        }
-        case DXGI_FORMAT_A8_UNORM: {
-            auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
-            py::buffer_info buf = arr.request();
-            auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
-            for (size_t y = 0; y < image->height; ++y) {
-                const uint8_t* src_row = image->pixels + y * image->rowPitch;
-                uint8_t* dst_row = dst_ptr + y * image->width * 4;
-                for (size_t x = 0; x < image->width; ++x) {
-                    dst_row[x * 4 + 0] = 255;
-                    dst_row[x * 4 + 1] = 255;
-                    dst_row[x * 4 + 2] = 255;
-                    dst_row[x * 4 + 3] = src_row[x];
-                }
-            }
-            return arr;
-        }
-        default:
-            throw std::runtime_error("Unsupported DXGI_FORMAT for NumPy conversion: " + DXGIFormatToString(image->format));
-    }
-}
-
-// Helper function for the fallback loading logic
+// Fallback loader using manual header analysis for legacy/broken files.
 std::unique_ptr<ScratchImage> load_with_fallback(const uint8_t* dds_data_ptr, size_t dds_data_size) {
-    const auto* header = reinterpret_cast<const DDS_HEADER*>(dds_data_ptr + 4);
-    const uint8_t* file_end = dds_data_ptr + dds_data_size;
-    if (header->dwSize != 124) {
-        throw std::runtime_error("Invalid DDS header size in fallback.");
-    }
-
-    bool isXbox360 = IsXbox360Format(header->ddspf.dwFourCC);
-    DXGI_FORMAT manual_format = GetDXGIFormatFromHeader(*header, file_end, isXbox360);
-    const uint8_t* image_data_start = dds_data_ptr + 4 + sizeof(DDS_HEADER);
-    bool is_swizzled = false;
-
-    if (header->ddspf.dwFourCC == FOURCC_DX10 || header->ddspf.dwFourCC == FOURCC_DX10_XBOX) {
-        image_data_start += sizeof(DDS_HEADER_DXT10);
-    }
-
-    bool marker_found = false;
-    if (image_data_start + 4 <= file_end) {
-        const uint32_t* marker = reinterpret_cast<const uint32_t*>(image_data_start);
-        if (*marker == FOURCC_CRYF) {
-            is_swizzled = true;
-            marker_found = true;
-            image_data_start += 8;
-        } else if (*marker == FOURCC_FYRC) {
-            is_swizzled = false;
-            marker_found = true;
-            image_data_start += 4;
-        }
-    }
-
-    const size_t actual_data_size = file_end - image_data_start;
-
-    if (marker_found && (header->ddspf.dwFlags & DDPF_RGB)) {
-        if (header->ddspf.dwRBitMask == 0x000000FF && header->ddspf.dwGBitMask == 0x000000FF) {
-            manual_format = DXGI_FORMAT_BC5_UNORM;
-        } else {
-            size_t expected_size_dxt1 = std::max(1u, (header->dwWidth + 3) / 4) * std::max(1u, (header->dwHeight + 3) / 4) * 8;
-            if (actual_data_size >= expected_size_dxt1) {
-                manual_format = DXGI_FORMAT_BC1_UNORM;
-            } else {
-                manual_format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            }
-        }
-    }
-
-    if (image_data_start >= file_end) {
-        throw std::runtime_error("Image data offset out of bounds in fallback.");
-    }
+    AnalyzedHeaderInfo info = analyze_header(dds_data_ptr, dds_data_size);
 
     size_t row_pitch, slice_pitch;
-    if (FAILED(ComputePitch(manual_format, header->dwWidth, header->dwHeight, row_pitch, slice_pitch))) {
-         throw std::runtime_error("ComputePitch failed in fallback for format " + DXGIFormatToString(manual_format));
-    }
-
-    if (actual_data_size < slice_pitch) {
-        std::ostringstream error_msg;
-        error_msg << "Insufficient pixel data. Expected " << slice_pitch << " bytes for format "
-                  << DXGIFormatToString(manual_format) << ", but found " << actual_data_size << " bytes.";
-        throw std::runtime_error(error_msg.str());
-    }
+    ThrowIfFailed(ComputePitch(info.format, info.header.dwWidth, info.header.dwHeight, row_pitch, slice_pitch), "ComputePitch failed in fallback");
+    if (info.data_size < slice_pitch) throw DDSLoadError("Insufficient pixel data in fallback.");
 
     std::vector<uint8_t> persistent_buffer(slice_pitch);
     uint8_t* mutable_pixel_data = persistent_buffer.data();
 
-    if (is_swizzled) {
-        size_t blockBytes;
-        if (IsCompressed(manual_format)) {
-             blockBytes = (manual_format == DXGI_FORMAT_BC1_UNORM || manual_format == DXGI_FORMAT_BC4_UNORM) ? 8 : 16;
-        } else {
-             size_t bpp = BitsPerPixel(manual_format);
-             if (bpp == 0) {
-                 throw std::runtime_error("BitsPerPixel returned 0 for uncompressed swizzled format.");
-             }
-             blockBytes = (4 * 4 * bpp) / 8;
-        }
-        UnswizzleBlockLinear(image_data_start, mutable_pixel_data, header->dwWidth, header->dwHeight, blockBytes, file_end - image_data_start, slice_pitch);
+    if (info.is_swizzled) {
+        size_t blockBytes = IsCompressed(info.format) ? ((info.format == DXGI_FORMAT_BC1_UNORM || info.format == DXGI_FORMAT_BC4_UNORM) ? 8 : 16) : ((4 * 4 * BitsPerPixel(info.format)) / 8);
+        CryEngineUtils::UnswizzleBlockLinear(info.data_ptr, mutable_pixel_data, info.header.dwWidth, info.header.dwHeight, blockBytes, info.data_size, slice_pitch);
     } else {
-        memcpy(mutable_pixel_data, image_data_start, slice_pitch);
+        memcpy(mutable_pixel_data, info.data_ptr, slice_pitch);
     }
 
-    if (isXbox360) {
-        PerformXboxEndianSwap(mutable_pixel_data, slice_pitch, manual_format);
+    if (info.is_xbox) {
+        XboxUtils::PerformXboxEndianSwap(mutable_pixel_data, slice_pitch, info.format);
     }
 
     auto image = std::make_unique<ScratchImage>();
-    Image manual_image{ header->dwWidth, header->dwHeight, manual_format, row_pitch, slice_pitch, mutable_pixel_data };
-    HRESULT hr = image->InitializeFromImage(manual_image);
-    if (FAILED(hr)) {
-        throw std::runtime_error("Fallback initialization failed: " + HResultToString(hr));
-    }
+    Image manual_image{ info.header.dwWidth, info.header.dwHeight, info.format, row_pitch, slice_pitch, mutable_pixel_data };
+    ThrowIfFailed(image->InitializeFromImage(manual_image), "Fallback ScratchImage initialization failed");
+
     return image;
 }
 
+// Main Python-exposed function to decode pixel data.
 py::dict decode_dds(const py::bytes& dds_bytes, size_t mip_level = 0, py::ssize_t array_index = -1, bool force_rgba8 = false) {
     py::buffer_info info(py::buffer(dds_bytes).request());
-    if (info.size < sizeof(DDS_HEADER) + 4) throw py::value_error("Input data too small for a DDS file");
-    if (memcmp(info.ptr, "DDS ", 4) != 0) throw py::value_error("Not a DDS file (missing 'DDS ' magic number)");
+    const auto* dds_data_ptr = static_cast<const uint8_t*>(info.ptr);
+    size_t dds_data_size = static_cast<size_t>(info.size);
 
     py::gil_scoped_release gil_release;
     CoInitializer com_init;
     if (!com_init.IsValid()) {
-        py::gil_scoped_acquire gil_acquire;
-        throw std::runtime_error("COM initialization failed: " + HResultToString(com_init.GetResult()));
+        throw DDSLoadError("COM initialization failed", com_init.GetResult());
     }
 
-    const auto* dds_data_ptr = static_cast<const uint8_t*>(info.ptr);
-    size_t dds_data_size = static_cast<size_t>(info.size);
     auto image = std::make_unique<ScratchImage>();
-
     HRESULT hr = LoadFromDDSMemory(dds_data_ptr, dds_data_size, DDS_FLAGS_NONE, nullptr, *image);
 
     if (FAILED(hr)) {
         try {
             image = load_with_fallback(dds_data_ptr, dds_data_size);
         } catch (const std::exception& e) {
-            py::gil_scoped_acquire gil_acquire;
-            throw std::runtime_error(std::string("DDS loading failed on all paths. Fallback error: ") + e.what());
+            throw DDSLoadError(std::string("DDS loading failed on all paths. Fallback error: ") + e.what());
         }
     }
 
     const auto& final_metadata = image->GetMetadata();
     if (mip_level >= final_metadata.mipLevels) {
-        py::gil_scoped_acquire gil_acquire;
         throw py::value_error("Mipmap level is out of bounds");
     }
 
     auto process_single_image = [&](const DirectX::Image* input_image) -> std::unique_ptr<ScratchImage> {
-        if (!input_image) throw std::runtime_error("Input image for processing is null");
+        if (!input_image) throw DDSLoadError("Input image for processing is null");
         auto current_image = std::make_unique<ScratchImage>();
-        HRESULT hr_process = current_image->InitializeFromImage(*input_image);
-        if (FAILED(hr_process)) throw std::runtime_error("Failed to initialize from selected image: " + HResultToString(hr_process));
+        ThrowIfFailed(current_image->InitializeFromImage(*input_image), "Failed to initialize from selected image");
+
         if (IsCompressed(current_image->GetMetadata().format)) {
             auto temp = std::make_unique<ScratchImage>();
-            hr_process = Decompress(*current_image->GetImage(0, 0, 0), DXGI_FORMAT_UNKNOWN, *temp);
-            if (FAILED(hr_process)) throw std::runtime_error("Decompression failed: " + HResultToString(hr_process));
+            ThrowIfFailed(Decompress(*current_image->GetImage(0, 0, 0), DXGI_FORMAT_UNKNOWN, *temp), "Decompression failed");
             current_image = std::move(temp);
         }
         if (force_rgba8) {
             DXGI_FORMAT current_format = current_image->GetMetadata().format;
             if (current_format != DXGI_FORMAT_R8G8B8A8_UNORM && current_format != DXGI_FORMAT_B8G8R8A8_UNORM) {
                 auto temp = std::make_unique<ScratchImage>();
-                hr_process = Convert(*current_image->GetImage(0, 0, 0), DXGI_FORMAT_R8G8B8A8_UNORM, TEX_FILTER_DEFAULT, TEX_THRESHOLD_DEFAULT, *temp);
-                if (FAILED(hr_process)) throw std::runtime_error("Format conversion to RGBA8 failed: " + HResultToString(hr_process));
+                ThrowIfFailed(Convert(*current_image->GetImage(0, 0, 0), DXGI_FORMAT_R8G8B8A8_UNORM, TEX_FILTER_DEFAULT, TEX_THRESHOLD_DEFAULT, *temp), "Format conversion to RGBA8 failed");
                 current_image = std::move(temp);
             }
         }
@@ -680,7 +698,6 @@ py::dict decode_dds(const py::bytes& dds_bytes, size_t mip_level = 0, py::ssize_
     bool is_3d = final_metadata.dimension == TEX_DIMENSION_TEXTURE3D;
     size_t num_images_to_process = load_all ? (is_3d ? final_metadata.depth : final_metadata.arraySize) : 1;
     if (!load_all && static_cast<size_t>(array_index) >= final_metadata.arraySize) {
-        py::gil_scoped_acquire gil_acquire;
         throw py::value_error("Array index is out of bounds");
     }
 
@@ -689,22 +706,21 @@ py::dict decode_dds(const py::bytes& dds_bytes, size_t mip_level = 0, py::ssize_
         size_t current_index = load_all ? i : static_cast<size_t>(array_index);
         const DirectX::Image* selected_image = image->GetImage(mip_level, current_index, 0);
         if (!selected_image) {
-            throw std::runtime_error("Failed to get image slice for index " + std::to_string(current_index));
+            throw DDSLoadError("Failed to get image slice for index " + std::to_string(current_index));
         }
         processed_images.push_back(process_single_image(selected_image));
     }
 
     const DirectX::Image* first_final_image = processed_images[0]->GetImage(0, 0, 0);
     if (!first_final_image || !first_final_image->pixels) {
-        py::gil_scoped_acquire gil_acquire;
-        throw std::runtime_error("Could not retrieve final processed image pixels");
+        throw DDSLoadError("Could not retrieve final processed image pixels");
     }
 
     py::gil_scoped_acquire gil_acquire;
     py::object numpy_array;
 
     if (num_images_to_process > 1) {
-        py::array single_slice_template = py::cast<py::array>(CreateNumpyArrayFromImage(first_final_image));
+        py::array single_slice_template = py::cast<py::array>(NumpyUtils::CreateNumpyArrayFromImage(first_final_image));
         py::buffer_info slice_info = single_slice_template.request();
         std::vector<py::ssize_t> final_shape;
         final_shape.push_back(num_images_to_process);
@@ -722,7 +738,7 @@ py::dict decode_dds(const py::bytes& dds_bytes, size_t mip_level = 0, py::ssize_
             memcpy(final_ptr + i * slice_size_bytes, current_slice->pixels, current_slice->slicePitch);
         }
     } else {
-        numpy_array = CreateNumpyArrayFromImage(first_final_image);
+        numpy_array = NumpyUtils::CreateNumpyArrayFromImage(first_final_image);
     }
 
     py::dict result_dict;
@@ -737,49 +753,20 @@ py::dict decode_dds(const py::bytes& dds_bytes, size_t mip_level = 0, py::ssize_
     return result_dict;
 }
 
+// Main Python-exposed function to get metadata without decoding.
 py::dict get_dds_metadata(const py::bytes& dds_bytes) {
     py::buffer_info info(py::buffer(dds_bytes).request());
-    if (info.size < sizeof(DDS_HEADER) + 4 || memcmp(info.ptr, "DDS ", 4) != 0) {
-        throw py::value_error("Not a valid DDS file");
-    }
-    const auto* header = reinterpret_cast<const DDS_HEADER*>(static_cast<const uint8_t*>(info.ptr) + 4);
-
-    bool isXbox360 = IsXbox360Format(header->ddspf.dwFourCC);
-    const uint8_t* file_end = static_cast<const uint8_t*>(info.ptr) + info.size;
-    DXGI_FORMAT format = GetDXGIFormatFromHeader(*header, file_end, isXbox360);
-
-    const uint8_t* image_data_start = static_cast<const uint8_t*>(info.ptr) + 4 + sizeof(DDS_HEADER);
-    if (header->ddspf.dwFourCC == FOURCC_DX10 || header->ddspf.dwFourCC == FOURCC_DX10_XBOX) image_data_start += sizeof(DDS_HEADER_DXT10);
-
-    if (image_data_start + 4 <= file_end) {
-        const uint32_t* marker = reinterpret_cast<const uint32_t*>(image_data_start);
-        bool marker_found = (*marker == FOURCC_CRYF || *marker == FOURCC_FYRC);
-
-        if (marker_found && (header->ddspf.dwFlags & DDPF_RGB)) {
-            const uint8_t* data_after_marker = image_data_start + ((*marker == FOURCC_CRYF) ? 8 : 4);
-            const size_t actual_data_size = file_end - data_after_marker;
-
-            if (header->ddspf.dwRBitMask == 0x000000FF && header->ddspf.dwGBitMask == 0x000000FF) {
-                 format = DXGI_FORMAT_BC5_UNORM;
-            } else {
-                 size_t expected_size_dxt1 = std::max(1u, (header->dwWidth + 3) / 4) * std::max(1u, (header->dwHeight + 3) / 4) * 8;
-                 if (actual_data_size >= expected_size_dxt1) {
-                     format = DXGI_FORMAT_BC1_UNORM;
-                 } else {
-                     format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                 }
-            }
-        }
-    }
+    AnalyzedHeaderInfo header_info = analyze_header(static_cast<const uint8_t*>(info.ptr), info.size);
 
     return py::dict(
-        py::arg("width") = header->dwWidth, py::arg("height") = header->dwHeight,
-        py::arg("depth") = (header->dwFlags & DDSD_DEPTH) ? header->dwDepth : 1,
-        py::arg("format_str") = DXGIFormatToString(format),
-        py::arg("mip_levels") = (header->dwFlags & DDSD_MIPMAPCOUNT) ? header->dwMipMapCount : 1,
-        py::arg("array_size") = (header->dwCaps2 & DDSCAPS2_CUBEMAP) ? 6 : 1,
-        py::arg("is_cubemap") = (header->dwCaps2 & DDSCAPS2_CUBEMAP) != 0,
-        py::arg("is_3d") = (header->dwCaps2 & DDSCAPS2_VOLUME) != 0
+        py::arg("width") = header_info.header.dwWidth,
+        py::arg("height") = header_info.header.dwHeight,
+        py::arg("depth") = (header_info.header.dwFlags & DDSD_DEPTH) ? header_info.header.dwDepth : 1,
+        py::arg("format_str") = DXGIFormatToString(header_info.format),
+        py::arg("mip_levels") = (header_info.header.dwFlags & DDSD_MIPMAPCOUNT) ? header_info.header.dwMipMapCount : 1,
+        py::arg("array_size") = (header_info.header.dwCaps2 & DDSCAPS2_CUBEMAP) ? 6 : 1,
+        py::arg("is_cubemap") = (header_info.header.dwCaps2 & DDSCAPS2_CUBEMAP) != 0,
+        py::arg("is_3d") = (header_info.header.dwCaps2 & DDSCAPS2_VOLUME) != 0
     );
 }
 
@@ -897,6 +884,9 @@ std::string DXGIFormatToString(DXGI_FORMAT format) {
     }
 }
 
+// =======================================================================================
+// Python Module Definition
+// =======================================================================================
 PYBIND11_MODULE(directxtex_decoder, m) {
     m.doc() = "High-performance DDS decoder with fixes for legacy CryEngine and Xbox 360 files.";
 
@@ -911,5 +901,5 @@ PYBIND11_MODULE(directxtex_decoder, m) {
           "Extracts DDS metadata without decoding pixel data, using a fallback for legacy/malformed formats.",
           py::arg("dds_bytes"));
 
-    m.attr("__version__") = "23.0.0";
+    m.attr("__version__") = "23.1.0";
 }

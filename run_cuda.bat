@@ -9,18 +9,16 @@ cd /d "%~dp0"
 set "VENV_DIR=.venv-cuda"
 set "ONNX_BACKEND=cuda"
 set "PYTHON_EXE=python"
-set "PYTHON_ARGS="
+set "REINSTALL_MODE="
+set "DIAG_MODE="
+set "PROFILE_MODE="
 
 :: --- Argument Parsing ---
-:parse_args
-if "%~1"=="" goto :args_done
-if /i "%~1"=="debug" ( set "PYTHON_ARGS=!PYTHON_ARGS! --debug" )
-if /i "%~1"=="reinstall" ( set "REINSTALL_MODE=1" )
-if /i "%~1"=="diag" ( set "DIAG_MODE=1" )
-if /i "%~1"=="profile" ( set "PROFILE_MODE=1" )
-shift
-goto :parse_args
-:args_done
+for %%a in (%*) do (
+    if /i "%%a"=="--reinstall" ( set "REINSTALL_MODE=1" )
+    if /i "%%a"=="--diag" ( set "DIAG_MODE=1" )
+    if /i "%%a"=="--profile" ( set "PROFILE_MODE=1" )
+)
 
 :: --- Header ---
 echo =======================================================
@@ -58,7 +56,6 @@ echo [OK] Virtual environment is active.
 echo.
 
 :: --- [3/5] Installing Dependencies ---
-:: This block is corrected to handle the conditional installation properly.
 if not defined NEEDS_INSTALL if not defined REINSTALL_MODE (
     echo [3/5] Dependencies appear to be installed. Skipping.
     goto :deps_done
@@ -92,9 +89,11 @@ echo =======================================================
 echo.
 
 if defined PROFILE_MODE (
-    python -m cProfile -o "app_data\scan_profile.pstats" main.py %PYTHON_ARGS%
+    echo [INFO] Running in profile mode. All arguments like --debug will be passed.
+    python -m cProfile -o "app_data\scan_profile.pstats" main.py %*
 ) else (
-    python main.py %PYTHON_ARGS%
+    echo [INFO] Passing arguments to application: %*
+    python main.py %*
 )
 
 if errorlevel 1 ( goto :error "Application exited unexpectedly." )

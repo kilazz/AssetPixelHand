@@ -4,8 +4,6 @@
 # (Optimized for parallel execution and ruff compliant)
 
 import argparse
-import contextlib
-import io
 import os
 import re
 import sys
@@ -160,78 +158,227 @@ def create_result(success: bool, time_ms: float, mem_mb: float, info: str = ""):
 
 
 def test_pillow(file_path: Path) -> dict | None:
+    """
+    Improved Pillow test function with more detailed metadata extraction.
+    """
     if not PILLOW_AVAILABLE:
         return None
+
     mem_before = get_process_memory_mb()
     start_time = time.perf_counter()
     try:
         with Image.open(file_path) as img:
-            img.load()
-            info = f"{img.size[0]}x{img.size[1]}, {img.mode}"
+            img.load()  # Make sure image data is read
+
+            info_parts = []
+
+            # 1. Basic info (always available)
+            info_parts.append(f"{img.size[0]}x{img.size[1]}")
+            info_parts.append(img.mode)
+
+            # 2. Check for EXIF data (especially useful for JPEG/TIFF)
+            # 36867 is the tag for DateTimeOriginal
+            try:
+                exif_data = img.getexif()
+                if exif_data and 36867 in exif_data:
+                    info_parts.append("EXIF Date")
+                elif exif_data:
+                    info_parts.append("EXIF")
+            except Exception:
+                # Some images have corrupted EXIF that can cause errors
+                pass
+
+            # 3. Check for ICC color profile
+            if "icc_profile" in img.info:
+                info_parts.append("ICC Profile")
+
+            # 4. Check for animation (for GIF, APNG, WebP)
+            if getattr(img, "is_animated", False):
+                try:
+                    n_frames = getattr(img, "n_frames", 1)
+                    info_parts.append(f"Animated ({n_frames} frames)")
+                except Exception:
+                    info_parts.append("Animated")
+
+            # 5. Check for transparency info in PNG
+            if "transparency" in img.info:
+                info_parts.append("Transparency")
+
+            info = " | ".join(info_parts)
+
         end_time = time.perf_counter()
         mem_after = get_process_memory_mb()
         return create_result(True, (end_time - start_time) * 1000, mem_after - mem_before, info)
-    except Exception:
+
+    except Exception as e:
         end_time = time.perf_counter()
         mem_after = get_process_memory_mb()
-        return create_result(False, (end_time - start_time) * 1000, mem_after - mem_before)
+        # Also improve error reporting here
+        return create_result(False, (end_time - start_time) * 1000, mem_after - mem_before, str(e))
 
 
 def test_oiio(file_path: Path) -> dict | None:
+    """
+    Improved OpenImageIO test function with deep metadata inspection.
+    """
     if not OIIO_AVAILABLE:
         return None
+
     mem_before = get_process_memory_mb()
     start_time = time.perf_counter()
     try:
-        with contextlib.redirect_stderr(io.StringIO()):
-            buf = oiio.ImageBuf(str(file_path))
-            has_error = buf.has_error
-            spec = buf.spec()
-            info = f"{spec.width}x{spec.height}, {spec.nchannels}ch, {spec.format}"
-        end_time = time.perf_counter()
-        mem_after = get_process_memory_mb()
-        return create_result(not has_error, (end_time - start_time) * 1000, mem_after - mem_before, info)
-    except Exception:
-        end_time = time.perf_counter()
-        mem_after = get_process_memory_mb()
-        return create_result(False, (end_time - start_time) * 1000, mem_after - mem_before)
+        buf = oiio.ImageBuf(str(file_path))
+        has_error = buf.has_error
+        if has_error:
+            # If OIIO reports an internal error, capture it.
+            error_message = buf.geterror()
+            end_time = time.perf_counter()
+            mem_after = get_process_memory_mb()
+            return create_result(False, (end_time - start_time) * 1000, mem_after - mem_before, error_message)
 
+        spec = buf.spec()
 
-def test_pyvips(file_path: Path) -> dict | None:
-    if not PYVIPS_AVAILABLE:
-        return None
-    mem_before = get_process_memory_mb()
-    start_time = time.perf_counter()
-    try:
-        img = pyvips.Image.new_from_file(str(file_path), access="sequential")
-        info = f"{img.width}x{img.height}, {img.bands} bands"
+        info_parts = []
+        info_parts.append(f"{spec.width}x{spec.height}")
+
+        # Get compression format
+        compression = spec.get_string_attribute("compression") or spec.get_string_attribute("dds:format")
+        if compression:
+            info_parts.append(compression)
+
+        # Get color space
+        color_space = spec.get_string_attribute("oiio:ColorSpace")
+        if color_space:
+            info_parts.append(color_space)
+
+        # Mipmap detection using both methods for diagnostics
+        mips_from_attr = spec.get_int_attribute("dds:mipmaps", 0)
+        mips_from_subimages = buf.nsubimages
+
+        mip_str = "Mips: 1"  # Default
+        if mips_from_subimages > 1:
+            mip_str = f"Mips: {mips_from_subimages} (from subimages)"
+        elif mips_from_attr > 1:
+            mip_str = f"Mips: {mips_from_attr} (from attr)"
+        info_parts.append(mip_str)
+
+        # Cubemap detection
+        if spec.get_int_attribute("dds:is_cubemap"):
+            info_parts.append("Cubemap")
+
+        info = " | ".join(info_parts)
+
         end_time = time.perf_counter()
         mem_after = get_process_memory_mb()
         return create_result(True, (end_time - start_time) * 1000, mem_after - mem_before, info)
-    except Exception:
+
+    except Exception as e:
         end_time = time.perf_counter()
         mem_after = get_process_memory_mb()
-        return create_result(False, (end_time - start_time) * 1000, mem_after - mem_before)
+        # Return the exception as the info string for clear error reporting
+        return create_result(False, (end_time - start_time) * 1000, mem_after - mem_before, str(e))
+
+
+def test_pyvips(file_path: Path) -> dict | None:
+    """
+    Improved PyVips test function with detailed technical metadata.
+    """
+    if not PYVIPS_AVAILABLE:
+        return None
+
+    mem_before = get_process_memory_mb()
+    start_time = time.perf_counter()
+    try:
+        # Use "sequential" access for performance, as we are not editing.
+        img = pyvips.Image.new_from_file(str(file_path), access="sequential")
+
+        info_parts = []
+
+        # 1. Resolution and technical format details
+        info_parts.append(f"{img.width}x{img.height}")
+        info_parts.append(f"{img.format}, {img.interpretation}")
+        info_parts.append(f"{img.bands} bands")
+
+        # 2. Check for key metadata fields by querying all available fields
+        fields = img.get_fields()
+        if "exif-ifd0-DateTime" in fields:
+            info_parts.append("EXIF Date")
+        elif any(f.startswith("exif-") for f in fields):
+            info_parts.append("EXIF")
+
+        if "icc-profile-data" in fields:
+            info_parts.append("ICC")
+
+        # 3. Get the specific loader used by vips (for diagnostics)
+        try:
+            loader = img.get("vips-loader")
+            if loader:
+                info_parts.append(f"loader: {loader}")
+        except Exception:
+            # This field might not exist on all versions or for all formats, so we ignore errors.
+            pass
+
+        info = " | ".join(info_parts)
+
+        end_time = time.perf_counter()
+        mem_after = get_process_memory_mb()
+        return create_result(True, (end_time - start_time) * 1000, mem_after - mem_before, info)
+
+    except Exception as e:
+        end_time = time.perf_counter()
+        mem_after = get_process_memory_mb()
+        # Return the actual exception message for clear error reporting
+        return create_result(False, (end_time - start_time) * 1000, mem_after - mem_before, str(e))
 
 
 def test_directxtex(file_path: Path) -> dict | None:
+    """
+    Improved DirectXTex test function with full metadata extraction.
+    """
     if not DIRECTXTEX_AVAILABLE:
         return None
+
     mem_before = get_process_memory_mb()
     start_time = time.perf_counter()
     try:
         data = file_path.read_bytes()
+
+        # 1. Get all metadata without decoding pixels. This is the source of our info.
         metadata = directxtex_decoder.get_dds_metadata(data)
+
+        # 2. Decode the image fully to measure performance accurately.
+        # We discard the result as we only need the metadata from the step above.
         directxtex_decoder.decode_dds(data)
-        info = f"{metadata['width']}x{metadata['height']}, {metadata['format_str']}"
-        if metadata.get("is_xbox"):
-            info += " (Xbox)"
+
+        info_parts = []
+
+        # Handle resolution for 2D, 3D, and arrays
+        if metadata.get("is_3d"):
+            info_parts.append(f"{metadata['width']}x{metadata['height']}x{metadata['depth']}")
+        else:
+            info_parts.append(f"{metadata['width']}x{metadata['height']}")
+
+        info_parts.append(metadata["format_str"])
+        info_parts.append(f"Mips: {metadata['mip_levels']}")
+
+        # Add texture type (Cubemap, 3D, or Array)
+        if metadata.get("is_cubemap"):
+            info_parts.append("Cubemap")
+        elif metadata.get("is_3d"):
+            info_parts.append("3D Texture")
+        elif metadata.get("array_size", 1) > 1:
+            info_parts.append(f"Texture Array ({metadata['array_size']} items)")
+
+        info = " | ".join(info_parts)
+
         end_time = time.perf_counter()
         mem_after = get_process_memory_mb()
         return create_result(True, (end_time - start_time) * 1000, mem_after - mem_before, info)
+
     except Exception as e:
         end_time = time.perf_counter()
         mem_after = get_process_memory_mb()
+        # Return the actual exception message for clear error reporting
         return create_result(False, (end_time - start_time) * 1000, mem_after - mem_before, str(e))
 
 
@@ -316,7 +463,7 @@ def main():
             else:
                 stats[lib]["fail"] = stats[lib].get("fail", 0) + 1
                 has_failure_in_file = True
-                display_results_row.append(colorize("FAIL", Colors.RED) + f" ({result['time_ms']:.2f}ms)")
+                display_results_row.append(colorize("FAIL", Colors.RED) + f" ({result['info']})")
 
         if has_failure_in_file:
             total_files_with_failures += 1
@@ -375,7 +522,7 @@ def main():
         log_and_print(colorize("All files read successfully by at least one applicable library!", Colors.GREEN))
     log_and_print("=" * 80)
 
-    log_path = script_dir / "test_log.txt"
+    log_path = project_root / "test_log.txt"
     try:
         with open(log_path, "w", encoding="utf-8") as f:
             f.write("\n".join(LOG_LINES))

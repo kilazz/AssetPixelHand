@@ -51,8 +51,13 @@ DUCKDB_AVAILABLE = bool(importlib.util.find_spec("duckdb"))
 LANCEDB_AVAILABLE = bool(importlib.util.find_spec("lancedb"))
 ZSTD_AVAILABLE = bool(importlib.util.find_spec("zstandard"))
 OCIO_AVAILABLE = bool(importlib.util.find_spec("simple_ocio"))
+DIRECTXTEX_AVAILABLE = bool(importlib.util.find_spec("directxtex_decoder"))
 
-Image.init()
+try:
+    Image.init()
+    PILLOW_AVAILABLE = True
+except (ImportError, NameError):
+    PILLOW_AVAILABLE = False
 
 if DEEP_LEARNING_AVAILABLE:
     from transformers import logging as transformers_logging
@@ -148,16 +153,11 @@ def _load_models_config() -> dict:
     Loads model configurations by merging built-in defaults with user-defined custom models.
     Custom models from 'custom_models.json' will override defaults if names match.
     """
-    # 1. Start with the guaranteed, hardcoded default models.
     all_models = _get_default_models()
-
-    # 2. Try to load custom models from the user's data directory.
     if CUSTOM_MODELS_CONFIG_FILE.exists():
         try:
             with open(CUSTOM_MODELS_CONFIG_FILE, encoding="utf-8") as f:
                 custom_models = json.load(f)
-            # 3. Merge them. The update() method will overwrite keys from `all_models`
-            #    with keys from `custom_models` if they are the same.
             all_models.update(custom_models)
             logging.getLogger("AssetPixelHand.constants").info(f"Loaded and merged {len(custom_models)} custom models.")
         except (json.JSONDecodeError, OSError) as e:
@@ -165,13 +165,11 @@ def _load_models_config() -> dict:
                 f"Failed to load custom_models.json: {e}. Using default models only."
             )
     else:
-        # If the file doesn't exist, create an empty one as an example for the user.
         try:
             with open(CUSTOM_MODELS_CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump({}, f)
         except OSError:
-            pass  # Ignore if we can't write, not a critical error.
-
+            pass
     return all_models
 
 
