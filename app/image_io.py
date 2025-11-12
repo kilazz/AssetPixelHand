@@ -98,7 +98,7 @@ def _handle_dds_alpha_channel_logic(pil_image: Image.Image) -> Image.Image:
     app_logger.debug("Analyzing DDS RGBA texture for special channel formats.")
     arr = numpy_array.astype(np.float32)
     rgb, alpha = arr[:, :, :3], arr[:, :, 3]
-    alpha_min, alpha_max = np.min(alpha), np.max(alpha)
+    alpha_max = np.max(alpha)
     rgb_max = np.max(rgb)
 
     # Heuristic for additive blending (e.g., fire, sparks)
@@ -109,7 +109,8 @@ def _handle_dds_alpha_channel_logic(pil_image: Image.Image) -> Image.Image:
         return Image.fromarray(arr.astype(np.uint8))
 
     # Heuristic for grayscale mask stored in alpha channel of a pure black texture
-    elif rgb_max == 0 and alpha_max > 0 and alpha_min != alpha_max:
+    # The check for alpha_min != alpha_max was removed as it was too strict for solid masks.
+    elif rgb_max == 0 and alpha_max > 0:
         app_logger.debug("Detected grayscale mask in alpha channel.")
         arr[:, :, 0] = alpha
         arr[:, :, 1] = alpha
