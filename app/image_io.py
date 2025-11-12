@@ -72,6 +72,8 @@ def set_active_tonemap_view(view_name: str):
 
 
 # --- Public API Functions ---
+
+
 def load_image(
     path: str | Path,
     target_size: tuple[int, int] | None = None,
@@ -198,6 +200,8 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
 
 
 # --- Private Helper Functions (used by this module and dds_loader) ---
+
+
 def _get_metadata_with_pyvips(path: Path, stat) -> dict | None:
     img = pyvips.Image.new_from_file(str(path), access="sequential")
     if img.width > MAX_PIXEL_DIMENSION or img.height > MAX_PIXEL_DIMENSION:
@@ -264,6 +268,10 @@ def _get_metadata_with_oiio(path: Path, stat) -> tuple[dict | None, Any]:
         with contextlib.suppress(ValueError, TypeError):
             capture_date = datetime.strptime(dt, "%Y:%m:%d %H:%M:%S").timestamp()
 
+    mipmap_count = 1
+    if format_str == "DDS":
+        mipmap_count = max(1, buf.nsubimages)
+
     metadata = {
         "resolution": (spec.width, spec.height),
         "file_size": stat.st_size,
@@ -274,11 +282,10 @@ def _get_metadata_with_oiio(path: Path, stat) -> tuple[dict | None, Any]:
         "has_alpha": spec.alpha_channel != -1,
         "capture_date": capture_date,
         "bit_depth": bit_depth,
-        "mipmap_count": 1,
+        "mipmap_count": mipmap_count,
         "texture_type": "2D",
         "color_space": spec.get_string_attribute("oiio:ColorSpace") or "sRGB",
     }
-    # Return both the dict and the spec for the DDS handler
     return metadata, spec
 
 
@@ -302,7 +309,7 @@ def _get_metadata_with_pillow(path: Path, stat) -> dict | None:
             "has_alpha": "A" in img.getbands(),
             "capture_date": None,
             "bit_depth": bit_depth,
-            "mipmap_count": 1,
+            "mipmap_count": 99,  # <-- DIAGNOSTIC VALUE
             "texture_type": "2D",
             "color_space": "sRGB" if "icc_profile" in img.info else "Unknown",
         }

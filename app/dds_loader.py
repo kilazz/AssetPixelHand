@@ -5,6 +5,7 @@ isolating it from the main image_io module.
 """
 
 import logging
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,24 @@ from .image_io import (
 )
 
 app_logger = logging.getLogger("AssetPixelHand.dds_loader")
+
+
+def _read_dds_mipmap_count_from_header(path: Path) -> int:
+    """
+    Reads the mipmap count directly from the DDS file header bytes.
+    This is the most reliable method and avoids library parsing issues.
+    """
+    try:
+        with open(path, "rb") as f:
+            # The dwMipMapCount field is at byte offset 28 in a standard DDS header.
+            # (Magic number 'DDS ' (4) + dwSize (4) + dwFlags (4) + dwHeight (4) + dwWidth (4) + dwPitchOrLinearSize (4) + dwDepth (4) = 28)
+            f.seek(28)
+            # Read 4 bytes as a little-endian unsigned long.
+            (mip_count,) = struct.unpack("<L", f.read(4))
+            return max(1, int(mip_count))
+    except Exception as e:
+        app_logger.warning(f"Could not read DDS header directly for {path.name}: {e}")
+        return 1
 
 
 def _get_dds_channel_info(compression_format: str, spec) -> tuple[str, bool]:
@@ -136,27 +155,28 @@ def get_dds_metadata(path: Path, stat) -> dict | None:
     if OIIO_AVAILABLE:
         app_logger.debug(f"Getting metadata for DDS '{filename}' with OpenImageIO.")
         try:
-            # OIIO is the most reliable source for mipmaps and cubemap info.
-            # It now explicitly returns the metadata dict and the spec object separately.
             base_metadata, spec = _get_metadata_with_oiio(path, stat)
             if base_metadata and spec:
                 compression_format = base_metadata.get("compression_format", "DDS")
                 ch_str, has_alpha = _get_dds_channel_info(compression_format, spec)
 
-                # Update metadata with inferred values
                 base_metadata["has_alpha"] = has_alpha
-                base_metadata["format_details"] = ch_str  # Only channel info
-
-                # Extract DDS-specific attributes from the spec object
-                base_metadata["mipmap_count"] = spec.get_int_attribute("dds:mipmaps", 1)
+                base_metadata["format_details"] = ch_str
                 base_metadata["texture_type"] = "Cubemap" if spec.get_int_attribute("dds:is_cubemap") else "2D"
+
+                # Overwrite the mipmap count from OIIO with the value read directly from the file header.
+                # This corrects for OIIO's inability to parse the mipmap count from these specific files.
+                base_metadata["mipmap_count"] = _read_dds_mipmap_count_from_header(path)
+
                 metadata = base_metadata
         except Exception as e:
-            app_logger.debug(f"OIIO metadata for DDS failed for '{filename}': {e}. Falling back.")
-            metadata = None  # Ensure we fallback if OIIO fails
+            app_logger.error(f"CRITICAL: OpenImageIO failed, falling back to Pillow. Reason: {e}", exc_info=True)
+            metadata = None
 
     if metadata is None and PILLOW_AVAILABLE:
-        app_logger.debug(f"Getting metadata for DDS '{filename}' with Pillow (fallback).")
+        app_logger.warning(
+            f"Getting metadata for DDS '{filename}' with Pillow (FALLBACK). Mipmap info will be incorrect."
+        )
         try:
             metadata = _get_metadata_with_pillow(path, stat)
         except Exception as e:
