@@ -309,7 +309,7 @@ def _get_metadata_with_pillow(path: Path, stat) -> dict | None:
             "has_alpha": "A" in img.getbands(),
             "capture_date": None,
             "bit_depth": bit_depth,
-            "mipmap_count": 99,  # <-- DIAGNOSTIC VALUE
+            "mipmap_count": 1,  # Pillow cannot read mipmaps, so it defaults to 1.
             "texture_type": "2D",
             "color_space": "sRGB" if "icc_profile" in img.info else "Unknown",
         }
