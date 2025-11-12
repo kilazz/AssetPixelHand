@@ -14,7 +14,7 @@ from PySide6.QtCore import QObject, QThread, Slot
 
 from app.constants import CACHE_DIR, DB_TABLE_NAME, DUCKDB_AVAILABLE, LANCEDB_AVAILABLE
 from app.core.strategies import FindDuplicatesStrategy, SearchStrategy
-from app.data_models import ScanConfig, ScanMode, ScanState
+from app.data_models import FINGERPRINT_FIELDS, ScanConfig, ScanMode, ScanState
 from app.services.signal_bus import APP_SIGNAL_BUS
 
 if LANCEDB_AVAILABLE:
@@ -92,25 +92,15 @@ class ScannerCore(QObject):
             db_path.mkdir(parents=True, exist_ok=True)
             self.db = lancedb.connect(str(db_path))
 
-            schema = pa.schema(
-                [
-                    pa.field("id", pa.string()),
-                    pa.field("vector", pa.list_(pa.float32(), self.config.model_dim)),
-                    pa.field("path", pa.string()),
-                    pa.field("resolution_w", pa.int32()),
-                    pa.field("resolution_h", pa.int32()),
-                    pa.field("file_size", pa.int64()),
-                    pa.field("mtime", pa.float64()),
-                    pa.field("capture_date", pa.float64()),
-                    pa.field("format_str", pa.string()),
-                    pa.field("compression_format", pa.string()),
-                    pa.field("format_details", pa.string()),
-                    pa.field("has_alpha", pa.bool_()),
-                    pa.field("bit_depth", pa.int32()),
-                    pa.field("mipmap_count", pa.int32()),
-                    pa.field("texture_type", pa.string()),
-                ]
-            )
+            schema_fields = [
+                pa.field("id", pa.string()),
+                pa.field("vector", pa.list_(pa.float32(), self.config.model_dim)),
+            ]
+            # Add all other fields as defined in our single source of truth
+            for name, types in FINGERPRINT_FIELDS.items():
+                schema_fields.append(pa.field(name, types["pyarrow"]))
+
+            schema = pa.schema(schema_fields)
 
             table_name = DB_TABLE_NAME
             if table_name in self.db.table_names():

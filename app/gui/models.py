@@ -62,6 +62,7 @@ def _format_metadata_string(node: ResultNode) -> str:
         size_str,
         node.format_str,
         node.compression_format,
+        node.color_space,
         bit_depth_str,
         active_channels,
         node.texture_type,

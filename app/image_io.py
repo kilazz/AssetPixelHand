@@ -72,8 +72,6 @@ def set_active_tonemap_view(view_name: str):
 
 
 # --- Public API Functions ---
-
-
 def load_image(
     path: str | Path,
     target_size: tuple[int, int] | None = None,
@@ -192,6 +190,7 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
                 "bit_depth": 0,
                 "mipmap_count": 1,
                 "texture_type": "2D",
+                "color_space": "Unknown",
             }
         except Exception as stat_error:
             app_logger.critical(f"Could not even stat file {path.name}. Error: {stat_error}")
@@ -199,8 +198,6 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
 
 
 # --- Private Helper Functions (used by this module and dds_loader) ---
-
-
 def _get_metadata_with_pyvips(path: Path, stat) -> dict | None:
     img = pyvips.Image.new_from_file(str(path), access="sequential")
     if img.width > MAX_PIXEL_DIMENSION or img.height > MAX_PIXEL_DIMENSION:
@@ -219,6 +216,13 @@ def _get_metadata_with_pyvips(path: Path, stat) -> dict | None:
             capture_date = datetime.strptime(
                 img.get("exif-ifd0-DateTime").split("\0", 1)[0], "%Y:%m:%d %H:%M:%S"
             ).timestamp()
+    
+    color_space = "sRGB"
+    if "icc-profile-data" in img.get_fields():
+        color_space = "Embedded ICC"
+    elif img.interpretation == "grey16":
+        color_space = "Linear"
+
 
     return {
         "resolution": (img.width, img.height),
@@ -232,6 +236,7 @@ def _get_metadata_with_pyvips(path: Path, stat) -> dict | None:
         "bit_depth": bit_depth,
         "mipmap_count": 1,
         "texture_type": "2D",
+        "color_space": color_space,
     }
 
 
@@ -271,7 +276,8 @@ def _get_metadata_with_oiio(path: Path, stat) -> tuple[dict | None, Any]:
         "capture_date": capture_date,
         "bit_depth": bit_depth,
         "mipmap_count": 1,
-        "texture_type": "2D",  # Add defaults here for all formats
+        "texture_type": "2D",
+        "color_space": spec.get_string_attribute("oiio:ColorSpace") or "sRGB",
     }
     # Return both the dict and the spec for the DDS handler
     return metadata, spec
@@ -299,6 +305,7 @@ def _get_metadata_with_pillow(path: Path, stat) -> dict | None:
             "bit_depth": bit_depth,
             "mipmap_count": 1,
             "texture_type": "2D",
+            "color_space": "sRGB" if "icc_profile" in img.info else "Unknown",
         }
 
 

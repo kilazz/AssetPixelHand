@@ -19,6 +19,7 @@ from app.cache import _configure_db_connection
 from app.constants import BEST_FILE_METHOD_NAME, DUCKDB_AVAILABLE, RESULTS_DB_FILE
 from app.data_models import (
     DuplicateResults,
+    FINGERPRINT_FIELDS,
     ImageFingerprint,
     ScanConfig,
     ScanMode,
@@ -97,9 +98,9 @@ class ScanStrategy(ABC):
                 self._create_results_table(conn)
                 data = self._prepare_results_data(final_groups, search_context)
                 if data:
-                    conn.executemany(
-                        "INSERT INTO results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", data
-                    )
+                    num_columns = len(data[0])
+                    placeholders = ", ".join("?" for _ in range(num_columns))
+                    conn.executemany(f"INSERT INTO results VALUES ({placeholders})", data)
                 self._persist_database(conn)
                 app_logger.info(f"Results saved to '{RESULTS_DB_FILE.name}'.")
         except duckdb.Error as e:
@@ -108,13 +109,12 @@ class ScanStrategy(ABC):
 
     @staticmethod
     def _create_results_table(conn):
+        columns_sql = ", ".join([f"{name} {types['duckdb']}" for name, types in FINGERPRINT_FIELDS.items()])
         conn.execute(
-            """CREATE TABLE results (
-               group_id INTEGER, is_best BOOLEAN, path VARCHAR, resolution_w INTEGER,
-               resolution_h INTEGER, file_size UBIGINT, mtime DOUBLE, capture_date DOUBLE,
-               distance INTEGER, format_str VARCHAR, compression_format VARCHAR, format_details VARCHAR,
-               has_alpha BOOLEAN, bit_depth INTEGER, mipmap_count INTEGER, texture_type VARCHAR,
-               search_context VARCHAR, found_by VARCHAR
+            f"""CREATE TABLE results (
+               group_id INTEGER, is_best BOOLEAN,
+               {columns_sql},
+               distance INTEGER, search_context VARCHAR, found_by VARCHAR
             )"""
         )
 
@@ -140,25 +140,20 @@ class ScanStrategy(ABC):
         group_id: int, is_best: bool, fp: ImageFingerprint, distance: int, search_context: str | None, found_by: str
     ) -> tuple:
         """Create a single result row tuple."""
-        return (
-            group_id,
-            is_best,
-            str(fp.path),
-            *fp.resolution,
-            fp.file_size,
-            fp.mtime,
-            fp.capture_date,
-            distance,
-            fp.format_str,
-            fp.compression_format,
-            fp.format_details,
-            fp.has_alpha,
-            fp.bit_depth,
-            fp.mipmap_count,
-            fp.texture_type,
-            search_context,
-            found_by,
-        )
+
+        row_data = [group_id, is_best]
+        for field_name in FINGERPRINT_FIELDS:
+            if field_name == "path":
+                row_data.append(str(fp.path))
+            elif field_name == "resolution_w":
+                row_data.append(fp.resolution[0])
+            elif field_name == "resolution_h":
+                row_data.append(fp.resolution[1])
+            else:
+                row_data.append(getattr(fp, field_name, None))
+        
+        row_data.extend([distance, search_context, found_by])
+        return tuple(row_data)
 
 
 class FindDuplicatesStrategy(ScanStrategy):
@@ -324,6 +319,7 @@ class SearchStrategy(ScanStrategy):
                 bit_depth=8,
                 mipmap_count=1,
                 texture_type="2D",
+                color_space="N/A",
             )
 
     def _get_search_context(self) -> str:

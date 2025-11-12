@@ -246,27 +246,13 @@ class PipelineManager(QObject):
         """Adds a list of fingerprints to the LanceDB table in a separate thread."""
         if not fingerprints or not LANCEDB_AVAILABLE:
             return
+
         data_to_convert = [
-            {
-                "id": str(uuid.uuid5(uuid.NAMESPACE_URL, str(fp.path))),
-                "vector": fp.hashes,
-                "path": str(fp.path),
-                "resolution_w": fp.resolution[0],
-                "resolution_h": fp.resolution[1],
-                "file_size": fp.file_size,
-                "mtime": fp.mtime,
-                "capture_date": fp.capture_date,
-                "format_str": fp.format_str,
-                "compression_format": fp.compression_format,
-                "format_details": fp.format_details,
-                "has_alpha": bool(fp.has_alpha),
-                "bit_depth": fp.bit_depth,
-                "mipmap_count": fp.mipmap_count,
-                "texture_type": fp.texture_type,
-            }
+            fp.to_lancedb_dict()
             for fp in fingerprints
             if fp.hashes is not None and fp.hashes.size > 0
         ]
+
         if not data_to_convert:
             return
         try:

@@ -6,12 +6,14 @@ consistency and avoids circular import dependencies.
 
 import json
 import threading
+import uuid
 from dataclasses import dataclass, field, fields
 from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import pyarrow as pa
 
 from app.constants import (
     ALL_SUPPORTED_EXTENSIONS,
@@ -24,6 +26,26 @@ from app.constants import (
 
 if TYPE_CHECKING:
     pass
+
+
+# A centralized source of truth for all fingerprint-related fields, their types, and defaults.
+FINGERPRINT_FIELDS = {
+    # Field Name in dataclass: { types for different databases }
+    "path": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
+    "resolution_w": {"pyarrow": pa.int32(), "duckdb": "INTEGER"},
+    "resolution_h": {"pyarrow": pa.int32(), "duckdb": "INTEGER"},
+    "file_size": {"pyarrow": pa.int64(), "duckdb": "UBIGINT"},
+    "mtime": {"pyarrow": pa.float64(), "duckdb": "DOUBLE"},
+    "capture_date": {"pyarrow": pa.float64(), "duckdb": "DOUBLE"},
+    "format_str": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
+    "compression_format": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
+    "format_details": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
+    "has_alpha": {"pyarrow": pa.bool_(), "duckdb": "BOOLEAN"},
+    "bit_depth": {"pyarrow": pa.int32(), "duckdb": "INTEGER"},
+    "mipmap_count": {"pyarrow": pa.int32(), "duckdb": "INTEGER"},
+    "texture_type": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
+    "color_space": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
+}
 
 
 class ScanMode(Enum):
@@ -59,6 +81,7 @@ class ImageFingerprint:
         "path",
         "resolution",
         "texture_type",
+        "color_space",
     ]
     path: Path
     hashes: np.ndarray
@@ -73,6 +96,7 @@ class ImageFingerprint:
     bit_depth: int
     mipmap_count: int
     texture_type: str
+    color_space: str | None
 
     def __hash__(self) -> int:
         return hash(self.path)
@@ -81,6 +105,21 @@ class ImageFingerprint:
         if isinstance(other, ImageFingerprint):
             return self.path == other.path
         return NotImplemented
+
+    def to_lancedb_dict(self) -> dict[str, Any]:
+        """Converts the object to a dictionary suitable for writing to LanceDB."""
+        data = {
+            "id": str(uuid.uuid5(uuid.NAMESPACE_URL, str(self.path))),
+            "vector": self.hashes,
+            "path": str(self.path),
+            "resolution_w": self.resolution[0],
+            "resolution_h": self.resolution[1],
+        }
+        # Automatically add all other fields from our centralized definition
+        for field_name in FINGERPRINT_FIELDS:
+            if hasattr(self, field_name) and field_name not in data:
+                data[field_name] = getattr(self, field_name)
+        return data
 
     @classmethod
     def from_db_row(cls, row: dict) -> "ImageFingerprint":
@@ -102,6 +141,7 @@ class ImageFingerprint:
             bit_depth=row.get("bit_depth", 8),
             mipmap_count=row.get("mipmap_count", 1),
             texture_type=row.get("texture_type", "2D"),
+            color_space=row.get("color_space", "sRGB"),
         )
 
 
@@ -134,6 +174,7 @@ class ResultNode:
     bit_depth: int
     mipmap_count: int
     texture_type: str
+    color_space: str | None
     found_by: str
     type: str = "result"  # Field for type checking within the model logic
 
@@ -149,6 +190,8 @@ class ResultNode:
             filtered_data["mipmap_count"] = 1
         if "texture_type" not in filtered_data:
             filtered_data["texture_type"] = "2D"
+        if "color_space" not in filtered_data:
+            filtered_data["color_space"] = "sRGB"
         return cls(**filtered_data)
 
 
