@@ -261,6 +261,8 @@ class PipelineManager(QObject):
                 "format_details": fp.format_details,
                 "has_alpha": bool(fp.has_alpha),
                 "bit_depth": fp.bit_depth,
+                "mipmap_count": fp.mipmap_count,
+                "texture_type": fp.texture_type,
             }
             for fp in fingerprints
             if fp.hashes is not None and fp.hashes.size > 0

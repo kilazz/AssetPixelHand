@@ -51,14 +51,25 @@ def _format_metadata_string(node: ResultNode) -> str:
     res = f"{node.resolution_w}x{node.resolution_h}"
     size_mb = node.file_size / (1024**2)
     size_str = f"{size_mb:.2f} MB"
+    bit_depth_str = f"{node.bit_depth}-bit"
 
-    # The backend now provides pre-formatted details. The GUI just assembles them.
-    # The format_details from backend is expected to be like "16-bit RGBA"
-    details_parts = node.format_details.split()
-    bit_depth_str = details_parts[0] if (details_parts and "-bit" in details_parts[0]) else f"{node.bit_depth}-bit"
-    active_channels = details_parts[1] if len(details_parts) > 1 else ""
+    # The backend provides clean, separated data. The GUI just assembles it.
+    active_channels = node.format_details
 
-    return f"{res} | {size_str} | {node.format_str} | {node.compression_format} | {bit_depth_str} | {active_channels}"
+    # --- Build the final string piece by piece ---
+    parts = [
+        res,
+        size_str,
+        node.format_str,
+        node.compression_format,
+        bit_depth_str,
+        active_channels,
+        node.texture_type,
+        f"Mips: {node.mipmap_count}",
+    ]
+
+    # Filter out any empty or None values and join them
+    return " | ".join(filter(None, parts))
 
 
 class ResultsTreeModel(QAbstractItemModel):

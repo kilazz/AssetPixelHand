@@ -44,10 +44,6 @@ class ScannerCore(QObject):
         start_time = time.time()
         self.all_skipped_files.clear()
 
-        # The call to _set_process_priority() has been removed here.
-        # If you still want niceness on Linux/macOS, you could add:
-        # if hasattr(os, "nice"): os.nice(10)
-
         try:
             setup_caches(self.config)
 
@@ -111,6 +107,8 @@ class ScannerCore(QObject):
                     pa.field("format_details", pa.string()),
                     pa.field("has_alpha", pa.bool_()),
                     pa.field("bit_depth", pa.int32()),
+                    pa.field("mipmap_count", pa.int32()),
+                    pa.field("texture_type", pa.string()),
                 ]
             )
 

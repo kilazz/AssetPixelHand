@@ -72,6 +72,8 @@ def set_active_tonemap_view(view_name: str):
 
 
 # --- Public API Functions ---
+
+
 def load_image(
     path: str | Path,
     target_size: tuple[int, int] | None = None,
@@ -80,6 +82,9 @@ def load_image(
     """
     Loads an image from a given path, delegating to specialized handlers based on file type.
     """
+    # Local import to avoid circular dependency at module level
+    from app.dds_loader import load_dds_image as load_dds_image_internal
+
     try:
         path = Path(path)
         ext = path.suffix.lower()
@@ -91,8 +96,6 @@ def load_image(
     filename = path.name
 
     if ext == ".dds":
-        from app.dds_loader import load_dds_image as load_dds_image_internal
-
         pil_image = load_dds_image_internal(path, tonemap_mode)
     else:
         # General loading chain for all other formats
@@ -133,6 +136,9 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
     """
     Extracts image metadata, delegating to specialized handlers based on file type.
     """
+    # Local import to avoid circular dependency at module level
+    from app.dds_loader import get_dds_metadata as get_dds_metadata_internal
+
     try:
         stat = precomputed_stat or path.stat()
     except FileNotFoundError:
@@ -141,21 +147,39 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
     try:
         ext = path.suffix.lower()
         if ext == ".dds":
-            from app.dds_loader import get_dds_metadata as get_dds_metadata_internal
-
             return get_dds_metadata_internal(path, stat)
 
         # General metadata chain for non-DDS formats
-        if PYVIPS_AVAILABLE and (metadata := _get_metadata_with_pyvips(path, stat)):
-            return metadata
-        if OIIO_AVAILABLE and (metadata := _get_metadata_with_oiio(path, stat)):
-            return metadata
-        if PILLOW_AVAILABLE and (metadata := _get_metadata_with_pillow(path, stat)):
-            return metadata
+        if PYVIPS_AVAILABLE:
+            try:
+                if metadata := _get_metadata_with_pyvips(path, stat):
+                    return metadata
+            except Exception as e:
+                app_logger.debug(f"pyvips metadata failed for '{path.name}': {e}. Falling back.")
+
+        if OIIO_AVAILABLE:
+            try:
+                # For non-DDS files, we only care about the metadata dict, not the spec object.
+                metadata, _ = _get_metadata_with_oiio(path, stat)
+                if metadata:
+                    return metadata
+            except Exception as e:
+                app_logger.debug(f"OIIO metadata failed for '{path.name}': {e}. Falling back.")
+
+        if PILLOW_AVAILABLE:
+            try:
+                if metadata := _get_metadata_with_pillow(path, stat):
+                    return metadata
+            except Exception as e:
+                app_logger.debug(f"Pillow metadata failed for '{path.name}': {e}. Falling back.")
+
+        # If we reach here, all libraries failed.
+        raise RuntimeError("All available image libraries failed to read metadata.")
 
     except Exception as e:
         app_logger.error(f"All metadata methods failed for {path.name}. Error: {e}")
         try:
+            # Fallback to a minimal metadata object if all else fails
             return {
                 "resolution": (0, 0),
                 "file_size": stat.st_size,
@@ -166,6 +190,8 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
                 "has_alpha": False,
                 "capture_date": None,
                 "bit_depth": 0,
+                "mipmap_count": 1,
+                "texture_type": "2D",
             }
         except Exception as stat_error:
             app_logger.critical(f"Could not even stat file {path.name}. Error: {stat_error}")
@@ -173,6 +199,8 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
 
 
 # --- Private Helper Functions (used by this module and dds_loader) ---
+
+
 def _get_metadata_with_pyvips(path: Path, stat) -> dict | None:
     img = pyvips.Image.new_from_file(str(path), access="sequential")
     if img.width > MAX_PIXEL_DIMENSION or img.height > MAX_PIXEL_DIMENSION:
@@ -198,14 +226,16 @@ def _get_metadata_with_pyvips(path: Path, stat) -> dict | None:
         "mtime": stat.st_mtime,
         "format_str": format_str,
         "compression_format": compression_format,
-        "format_details": f"{bit_depth}-bit {ch_str}",
+        "format_details": ch_str,
         "has_alpha": img.hasalpha(),
         "capture_date": capture_date,
         "bit_depth": bit_depth,
+        "mipmap_count": 1,
+        "texture_type": "2D",
     }
 
 
-def _get_metadata_with_oiio(path: Path, stat) -> dict | None:
+def _get_metadata_with_oiio(path: Path, stat) -> tuple[dict | None, Any]:
     buf = oiio.ImageBuf(str(path))
     if buf.has_error:
         raise RuntimeError(f"OIIO Error: {buf.geterror(autoclear=1)}")
@@ -221,22 +251,30 @@ def _get_metadata_with_oiio(path: Path, stat) -> dict | None:
         dds_format = spec.get_string_attribute("dds:format") or spec.get_string_attribute("compression")
         compression_format = dds_format.upper() if dds_format else ch_str
 
+    format_details = ch_str
+    if desc := spec.get_string_attribute("ImageDescription"):
+        format_details += f" | {desc.strip()}"
+
     capture_date = None
     if dt := spec.get_string_attribute("DateTime"):
         with contextlib.suppress(ValueError, TypeError):
             capture_date = datetime.strptime(dt, "%Y:%m:%d %H:%M:%S").timestamp()
 
-    return {
+    metadata = {
         "resolution": (spec.width, spec.height),
         "file_size": stat.st_size,
         "mtime": stat.st_mtime,
         "format_str": format_str,
         "compression_format": compression_format,
-        "format_details": f"{bit_depth}-bit {ch_str}",
+        "format_details": format_details,
         "has_alpha": spec.alpha_channel != -1,
         "capture_date": capture_date,
         "bit_depth": bit_depth,
+        "mipmap_count": 1,
+        "texture_type": "2D",  # Add defaults here for all formats
     }
+    # Return both the dict and the spec for the DDS handler
+    return metadata, spec
 
 
 def _get_metadata_with_pillow(path: Path, stat) -> dict | None:
@@ -255,10 +293,12 @@ def _get_metadata_with_pillow(path: Path, stat) -> dict | None:
             "mtime": stat.st_mtime,
             "format_str": format_str,
             "compression_format": compression_format,
-            "format_details": f"{bit_depth}-bit {img.mode}",
+            "format_details": img.mode,
             "has_alpha": "A" in img.getbands(),
             "capture_date": None,
             "bit_depth": bit_depth,
+            "mipmap_count": 1,
+            "texture_type": "2D",
         }
 
 

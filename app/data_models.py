@@ -54,9 +54,11 @@ class ImageFingerprint:
         "format_str",
         "has_alpha",
         "hashes",
+        "mipmap_count",
         "mtime",
         "path",
         "resolution",
+        "texture_type",
     ]
     path: Path
     hashes: np.ndarray
@@ -69,6 +71,8 @@ class ImageFingerprint:
     format_details: str
     has_alpha: bool
     bit_depth: int
+    mipmap_count: int
+    texture_type: str
 
     def __hash__(self) -> int:
         return hash(self.path)
@@ -96,6 +100,8 @@ class ImageFingerprint:
             format_details=row["format_details"],
             has_alpha=row["has_alpha"],
             bit_depth=row.get("bit_depth", 8),
+            mipmap_count=row.get("mipmap_count", 1),
+            texture_type=row.get("texture_type", "2D"),
         )
 
 
@@ -126,6 +132,8 @@ class ResultNode:
     format_details: str
     has_alpha: bool
     bit_depth: int
+    mipmap_count: int
+    texture_type: str
     found_by: str
     type: str = "result"  # Field for type checking within the model logic
 
@@ -134,9 +142,13 @@ class ResultNode:
         """Creates an instance from a dictionary, safely ignoring extra keys."""
         class_fields = {f.name for f in fields(cls)}
         filtered_data = {k: v for k, v in data.items() if k in class_fields}
-        # Backward compatibility for DBs without the new field
+        # Backward compatibility for DBs without the new fields
         if "compression_format" not in filtered_data:
             filtered_data["compression_format"] = filtered_data.get("format_str", "Unknown")
+        if "mipmap_count" not in filtered_data:
+            filtered_data["mipmap_count"] = 1
+        if "texture_type" not in filtered_data:
+            filtered_data["texture_type"] = "2D"
         return cls(**filtered_data)
 
 

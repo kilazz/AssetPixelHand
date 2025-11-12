@@ -22,6 +22,37 @@ from .image_io import (
 app_logger = logging.getLogger("AssetPixelHand.dds_loader")
 
 
+def _get_dds_channel_info(compression_format: str, spec) -> tuple[str, bool]:
+    """
+    Infers channel string (e.g., "RGBA") and alpha presence from a DDS compression format.
+    This acts as a knowledge base for common block compression formats.
+    """
+    fmt = compression_format.upper()
+
+    # Formats with guaranteed Alpha channel
+    if any(s in fmt for s in ["BC2", "DXT2", "DXT3", "BC3", "DXT4", "DXT5", "BC7"]):
+        return "RGBA", True
+
+    # Formats with two channels (typically Normal Maps)
+    if any(s in fmt for s in ["BC5", "ATI2"]):
+        return "RG", False
+
+    # Formats with a single channel
+    if any(s in fmt for s in ["BC4", "ATI1"]):
+        return "R", False  # Typically Red channel for grayscale/height maps
+
+    # BC1/DXT1 is special: it can have 1-bit alpha or not.
+    if "BC1" in fmt or "DXT1" in fmt:
+        # Rely on OIIO's ability to detect the alpha channel.
+        has_alpha = spec.alpha_channel != -1 if spec else False
+        return "RGBA" if has_alpha else "RGB", has_alpha
+
+    # Fallback for uncompressed or unknown formats: rely on OIIO's channel count
+    ch_str = {1: "Grayscale", 2: "GA", 3: "RGB", 4: "RGBA"}.get(spec.nchannels if spec else 0, "")
+    has_alpha = spec.alpha_channel != -1 if spec else False
+    return ch_str, has_alpha
+
+
 def _handle_dds_alpha_channel_logic(pil_image: Image.Image) -> Image.Image:
     """
     Applies special alpha channel processing for DDS textures, such as un-premultiplying.
@@ -100,21 +131,35 @@ def get_dds_metadata(path: Path, stat) -> dict | None:
     Extracts metadata from a DDS file using a prioritized chain of libraries.
     """
     filename = path.name
+    metadata = None
 
     if OIIO_AVAILABLE:
         app_logger.debug(f"Getting metadata for DDS '{filename}' with OpenImageIO.")
         try:
-            if metadata := _get_metadata_with_oiio(path, stat):
-                return metadata
+            # OIIO is the most reliable source for mipmaps and cubemap info.
+            # It now explicitly returns the metadata dict and the spec object separately.
+            base_metadata, spec = _get_metadata_with_oiio(path, stat)
+            if base_metadata and spec:
+                compression_format = base_metadata.get("compression_format", "DDS")
+                ch_str, has_alpha = _get_dds_channel_info(compression_format, spec)
+
+                # Update metadata with inferred values
+                base_metadata["has_alpha"] = has_alpha
+                base_metadata["format_details"] = ch_str  # Only channel info
+
+                # Extract DDS-specific attributes from the spec object
+                base_metadata["mipmap_count"] = spec.get_int_attribute("dds:mipmaps", 1)
+                base_metadata["texture_type"] = "Cubemap" if spec.get_int_attribute("dds:is_cubemap") else "2D"
+                metadata = base_metadata
         except Exception as e:
             app_logger.debug(f"OIIO metadata for DDS failed for '{filename}': {e}. Falling back.")
+            metadata = None  # Ensure we fallback if OIIO fails
 
-    if PILLOW_AVAILABLE:
+    if metadata is None and PILLOW_AVAILABLE:
         app_logger.debug(f"Getting metadata for DDS '{filename}' with Pillow (fallback).")
         try:
-            if metadata := _get_metadata_with_pillow(path, stat):
-                return metadata
+            metadata = _get_metadata_with_pillow(path, stat)
         except Exception as e:
             app_logger.debug(f"Pillow metadata for DDS failed for '{filename}': {e}.")
 
-    return None
+    return metadata

@@ -98,7 +98,7 @@ class ScanStrategy(ABC):
                 data = self._prepare_results_data(final_groups, search_context)
                 if data:
                     conn.executemany(
-                        "INSERT INTO results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", data
+                        "INSERT INTO results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", data
                     )
                 self._persist_database(conn)
                 app_logger.info(f"Results saved to '{RESULTS_DB_FILE.name}'.")
@@ -113,7 +113,8 @@ class ScanStrategy(ABC):
                group_id INTEGER, is_best BOOLEAN, path VARCHAR, resolution_w INTEGER,
                resolution_h INTEGER, file_size UBIGINT, mtime DOUBLE, capture_date DOUBLE,
                distance INTEGER, format_str VARCHAR, compression_format VARCHAR, format_details VARCHAR,
-               has_alpha BOOLEAN, bit_depth INTEGER, search_context VARCHAR, found_by VARCHAR
+               has_alpha BOOLEAN, bit_depth INTEGER, mipmap_count INTEGER, texture_type VARCHAR,
+               search_context VARCHAR, found_by VARCHAR
             )"""
         )
 
@@ -153,6 +154,8 @@ class ScanStrategy(ABC):
             fp.format_details,
             fp.has_alpha,
             fp.bit_depth,
+            fp.mipmap_count,
+            fp.texture_type,
             search_context,
             found_by,
         )
@@ -319,6 +322,8 @@ class SearchStrategy(ScanStrategy):
                 format_details="Text Query",
                 has_alpha=False,
                 bit_depth=8,
+                mipmap_count=1,
+                texture_type="2D",
             )
 
     def _get_search_context(self) -> str:
