@@ -107,6 +107,7 @@ class ScannerCore(QObject):
                     pa.field("mtime", pa.float64()),
                     pa.field("capture_date", pa.float64()),
                     pa.field("format_str", pa.string()),
+                    pa.field("compression_format", pa.string()),
                     pa.field("format_details", pa.string()),
                     pa.field("has_alpha", pa.bool_()),
                     pa.field("bit_depth", pa.int32()),

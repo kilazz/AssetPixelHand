@@ -51,51 +51,14 @@ def _format_metadata_string(node: ResultNode) -> str:
     res = f"{node.resolution_w}x{node.resolution_h}"
     size_mb = node.file_size / (1024**2)
     size_str = f"{size_mb:.2f} MB"
-    general_format = node.format_str
-    bit_depth_str = f"{node.bit_depth}-bit"
-    compression_format = ""
-    active_channels = ""
 
-    if general_format == "DDS":
-        # Robustly handle different metadata sources
-        if node.format_details.startswith("DDS ("):
-            # Case 1: Detailed metadata from directxtex_decoder
-            format_spec = node.format_details.replace("DDS (", "").replace(")", "")
-            spec_upper = format_spec.upper()
-            compression_format = spec_upper
+    # The backend now provides pre-formatted details. The GUI just assembles them.
+    # The format_details from backend is expected to be like "16-bit RGBA"
+    details_parts = node.format_details.split()
+    bit_depth_str = details_parts[0] if (details_parts and "-bit" in details_parts[0]) else f"{node.bit_depth}-bit"
+    active_channels = details_parts[1] if len(details_parts) > 1 else ""
 
-            if any(
-                s in spec_upper
-                for s in ["R32G32B32A32", "R16G16B16A16", "R10G10B10A2", "R8G8B8A8", "B8G8R8A8", "BC2", "BC3", "BC7"]
-            ):
-                active_channels = "RGBA"
-            elif any(s in spec_upper for s in ["R32G32B32", "R11G11B10", "B5G6R5"]):
-                active_channels = "RGB"
-            elif any(s in spec_upper for s in ["BC1", "DXT1"]):
-                active_channels = "RGBA" if node.has_alpha else "RGB"
-            elif any(s in spec_upper for s in ["R32G32", "R16G16", "R8G8", "BC5", "ATI2"]):
-                active_channels = "RG"
-            elif any(s in spec_upper for s in ["R32", "R16", "R8", "A8", "BC4", "ATI1"]):
-                active_channels = "A" if "A8" in spec_upper else "R"
-            else:
-                active_channels = "Unknown"
-        else:
-            # Case 2: Generic metadata from pyvips or other loaders
-            compression_format = "Unknown"  # Cannot know original compression
-            if "-bit" in node.format_details:
-                # Extracts "RGBA" from "8-bit RGBA"
-                active_channels = node.format_details.split("-bit")[1].strip()
-            else:
-                active_channels = "RGBA" if node.has_alpha else "RGB"
-
-    else:  # For other common image types like PNG, JPG
-        compression_format = general_format
-        if "-bit" in node.format_details:
-            active_channels = node.format_details.split("-bit")[1].strip()
-        else:
-            active_channels = "RGB" if not node.has_alpha else "RGBA"
-
-    return f"{res} | {size_str} | {general_format} | {compression_format} | {bit_depth_str} | {active_channels}"
+    return f"{res} | {size_str} | {node.format_str} | {node.compression_format} | {bit_depth_str} | {active_channels}"
 
 
 class ResultsTreeModel(QAbstractItemModel):

@@ -97,7 +97,9 @@ class ScanStrategy(ABC):
                 self._create_results_table(conn)
                 data = self._prepare_results_data(final_groups, search_context)
                 if data:
-                    conn.executemany("INSERT INTO results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", data)
+                    conn.executemany(
+                        "INSERT INTO results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", data
+                    )
                 self._persist_database(conn)
                 app_logger.info(f"Results saved to '{RESULTS_DB_FILE.name}'.")
         except duckdb.Error as e:
@@ -110,7 +112,7 @@ class ScanStrategy(ABC):
             """CREATE TABLE results (
                group_id INTEGER, is_best BOOLEAN, path VARCHAR, resolution_w INTEGER,
                resolution_h INTEGER, file_size UBIGINT, mtime DOUBLE, capture_date DOUBLE,
-               distance INTEGER, format_str VARCHAR, format_details VARCHAR,
+               distance INTEGER, format_str VARCHAR, compression_format VARCHAR, format_details VARCHAR,
                has_alpha BOOLEAN, bit_depth INTEGER, search_context VARCHAR, found_by VARCHAR
             )"""
         )
@@ -147,6 +149,7 @@ class ScanStrategy(ABC):
             fp.capture_date,
             distance,
             fp.format_str,
+            fp.compression_format,
             fp.format_details,
             fp.has_alpha,
             fp.bit_depth,
@@ -312,6 +315,7 @@ class SearchStrategy(ScanStrategy):
                 mtime=0,
                 capture_date=None,
                 format_str="SEARCH",
+                compression_format="Text Query",
                 format_details="Text Query",
                 has_alpha=False,
                 bit_depth=8,

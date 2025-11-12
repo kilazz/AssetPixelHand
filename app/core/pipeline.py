@@ -257,6 +257,7 @@ class PipelineManager(QObject):
                 "mtime": fp.mtime,
                 "capture_date": fp.capture_date,
                 "format_str": fp.format_str,
+                "compression_format": fp.compression_format,
                 "format_details": fp.format_details,
                 "has_alpha": bool(fp.has_alpha),
                 "bit_depth": fp.bit_depth,

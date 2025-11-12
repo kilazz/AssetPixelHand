@@ -48,6 +48,7 @@ class ImageFingerprint:
     __slots__ = [
         "bit_depth",
         "capture_date",
+        "compression_format",
         "file_size",
         "format_details",
         "format_str",
@@ -64,6 +65,7 @@ class ImageFingerprint:
     mtime: float
     capture_date: float | None
     format_str: str
+    compression_format: str
     format_details: str
     has_alpha: bool
     bit_depth: int
@@ -90,6 +92,7 @@ class ImageFingerprint:
             mtime=row["mtime"],
             capture_date=row["capture_date"],
             format_str=row["format_str"],
+            compression_format=row.get("compression_format", row["format_str"]),
             format_details=row["format_details"],
             has_alpha=row["has_alpha"],
             bit_depth=row.get("bit_depth", 8),
@@ -119,6 +122,7 @@ class ResultNode:
     capture_date: float | None
     distance: int
     format_str: str
+    compression_format: str
     format_details: str
     has_alpha: bool
     bit_depth: int
@@ -130,6 +134,9 @@ class ResultNode:
         """Creates an instance from a dictionary, safely ignoring extra keys."""
         class_fields = {f.name for f in fields(cls)}
         filtered_data = {k: v for k, v in data.items() if k in class_fields}
+        # Backward compatibility for DBs without the new field
+        if "compression_format" not in filtered_data:
+            filtered_data["compression_format"] = filtered_data.get("format_str", "Unknown")
         return cls(**filtered_data)
 
 

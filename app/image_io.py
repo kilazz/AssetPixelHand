@@ -212,6 +212,10 @@ def load_image(
 
 
 def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | None:
+    """
+    Extracts image metadata using a chain of libraries.
+    The library order is chosen to maximize the quality of metadata.
+    """
     try:
         stat = precomputed_stat if precomputed_stat else path.stat()
     except FileNotFoundError:
@@ -221,42 +225,34 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
         ext = path.suffix.lower()
         filename = path.name
 
-        # --- General metadata chain ---
-        if PYVIPS_AVAILABLE:
-            app_logger.debug(f"Getting metadata for '{filename}' with pyvips.")
-            try:
-                return _get_metadata_with_pyvips(path, stat)
-            except Exception as e:
-                app_logger.debug(f"pyvips metadata failed for '{filename}': {e}. Falling back.")
+        # Define the call chain for each library
+        oiio_call = (_get_metadata_with_oiio, "OpenImageIO") if OIIO_AVAILABLE else None
+        pyvips_call = (_get_metadata_with_pyvips, "pyvips") if PYVIPS_AVAILABLE else None
+        pillow_call = (_get_metadata_with_pillow, "Pillow") if PILLOW_AVAILABLE else None
 
-        if OIIO_AVAILABLE:
-            app_logger.debug(f"Getting metadata for '{filename}' with OpenImageIO.")
-            try:
-                return _get_metadata_with_oiio(path, stat)
-            except Exception as e:
-                app_logger.debug(f"OIIO metadata failed for '{filename}': {e}. Falling back.")
+        # Determine the optimal call order based on file type
+        call_order = [oiio_call, pyvips_call, pillow_call] if ext == ".dds" else [pyvips_call, oiio_call, pillow_call]
 
-        if PILLOW_AVAILABLE:
-            app_logger.debug(f"Getting metadata for '{filename}' with Pillow.")
-            with Image.open(path) as img:
-                return {
-                    "resolution": img.size,
-                    "file_size": stat.st_size,
-                    "mtime": stat.st_mtime,
-                    "format_str": img.format or ext.strip(".").upper(),
-                    "format_details": f"8-bit {img.mode}",
-                    "has_alpha": "A" in img.getbands(),
-                    "capture_date": None,
-                    "bit_depth": 8,
-                }
+        # Execute the call chain, stopping at the first success
+        for func, name in filter(None, call_order):
+            app_logger.debug(f"Getting metadata for '{filename}' with {name}.")
+            try:
+                # If a function returns a valid dict, we are done.
+                if metadata := func(path, stat):
+                    return metadata
+            except Exception as e:
+                app_logger.debug(f"{name} metadata failed for '{filename}': {e}. Falling back.")
+
     except Exception as e:
         app_logger.error(f"All metadata methods failed for {path.name}. Error: {e}")
         try:
+            # Fallback to a minimal metadata object if all else fails
             return {
                 "resolution": (0, 0),
                 "file_size": stat.st_size,
                 "mtime": stat.st_mtime,
                 "format_str": path.suffix.strip(".").upper(),
+                "compression_format": "Unknown",
                 "format_details": "METADATA FAILED",
                 "has_alpha": False,
                 "capture_date": None,
@@ -298,11 +294,15 @@ def _get_metadata_with_pyvips(path: Path, stat) -> dict | None:
         dt_str = img.get("exif-ifd0-DateTime")
         with contextlib.suppress(ValueError, TypeError):
             capture_date = datetime.strptime(dt_str.split("\0", 1)[0], "%Y:%m:%d %H:%M:%S").timestamp()
+
+    format_str = img.get("vips-loader").upper() or path.suffix.strip(".").upper()
+
     return {
         "resolution": (img.width, img.height),
         "file_size": stat.st_size,
         "mtime": stat.st_mtime,
-        "format_str": img.get("vips-loader").upper() or path.suffix.strip(".").upper(),
+        "format_str": format_str,
+        "compression_format": format_str,
         "format_details": f"{bit_depth}-bit {ch_str}",
         "has_alpha": has_alpha,
         "capture_date": capture_date,
@@ -319,11 +319,20 @@ def _get_metadata_with_oiio(path: Path, stat) -> dict | None:
         spec.format.basetype, 8
     )
     ch_str = {1: "Grayscale", 2: "GA", 3: "RGB", 4: "RGBA"}.get(spec.nchannels, f"{spec.nchannels}ch")
+
+    format_str = buf.file_format_name.upper()
+    compression_format = format_str
+    if format_str == "DDS":
+        compression_from_spec = spec.get_string_attribute("compression")
+        if compression_from_spec:
+            compression_format = compression_from_spec.upper()
+
     result = {
         "resolution": (spec.width, spec.height),
         "file_size": stat.st_size,
         "mtime": stat.st_mtime,
-        "format_str": buf.file_format_name.upper(),
+        "format_str": format_str,
+        "compression_format": compression_format,
         "format_details": f"{bit_depth}-bit {ch_str}",
         "has_alpha": spec.alpha_channel != -1,
         "capture_date": None,
@@ -333,6 +342,31 @@ def _get_metadata_with_oiio(path: Path, stat) -> dict | None:
         with contextlib.suppress(ValueError, TypeError):
             result["capture_date"] = datetime.strptime(dt, "%Y:%m:%d %H:%M:%S").timestamp()
     return result
+
+
+def _get_metadata_with_pillow(path: Path, stat) -> dict | None:
+    with Image.open(path) as img:
+        img.load()  # Ensure metadata is loaded
+
+        bit_depth = 8  # Pillow usually decodes to 8-bit, this is a safe assumption.
+        has_alpha = "A" in img.getbands()
+        format_str = img.format or path.suffix.strip(".").upper()
+
+        compression_format = format_str
+        if format_str == "DDS":
+            compression_format = img.info.get("fourcc", "DDS")
+
+        return {
+            "resolution": img.size,
+            "file_size": stat.st_size,
+            "mtime": stat.st_mtime,
+            "format_str": format_str,
+            "compression_format": compression_format,
+            "format_details": f"{bit_depth}-bit {img.mode}",
+            "has_alpha": has_alpha,
+            "capture_date": None,  # Pillow doesn't easily expose this
+            "bit_depth": bit_depth,
+        }
 
 
 # --- Private Helper Functions for Loading ---
