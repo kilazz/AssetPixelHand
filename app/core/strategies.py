@@ -18,8 +18,8 @@ import polars as pl
 from app.cache import _configure_db_connection
 from app.constants import BEST_FILE_METHOD_NAME, DUCKDB_AVAILABLE, RESULTS_DB_FILE
 from app.data_models import (
-    DuplicateResults,
     FINGERPRINT_FIELDS,
+    DuplicateResults,
     ImageFingerprint,
     ScanConfig,
     ScanMode,
@@ -151,7 +151,7 @@ class ScanStrategy(ABC):
                 row_data.append(fp.resolution[1])
             else:
                 row_data.append(getattr(fp, field_name, None))
-        
+
         row_data.extend([distance, search_context, found_by])
         return tuple(row_data)
 

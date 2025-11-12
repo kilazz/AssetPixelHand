@@ -8,7 +8,6 @@ import logging
 import multiprocessing
 import os
 import threading
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from multiprocessing import shared_memory
@@ -247,11 +246,7 @@ class PipelineManager(QObject):
         if not fingerprints or not LANCEDB_AVAILABLE:
             return
 
-        data_to_convert = [
-            fp.to_lancedb_dict()
-            for fp in fingerprints
-            if fp.hashes is not None and fp.hashes.size > 0
-        ]
+        data_to_convert = [fp.to_lancedb_dict() for fp in fingerprints if fp.hashes is not None and fp.hashes.size > 0]
 
         if not data_to_convert:
             return

@@ -70,6 +70,7 @@ class ImageFingerprint:
     __slots__ = [
         "bit_depth",
         "capture_date",
+        "color_space",
         "compression_format",
         "file_size",
         "format_details",
@@ -81,7 +82,6 @@ class ImageFingerprint:
         "path",
         "resolution",
         "texture_type",
-        "color_space",
     ]
     path: Path
     hashes: np.ndarray

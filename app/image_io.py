@@ -216,13 +216,12 @@ def _get_metadata_with_pyvips(path: Path, stat) -> dict | None:
             capture_date = datetime.strptime(
                 img.get("exif-ifd0-DateTime").split("\0", 1)[0], "%Y:%m:%d %H:%M:%S"
             ).timestamp()
-    
+
     color_space = "sRGB"
     if "icc-profile-data" in img.get_fields():
         color_space = "Embedded ICC"
     elif img.interpretation == "grey16":
         color_space = "Linear"
-
 
     return {
         "resolution": (img.width, img.height),
