@@ -93,7 +93,6 @@ def check_library_imports() -> bool:
         "Scientific & Math": {"scipy": "scipy"},
         "Advanced Image I/O (Optional but Recommended)": {
             "OpenImageIO": "OpenImageIO",
-            "directxtex_decoder": "directxtex-decoder",
             "pyvips": "pyvips",
             "simple_ocio": "simple-ocio",
         },

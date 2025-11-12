@@ -46,7 +46,7 @@ CUSTOM_MODELS_CONFIG_FILE = APP_DATA_DIR / "custom_models.json"
 # --- Library Availability Checks ---
 DEEP_LEARNING_AVAILABLE = all(importlib.util.find_spec(pkg) for pkg in ["onnxruntime", "transformers", "torch"])
 OIIO_AVAILABLE = bool(importlib.util.find_spec("OpenImageIO"))
-DIRECTXTEX_AVAILABLE = bool(importlib.util.find_spec("directxtex_decoder"))
+PYVIPS_AVAILABLE = bool(importlib.util.find_spec("pyvips"))
 DUCKDB_AVAILABLE = bool(importlib.util.find_spec("duckdb"))
 LANCEDB_AVAILABLE = bool(importlib.util.find_spec("lancedb"))
 ZSTD_AVAILABLE = bool(importlib.util.find_spec("zstandard"))
@@ -72,6 +72,7 @@ _main_supported_ext = [
     ".bmp",
     ".cin",
     ".cur",
+    ".dds",
     ".dpx",
     ".exr",
     ".gif",
@@ -92,8 +93,6 @@ _main_supported_ext = [
     ".webp",
 ]
 _all_ext = list(_main_supported_ext)
-if DIRECTXTEX_AVAILABLE:
-    _all_ext.append(".dds")
 ALL_SUPPORTED_EXTENSIONS = sorted(set(_all_ext))
 
 

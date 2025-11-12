@@ -5,9 +5,8 @@ This module provides a unified interface for handling a wide variety of image
 formats by using a prioritized chain of specialized libraries:
 1. simple-ocio for professional color management (tonemapping).
 2. pyvips for maximum format compatibility and performance.
-3. DirectXTex for DDS textures.
-4. OpenImageIO for professional formats.
-5. Pillow (PIL) as a robust fallback.
+3. OpenImageIO for professional formats.
+4. Pillow (PIL) as a robust fallback.
 """
 
 import contextlib
@@ -70,13 +69,6 @@ except ImportError:
     oiio = None
     OIIO_AVAILABLE = False
 
-try:
-    import directxtex_decoder
-
-    DIRECTXTEX_AVAILABLE = True
-except ImportError:
-    directxtex_decoder = None
-    DIRECTXTEX_AVAILABLE = False
 
 try:
     Image.init()
@@ -85,14 +77,56 @@ except ImportError:
     PILLOW_AVAILABLE = False
 
 
-def is_dds_hdr(format_str: str) -> tuple[bool, int]:
-    """Checks if a DDS format string corresponds to an HDR format."""
-    fmt = format_str.upper()
-    if any(x in fmt for x in ["BC6H", "R16G16B16A16_FLOAT", "R16G16_FLOAT", "R16_FLOAT"]):
-        return True, 16
-    if any(x in fmt for x in ["R32G32B32A32_FLOAT", "R32G32B32_FLOAT", "R32_FLOAT", "R11G11B10_FLOAT"]):
-        return True, 32
-    return False, 8
+def _handle_dds_alpha_channel_logic(pil_image: Image.Image) -> Image.Image:
+    """
+    Applies special alpha channel processing for DDS textures, such as un-premultiplying.
+    This logic is adapted from the original directxtex loader path.
+    """
+    if not pil_image or pil_image.mode != "RGBA":
+        return pil_image
+
+    # Convert to numpy array to perform channel analysis
+    try:
+        numpy_array = np.array(pil_image)
+    except Exception:
+        return pil_image  # Could not convert, return original
+
+    # This logic is only for 8-bit RGBA images, which is the most common case for this issue.
+    if numpy_array.ndim != 3 or numpy_array.shape[2] != 4 or numpy_array.dtype != np.uint8:
+        return pil_image
+
+    app_logger.debug("Analyzing DDS RGBA texture for special channel formats.")
+    arr = numpy_array.astype(np.float32)
+    rgb, alpha = arr[:, :, :3], arr[:, :, 3]
+    alpha_min, alpha_max = np.min(alpha), np.max(alpha)
+    rgb_max = np.max(rgb)
+
+    # Heuristic for additive blending (e.g., fire, sparks)
+    if alpha_max < 5 and rgb_max > 0:
+        app_logger.debug("Detected additive texture. Using luminance as alpha.")
+        luminance_alpha = np.maximum.reduce(rgb, axis=2)
+        arr[:, :, 3] = luminance_alpha
+        return Image.fromarray(arr.astype(np.uint8))
+
+    # Heuristic for grayscale mask stored in alpha channel of a pure black texture
+    elif rgb_max == 0 and alpha_max > 0 and alpha_min != alpha_max:
+        app_logger.debug("Detected grayscale mask in alpha channel.")
+        arr[:, :, 0] = alpha
+        arr[:, :, 1] = alpha
+        arr[:, :, 2] = alpha
+        arr[:, :, 3] = 255  # Make it fully opaque
+        return Image.fromarray(arr.astype(np.uint8))
+
+    # Default case: Assume standard premultiplied alpha and un-premultiply it
+    else:
+        app_logger.debug("Applying standard un-premultiply logic to DDS.")
+        mask = alpha > 0
+        # Create a broadcastable alpha channel, avoiding division by zero
+        alpha_scaled = alpha[mask, np.newaxis] / 255.0
+        # Un-premultiply RGB values
+        rgb[mask] /= alpha_scaled
+        arr[:, :, :3] = np.clip(rgb, 0, 255)
+        return Image.fromarray(arr.astype(np.uint8))
 
 
 def load_image(
@@ -113,15 +147,8 @@ def load_image(
     # --- DDS-specific loading chain ---
     if ext == ".dds":
         app_logger.debug(f"DDS file detected. Using specialized loading chain for '{filename}'.")
-        if DIRECTXTEX_AVAILABLE:
-            try:
-                pil_image = _load_with_directxtex(path.read_bytes(), tonemap_mode)
-                app_logger.debug(f"Successfully loaded '{filename}' with DirectXTex.")
-            except Exception as e:
-                app_logger.debug(f"DirectXTex failed for '{filename}': {e}. Falling back.")
-
-        if pil_image is None and OIIO_AVAILABLE:
-            app_logger.debug(f"Attempting to load DDS '{filename}' with OpenImageIO (fallback).")
+        # Step 1: Load the DDS using the best available generic loader
+        if OIIO_AVAILABLE:
             try:
                 pil_image = _load_with_oiio(path, tonemap_mode)
                 app_logger.debug(f"Successfully loaded DDS '{filename}' with OpenImageIO.")
@@ -137,6 +164,10 @@ def load_image(
                 app_logger.debug(f"Successfully loaded DDS '{filename}' with Pillow.")
             except Exception as e:
                 app_logger.error(f"All DDS loaders failed for '{filename}'. Final Pillow error: {e}")
+
+        # Step 2: If loaded, apply the special alpha channel logic
+        if pil_image:
+            pil_image = _handle_dds_alpha_channel_logic(pil_image)
 
     # --- General loading chain for all other formats ---
     else:
@@ -174,7 +205,7 @@ def load_image(
             return pil_image.convert("RGBA")
         return pil_image
 
-    if not any([PYVIPS_AVAILABLE, DIRECTXTEX_AVAILABLE, OIIO_AVAILABLE, PILLOW_AVAILABLE]):
+    if not any([PYVIPS_AVAILABLE, OIIO_AVAILABLE, PILLOW_AVAILABLE]):
         app_logger.error("No image loading libraries are installed.")
 
     return None
@@ -190,38 +221,7 @@ def get_image_metadata(path: Path, precomputed_stat=None) -> dict[str, Any] | No
         ext = path.suffix.lower()
         filename = path.name
 
-        # --- DDS-specific metadata chain ---
-        if ext == ".dds":
-            if DIRECTXTEX_AVAILABLE:
-                app_logger.debug(f"Getting metadata for '{filename}' with DirectXTex.")
-                try:
-                    with path.open("rb") as f:
-                        meta = directxtex_decoder.get_dds_metadata(f.read())
-                    format_str = meta["format_str"].upper()
-                    _, bit_depth = is_dds_hdr(format_str)
-                    has_alpha = any(s in format_str for s in ["A8", "BC2", "BC3", "BC7", "DXT", "RGBA"])
-                    return {
-                        "resolution": (meta["width"], meta["height"]),
-                        "file_size": stat.st_size,
-                        "mtime": stat.st_mtime,
-                        "format_str": "DDS",
-                        "format_details": f"DDS ({format_str})",
-                        "has_alpha": has_alpha,
-                        "capture_date": None,
-                        "bit_depth": bit_depth,
-                    }
-                except Exception as e:
-                    app_logger.debug(f"DirectXTex metadata failed for '{filename}': {e}. Falling back.")
-
-            if OIIO_AVAILABLE:
-                app_logger.debug(f"Getting metadata for DDS '{filename}' with OpenImageIO (fallback).")
-                try:
-                    # OIIO can provide some basic info even if directxtex fails
-                    return _get_metadata_with_oiio(path, stat)
-                except Exception as e:
-                    app_logger.debug(f"OIIO fallback for DDS failed for '{filename}': {e}. Falling back.")
-
-        # --- General metadata chain for non-DDS or failed DDS ---
+        # --- General metadata chain ---
         if PYVIPS_AVAILABLE:
             app_logger.debug(f"Getting metadata for '{filename}' with pyvips.")
             try:
@@ -349,57 +349,6 @@ def _load_with_pyvips(path: str | Path, tonemap_mode: str) -> Image.Image | None
         image = image.cast("uchar")
     numpy_array = image.numpy()
     return Image.fromarray(numpy_array)
-
-
-def _load_with_directxtex(dds_bytes: bytes, tonemap_mode: str) -> Image.Image | None:
-    decoded = directxtex_decoder.decode_dds(dds_bytes)
-    numpy_array, dtype = decoded["data"], decoded["data"].dtype
-
-    # This block handles various non-standard channel usages common in DDS game assets.
-    if numpy_array.ndim == 3 and numpy_array.shape[2] == 4 and np.issubdtype(dtype, np.uint8):
-        app_logger.debug("Analyzing RGBA texture for special channel formats.")
-        arr = numpy_array.astype(np.float32)
-        rgb, alpha = arr[:, :, :3], arr[:, :, 3]
-        alpha_max, rgb_max = np.max(alpha), np.max(rgb)
-
-        if alpha_max < 5 and rgb_max > 0:  # Additive texture
-            app_logger.debug("Detected additive texture. Using luminance as alpha.")
-            luminance_alpha = np.maximum.reduce(rgb, axis=2)
-            arr[:, :, 3] = luminance_alpha
-            return Image.fromarray(arr.astype(np.uint8))
-        elif rgb_max < 5 and alpha_max > 0:  # Grayscale in alpha
-            app_logger.debug("Detected grayscale mask in alpha channel.")
-            arr[:, :, 0] = alpha
-            arr[:, :, 1] = alpha
-            arr[:, :, 2] = alpha
-            arr[:, :, 3] = 255
-            return Image.fromarray(arr.astype(np.uint8))
-        else:  # Standard premultiplied alpha
-            app_logger.debug("Applying standard un-premultiply logic.")
-            mask = alpha > 0
-            alpha_scaled = alpha[mask, np.newaxis] / 255.0
-            rgb[mask] /= alpha_scaled
-            arr[:, :, :3] = np.clip(rgb, 0, 255)
-            return Image.fromarray(arr.astype(np.uint8))
-
-    pil_image = None
-    if np.issubdtype(dtype, np.floating):
-        if tonemap_mode != TonemapMode.NONE.value:
-            pil_image = Image.fromarray(_tonemap_float_array(numpy_array.astype(np.float32), tonemap_mode))
-        else:
-            pil_image = Image.fromarray((np.clip(numpy_array, 0.0, 1.0) * 255).astype(np.uint8))
-    elif np.issubdtype(dtype, np.uint16):
-        pil_image = Image.fromarray((numpy_array // 257).astype(np.uint8))
-    elif np.issubdtype(dtype, np.signedinteger):
-        info = np.iinfo(dtype)
-        norm = (numpy_array.astype(np.float32) - info.min) / (info.max - info.min)
-        pil_image = Image.fromarray((norm * 255).astype(np.uint8))
-    elif np.issubdtype(dtype, np.uint8):
-        pil_image = Image.fromarray(numpy_array)
-
-    if pil_image is None:
-        raise TypeError(f"Unhandled NumPy dtype from DirectXTex decoder: {dtype}")
-    return pil_image
 
 
 def _load_with_oiio(path: str | Path, tonemap_mode: str) -> Image.Image | None:
