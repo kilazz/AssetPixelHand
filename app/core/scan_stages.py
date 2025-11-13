@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import numpy as np
-import polars as pl  # Import polars
+import polars as pl
 
 from app.constants import LANCEDB_AVAILABLE
 from app.data_models import ImageFingerprint, ScanConfig, ScanState
@@ -346,11 +346,7 @@ class ExactGroupingStage(ScanStage):
             if context.stop_event.is_set():
                 return False
 
-        if context.config.find_simple_duplicates:
-            reps_data = self._group_by_hash_key(reps_data, "dhash", EvidenceMethod.DHASH.value, context)
-            if context.stop_event.is_set():
-                return False
-
+        # dHash grouping is now handled by the PerceptualGroupingStage
         context.files_to_process = [d["path"] for d in reps_data]
         return True
 
@@ -377,37 +373,54 @@ class PerceptualGroupingStage(ScanStage):
         return "Phase 3/6: Finding duplicates by perceptual hashes..."
 
     def run(self, context: ScanContext) -> bool:
-        if not context.config.find_perceptual_duplicates:
-            return True
+        # Step 1: Cluster by dHash (simple duplicates)
+        if context.config.find_simple_duplicates:
+            self._run_clustering(
+                context=context,
+                hash_key="dhash",
+                method=EvidenceMethod.DHASH,
+                threshold=context.config.dhash_threshold,
+            )
 
-        # Get the current representatives to process for pHash
+        # Step 2: Cluster by pHash (near-identical duplicates)
+        if context.config.find_perceptual_duplicates:
+            self._run_clustering(
+                context=context,
+                hash_key="phash",
+                method=EvidenceMethod.PHASH,
+                threshold=context.config.phash_threshold,
+            )
+
+        context.signals.log_message.emit(
+            f"Found {len(context.files_to_process)} unique candidates for AI processing.", "info"
+        )
+        return True
+
+    def _run_clustering(self, context: ScanContext, hash_key: str, method: EvidenceMethod, threshold: int):
+        """Generic logic to run clustering for a given hash type."""
         rep_paths = set(context.files_to_process)
         reps_data = [d for d in context.all_hashed_data if d["path"] in rep_paths]
 
-        phashes_to_process = [(d["phash"], d["path"]) for d in reps_data if d.get("phash") is not None]
-        if not phashes_to_process:
-            return True
+        hashes_to_process = [(d[hash_key], d["path"]) for d in reps_data if d.get(hash_key) is not None]
+        if not hashes_to_process:
+            return
 
-        hashes_ph, paths_ph = zip(*phashes_to_process, strict=True)
-        components = self._find_phash_components(paths_ph, hashes_ph, context.config.phash_threshold)
-        final_reps = self._process_phash_components(components, context)
+        hashes, paths = zip(*hashes_to_process, strict=True)
+        components = self._find_hash_components_lancedb(paths, hashes, threshold)
+        final_reps = self._process_hash_components(components, context, method)
 
         context.files_to_process = final_reps
-        context.signals.log_message.emit(f"Found {len(final_reps)} unique candidates for AI processing.", "info")
-        return True
 
-    def _find_phash_components(
+    def _find_hash_components_lancedb(
         self, paths: tuple[Path, ...], hashes: tuple[Any, ...], threshold: int
     ) -> dict[int, list[Path]]:
-        """
-        Finds groups of similar pHashes using a high-performance LanceDB index.
-        """
+        """Finds groups of similar hashes (dHash or pHash) using LanceDB."""
         n = len(paths)
         if not hashes or n < 2:
             return {i: [p] for i, p in enumerate(paths)}
 
         if not LANCEDB_AVAILABLE:
-            app_logger.warning("LanceDB not available, skipping perceptual hash indexing.")
+            app_logger.warning(f"LanceDB not available, skipping {hashes[0].__class__.__name__} indexing.")
             return {i: [p] for i, p in enumerate(paths)}
 
         temp_db_path = None
@@ -423,7 +436,7 @@ class PerceptualGroupingStage(ScanStage):
             data = [{"vector": v, "id": i} for i, v in enumerate(vectors)]
 
             db = lancedb.connect(temp_db_path)
-            tbl = db.create_table("phashes", data=data)
+            tbl = db.create_table("hashes", data=data)
 
             rows, cols = [], []
             radius = np.sqrt(threshold) + 0.001
@@ -431,9 +444,7 @@ class PerceptualGroupingStage(ScanStage):
 
             for i in range(n):
                 query_vector = vectors[i]
-                # Use .to_polars() instead of .to_df()
                 results = tbl.search(query_vector).metric("L2").limit(limit).to_polars()
-                # Use polars filtering syntax
                 neighbors = results.filter(pl.col("_distance") <= radius)
 
                 for neighbor_id in neighbors["id"]:
@@ -455,7 +466,10 @@ class PerceptualGroupingStage(ScanStage):
             if temp_db_path and Path(temp_db_path).exists():
                 shutil.rmtree(temp_db_path, ignore_errors=True)
 
-    def _process_phash_components(self, components: dict[int, list[Path]], context: ScanContext) -> list[Path]:
+    def _process_hash_components(
+        self, components: dict[int, list[Path]], context: ScanContext, method: EvidenceMethod
+    ) -> list[Path]:
+        """Processes the found hash clusters to update representatives and evidence."""
         final_representatives = []
         processed_paths = set()
 
@@ -475,10 +489,11 @@ class PerceptualGroupingStage(ScanStage):
                 final_representatives.append(best.path)
                 for path in group:
                     if path != best.path:
-                        context.cluster_manager.add_evidence(best.path, path, EvidenceMethod.PHASH.value, 0.0)
+                        context.cluster_manager.add_evidence(best.path, path, method.value, 0.0)
             elif group:
                 final_representatives.append(group[0])
 
+        # Add back any files that were not part of any cluster
         for path in context.files_to_process:
             if path not in processed_paths:
                 final_representatives.append(path)
