@@ -52,6 +52,7 @@ webgpu   = ["onnxruntime-webgpu>=1.24.0.dev20251031004"]
 dev = [
     "ruff",
     "snakeviz",
+    "py-spy",
     "tabulate2",
     "psutil",
     "tqdm",

@@ -74,28 +74,49 @@ class DirectXTexLoader(BaseLoader):
         )
 
     def _handle_alpha_logic(self, pil_image: Image.Image) -> Image.Image:
+        """
+        Optimized alpha handling for premultiplied alpha and other edge cases.
+        This version uses vectorized NumPy operations for maximum performance.
+        """
         if not pil_image or pil_image.mode != "RGBA":
             return pil_image
-        try:
-            numpy_array = np.array(pil_image)
-        except Exception:
-            return pil_image
-        if numpy_array.ndim != 3 or numpy_array.shape[2] != 4 or numpy_array.dtype != np.uint8:
+
+        # Create a mutable copy of the array
+        arr = np.array(pil_image)
+
+        if arr.ndim != 3 or arr.shape[2] != 4 or arr.dtype != np.uint8:
             return pil_image
 
-        arr = numpy_array.astype(np.float32)
-        rgb, alpha = arr[:, :, :3], arr[:, :, 3]
-        alpha_max, rgb_max = np.max(alpha), np.max(rgb)
+        rgb = arr[:, :, :3]
+        alpha = arr[:, :, 3]
+
+        alpha_max = np.max(alpha)
+        rgb_max = np.max(rgb)
 
         if alpha_max < 5 and rgb_max > 0:
-            arr[:, :, 3] = np.maximum.reduce(rgb, axis=2)
+            # Case 1: If alpha is nearly zero but color exists (common export error),
+            # use the color's brightness as the new alpha.
+            arr[:, :, 3] = np.max(rgb, axis=2)
+
         elif rgb_max == 0 and alpha_max > 0:
-            arr[:, :, 0] = arr[:, :, 1] = arr[:, :, 2] = alpha
+            # Case 2: If there's no color but alpha exists, copy the alpha channel to RGB
+            # for visualization purposes and set alpha to full.
+            arr[:, :, :3] = alpha[:, :, np.newaxis]
             arr[:, :, 3] = 255
         else:
+            # Case 3 (Hot Path): Perform "un-premultiply" alpha operation.
+            # This reverses the effect where RGB values have been multiplied by alpha.
             mask = alpha > 0
-            alpha_scaled = alpha[mask, np.newaxis] / 255.0
-            rgb[mask] /= alpha_scaled
-            arr[:, :, :3] = np.clip(rgb, 0, 255)
 
-        return Image.fromarray(arr.astype(np.uint8))
+            # Use uint16 for intermediate calculations to avoid overflow (faster than float).
+            rgb_calc = rgb.astype(np.uint16)
+
+            # Vectorized operation: (rgb * 255) / alpha.
+            # np.newaxis is crucial for correct broadcasting across the RGB channels.
+            alpha_channel = alpha[mask, np.newaxis]
+            rgb_calc[mask] = (rgb_calc[mask] * 255) // alpha_channel
+
+            # Clip values back to the 0-255 range and convert back to uint8.
+            arr[:, :, :3] = np.clip(rgb_calc, 0, 255).astype(np.uint8)
+
+        return Image.fromarray(arr)
