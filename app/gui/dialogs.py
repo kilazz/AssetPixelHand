@@ -104,6 +104,7 @@ class ModelConversionDialog(QDialog):
         hf_name: str,
         onnx_name: str,
         quant_mode: QuantizationMode,
+        model_info: dict,
         parent=None,
     ):
         super().__init__(parent)
@@ -111,7 +112,7 @@ class ModelConversionDialog(QDialog):
         self.setModal(True)
         self.setMinimumWidth(550)
         self._init_ui(model_key, quant_mode)
-        self.converter = ModelConverter(hf_name, onnx_name, quant_mode)
+        self.converter = ModelConverter(hf_name, onnx_name, quant_mode, model_info)
         self.converter.signals.finished.connect(self._on_finished)
         self.converter.signals.log.connect(self.log_message)
         QThreadPool.globalInstance().start(self.converter)

@@ -63,8 +63,10 @@ class PipelineManager(QObject):
 
     def run(self) -> tuple[bool, list[str]]:
         """Starts and runs the entire processing pipeline."""
-        device_name = "GPU" if self.config.device == "gpu" else "CPU"
-        app_logger.info(f"Starting {device_name} pipeline with {self.num_workers} pre-processing workers.")
+        log_msg = (
+            f"Starting pipeline: {self.num_workers} CPU workers for preprocessing, inference on {self.config.device}."
+        )
+        app_logger.info(log_msg)
 
         cache = CacheManager(self.config.folder_path, self.config.model_name, in_memory=self.config.lancedb_in_memory)
         all_skipped = []

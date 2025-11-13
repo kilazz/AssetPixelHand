@@ -290,7 +290,9 @@ class App(QMainWindow):
         model_key = self.options_panel.model_combo.currentText()
         model_info = self.options_panel.get_selected_model_info()
         quant_mode = self.performance_panel.get_selected_quantization()
-        dialog = ModelConversionDialog(model_key, model_info["hf_name"], model_info["onnx_name"], quant_mode, self)
+        dialog = ModelConversionDialog(
+            model_key, model_info["hf_name"], model_info["onnx_name"], quant_mode, model_info, self
+        )
         return bool(dialog.exec())
 
     def set_ui_scan_state(self, is_scanning: bool):

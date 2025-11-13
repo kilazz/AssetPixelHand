@@ -107,18 +107,26 @@ class ImageFingerprint:
         return NotImplemented
 
     def to_lancedb_dict(self) -> dict[str, Any]:
-        """Converts the object to a dictionary suitable for writing to LanceDB."""
+        """Converts the object to a dictionary suitable for writing to LanceDB,
+        with explicit type casting for robustness."""
         data = {
             "id": str(uuid.uuid5(uuid.NAMESPACE_URL, str(self.path))),
             "vector": self.hashes,
             "path": str(self.path),
-            "resolution_w": self.resolution[0],
-            "resolution_h": self.resolution[1],
+            "resolution_w": int(self.resolution[0]),
+            "resolution_h": int(self.resolution[1]),
+            "file_size": int(self.file_size),
+            "mtime": float(self.mtime),
+            "capture_date": float(self.capture_date) if self.capture_date is not None else None,
+            "format_str": str(self.format_str),
+            "compression_format": str(self.compression_format),
+            "format_details": str(self.format_details),
+            "has_alpha": bool(self.has_alpha),
+            "bit_depth": int(self.bit_depth),
+            "mipmap_count": int(self.mipmap_count),
+            "texture_type": str(self.texture_type),
+            "color_space": str(self.color_space) if self.color_space is not None else None,
         }
-        # Automatically add all other fields from our centralized definition
-        for field_name in FINGERPRINT_FIELDS:
-            if hasattr(self, field_name) and field_name not in data:
-                data[field_name] = getattr(self, field_name)
         return data
 
     @classmethod

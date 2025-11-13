@@ -113,6 +113,7 @@ def _get_default_models() -> dict:
             "dim": 512,
             "supports_text_search": True,
             "supports_image_search": True,
+            "use_dynamo": False,
         },
         "Compact (SigLIP-B)": {
             "hf_name": "google/siglip-base-patch16-384",
@@ -121,6 +122,7 @@ def _get_default_models() -> dict:
             "dim": 768,
             "supports_text_search": True,
             "supports_image_search": True,
+            "use_dynamo": False,
         },
         "Balanced (OpenCLIP-ViT-L/14)": {
             "hf_name": "laion/CLIP-ViT-L-14-laion2B-s32B-b82K",
@@ -129,6 +131,7 @@ def _get_default_models() -> dict:
             "dim": 768,
             "supports_text_search": True,
             "supports_image_search": True,
+            "use_dynamo": False,
         },
         "High Quality (SigLIP-L)": {
             "hf_name": "google/siglip-large-patch16-384",
@@ -137,6 +140,7 @@ def _get_default_models() -> dict:
             "dim": 1024,
             "supports_text_search": True,
             "supports_image_search": True,
+            "use_dynamo": False,
         },
         "Visual Structure (DINOv2-B)": {
             "hf_name": "facebook/dinov2-base",
@@ -145,6 +149,7 @@ def _get_default_models() -> dict:
             "dim": 768,
             "supports_text_search": False,
             "supports_image_search": True,
+            "use_dynamo": False,
         },
     }
 
@@ -159,7 +164,12 @@ def _load_models_config() -> dict:
         try:
             with open(CUSTOM_MODELS_CONFIG_FILE, encoding="utf-8") as f:
                 custom_models = json.load(f)
-            all_models.update(custom_models)
+            # This allows users to override any key, including 'use_dynamo'
+            for model_name, model_config in custom_models.items():
+                if model_name in all_models:
+                    all_models[model_name].update(model_config)
+                else:
+                    all_models[model_name] = model_config
             logging.getLogger("AssetPixelHand.constants").info(f"Loaded and merged {len(custom_models)} custom models.")
         except (json.JSONDecodeError, OSError) as e:
             logging.getLogger("AssetPixelHand.constants").error(

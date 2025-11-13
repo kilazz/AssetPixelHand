@@ -40,7 +40,7 @@ class ModelConverter(QRunnable):
         finished = Signal(bool, str)
         log = Signal(str, str)
 
-    def __init__(self, hf_model_name: str, onnx_name_base: str, quant_mode: QuantizationMode):
+    def __init__(self, hf_model_name: str, onnx_name_base: str, quant_mode: QuantizationMode, model_info: dict):
         super().__init__()
         self.setAutoDelete(True)
         self.hf_model_name = hf_model_name
@@ -48,6 +48,7 @@ class ModelConverter(QRunnable):
         self.quant_mode = quant_mode
         self.signals = self.Signals()
         self.adapter = get_model_adapter(self.hf_model_name)
+        self.model_info = model_info
 
     def run(self):
         import torch
@@ -83,7 +84,15 @@ class ModelConverter(QRunnable):
                 self.signals.log.emit("Converting model to FP16 precision...", "info")
                 model.half()
 
-            self._export_to_onnx(model, processor, target_dir, torch, Image)
+            # Read the 'use_dynamo' flag from the model's configuration.
+            use_dynamo = self.model_info.get("use_dynamo", False)
+            if use_dynamo:
+                self.signals.log.emit("Using modern Dynamo exporter for this model.", "info")
+                self._export_with_dynamo(model, processor, target_dir, torch, Image)
+            else:
+                self.signals.log.emit("Using stable legacy exporter for this model.", "info")
+                self._export_with_legacy(model, processor, target_dir, torch, Image)
+
             self.signals.finished.emit(True, "Model prepared successfully.")
 
         except Exception as e:
@@ -109,12 +118,47 @@ class ModelConverter(QRunnable):
         processor.save_pretrained(target_dir)
         return target_dir
 
-    def _export_to_onnx(self, model, processor, target_dir, torch: "torch", Image: "Image"):
-        opset_version = 23
-        vision_wrapper = self.adapter.get_vision_wrapper(model, torch)
+    def _export_with_dynamo(self, model, processor, target_dir, torch: "torch", Image: "Image"):
+        """Exports compatible models (like DINOv2) using the modern Dynamo backend."""
+        import torch._dynamo
+        from torch.export import Dim
 
-        self.signals.log.emit("Exporting vision model to ONNX...", "info")
-        visual_path = target_dir / "visual.onnx"
+        # This is the "expert mode" flag to bypass the ConstraintViolationError.
+        torch._dynamo.config.suppress_errors = True
+
+        # Opset 18 is known to be compatible with DINOv2 on DirectML.
+        opset_version = 18
+
+        self.signals.log.emit(f"Exporting vision model (opset {opset_version}) via Dynamo...", "info")
+
+        vision_wrapper = self.adapter.get_vision_wrapper(model, torch)
+        input_size = self.adapter.get_input_size(processor)
+        dummy_input = processor(images=Image.new("RGB", input_size), return_tensors="pt")
+
+        # TRICK: Trace with a batch of 2 to force Dynamo to handle dynamic batch sizes.
+        pixel_values = dummy_input["pixel_values"].repeat(2, 1, 1, 1)
+        if self.quant_mode == QuantizationMode.FP16:
+            pixel_values = pixel_values.half()
+
+        torch.onnx.export(
+            vision_wrapper,
+            (pixel_values,),  # Pass args as a tuple for Dynamo
+            str(target_dir / "visual.onnx"),
+            input_names=["pixel_values"],
+            output_names=["image_embeds"],
+            dynamic_shapes={"pixel_values": {0: Dim("batch_size", min=1)}},
+            opset_version=opset_version,
+        )
+        # Text model is not exported here as this path is only for vision-only models like DINOv2
+
+    def _export_with_legacy(self, model, processor, target_dir, torch: "torch", Image: "Image"):
+        """Exports models using the stable, TorchScript-based legacy exporter."""
+        # Opset 18 is the highest stable version for the legacy exporter.
+        opset_version = 18
+
+        self.signals.log.emit(f"Exporting vision model (opset {opset_version}) via legacy exporter...", "info")
+
+        vision_wrapper = self.adapter.get_vision_wrapper(model, torch)
         input_size = self.adapter.get_input_size(processor)
         dummy_input = processor(images=Image.new("RGB", input_size), return_tensors="pt")
         pixel_values = dummy_input["pixel_values"]
@@ -123,8 +167,8 @@ class ModelConverter(QRunnable):
 
         torch.onnx.export(
             vision_wrapper,
-            pixel_values,
-            str(visual_path),
+            pixel_values,  # Pass tensor directly for legacy
+            str(target_dir / "visual.onnx"),
             input_names=["pixel_values"],
             output_names=["image_embeds"],
             dynamic_axes={"pixel_values": {0: "batch_size"}, "image_embeds": {0: "batch_size"}},
@@ -133,12 +177,8 @@ class ModelConverter(QRunnable):
         )
 
         if self.adapter.has_text_model():
+            self.signals.log.emit(f"Exporting text model (opset {opset_version}) via legacy exporter...", "info")
             text_wrapper = self.adapter.get_text_wrapper(model, torch)
-            if text_wrapper is None:
-                return
-
-            self.signals.log.emit("Exporting text model to ONNX...", "info")
-            text_path = target_dir / "text.onnx"
             dummy_text_input = processor.tokenizer(
                 text=["a test query"],
                 return_tensors="pt",
@@ -168,7 +208,7 @@ class ModelConverter(QRunnable):
             torch.onnx.export(
                 text_wrapper,
                 onnx_inputs,
-                str(text_path),
+                str(target_dir / "text.onnx"),
                 input_names=input_names,
                 output_names=["text_embeds"],
                 dynamic_axes=dynamic_axes,
