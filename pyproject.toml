@@ -16,19 +16,20 @@ dependencies = [
     "PySide6>=6.10.0",
     "send2trash>=1.8.3",
     # AI & Machine Learning
-    "torch>=2.9.0",
+    "torch>=2.9.1",
     "transformers>=4.57.1",
     "sentencepiece>=0.2.1",
     "huggingface_hub[hf_xet]>=0.36.0", #transformers
     "onnx>=1.19.1",
+    "onnxscript>=0.5.6",
     # Databases
-    "lancedb>=0.25.2",
-    "duckdb>=1.4.1",
+    "lancedb>=0.25.3",
+    "duckdb>=1.4.2",
     # Data Handling & Utilities
     "numpy>=2.3.4",
     "scipy>=1.16.3",
     "pyarrow>=22.0.0",
-    "polars>=1.35.1",
+    "polars>=1.35.2",
     "xxhash>=3.6.0",
     "ImageHash>=4.3.2",
     "zstandard>=0.25.0",
@@ -52,6 +53,8 @@ dev = [
     "ruff",
     "snakeviz",
     "tabulate2",
+    "psutil",
+    "tqdm",
 ]
 
 [tool.ruff]

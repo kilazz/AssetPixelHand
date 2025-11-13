@@ -110,7 +110,7 @@ class ModelConverter(QRunnable):
         return target_dir
 
     def _export_to_onnx(self, model, processor, target_dir, torch: "torch", Image: "Image"):
-        opset_version = 18
+        opset_version = 23
         vision_wrapper = self.adapter.get_vision_wrapper(model, torch)
 
         self.signals.log.emit("Exporting vision model to ONNX...", "info")
