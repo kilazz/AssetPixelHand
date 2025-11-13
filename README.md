@@ -19,7 +19,7 @@
 *   **GUI**: PySide6
 *   **AI Core**: PyTorch, Transformers, ONNX Runtime
 *   **Databases**: LanceDB, DuckDB
-*   **Image Processing**: PyVips, OpenImageIO, Pillow
+*   **Image Processing**: PyVips, OpenImageIO, Pillow, DirectXTex
 
 ## Requirements
 *   Python 3.13 ~
