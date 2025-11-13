@@ -55,7 +55,7 @@ from app.constants import (
     UIConfig,
 )
 from app.data_models import AppSettings, FileOperation, ScanMode
-from app.image_io import TONE_MAPPER, set_active_tonemap_view
+from app.image_utils import TONE_MAPPER, set_active_tonemap_view
 from app.services.settings_manager import SettingsManager
 from app.view_models import ImageComparerState
 

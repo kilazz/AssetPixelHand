@@ -70,6 +70,7 @@ CACHE_VERSION = "v4"
 DB_TABLE_NAME = "images"
 FP16_MODEL_SUFFIX = "_fp16"
 BEST_FILE_METHOD_NAME = "Best"
+MAX_PIXEL_DIMENSION = 32767
 
 # --- Supported File Formats ---
 _main_supported_ext = [
@@ -179,23 +180,13 @@ SUPPORTED_MODELS = _load_models_config()
 # --- UI Configuration & Enums ---
 class UIConfig:
     class Colors:
-        SUCCESS = "#4CAF50"
-        WARNING = "#FF9800"
-        ERROR = "#F44336"
-        INFO = "#E0E0E0"
-        BEST_FILE_BG = "#2C3E50"
-        DIVIDER = "#F39C12"
-        HIGHLIGHT = "#4A90E2"
+        SUCCESS, WARNING, ERROR, INFO = "#4CAF50", "#FF9800", "#F44336", "#E0E0E0"
+        BEST_FILE_BG, DIVIDER, HIGHLIGHT = "#2C3E50", "#F39C12", "#4A90E2"
 
     class Sizes:
-        BROWSE_BUTTON_WIDTH = 35
-        MAX_VISUALS_ENTRY_WIDTH = 45
-        VISUALS_COLUMNS_SPINBOX_WIDTH = 40
-        SIMILARITY_LABEL_WIDTH = 40
-        ALPHA_LABEL_WIDTH = 30
-        CHANNEL_BUTTON_SIZE = 28
-        PREVIEW_MIN_SIZE = 100
-        PREVIEW_MAX_SIZE = 500
+        BROWSE_BUTTON_WIDTH, MAX_VISUALS_ENTRY_WIDTH, VISUALS_COLUMNS_SPINBOX_WIDTH = 35, 45, 40
+        SIMILARITY_LABEL_WIDTH, ALPHA_LABEL_WIDTH, CHANNEL_BUTTON_SIZE = 40, 30, 28
+        PREVIEW_MIN_SIZE, PREVIEW_MAX_SIZE = 100, 500
 
     class ResultsView:
         HEADERS: ClassVar[list[str]] = ["File", "Score", "Path", "Metadata"]
@@ -214,26 +205,17 @@ SIMILARITY_SEARCH_K_NEIGHBORS = 100
 
 
 class CompareMode(Enum):
-    SIDE_BY_SIDE = "Side-by-Side"
-    WIPE = "Wipe"
-    OVERLAY = "Overlay"
-    DIFF = "Difference"
+    SIDE_BY_SIDE, WIPE, OVERLAY, DIFF = "Side-by-Side", "Wipe", "Overlay", "Difference"
 
 
 class QuantizationMode(Enum):
-    FP32 = "FP32 (Max Accuracy)"
-    FP16 = "FP16 (Recommended)"
+    FP32, FP16 = "FP32 (Max Accuracy)", "FP16 (Recommended)"
 
 
 class TonemapMode(Enum):
-    NONE = "none"
-    ENABLED = "enabled"
+    NONE, ENABLED = "none", "enabled"
 
 
 # --- Data Model & UI Constants ---
-METHOD_DISPLAY_NAMES = {
-    "xxHash": "Exact Match",
-    "dHash": "Simple Match",
-    "pHash": "Near-Identical",
-}
+METHOD_DISPLAY_NAMES = {"xxHash": "Exact Match", "dHash": "Simple Match", "pHash": "Near-Identical"}
 NODE_TYPE_GROUP = "group"

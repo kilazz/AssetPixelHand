@@ -4,19 +4,23 @@
 // Provides Python bindings for the DirectXTex library.
 //
 // Key Features:
-// 1.  Centralized Header Analysis: A single `analyze_header` function now contains
-//     all heuristics for legacy Xbox, CryEngine, and malformed headers.
-// 2.  Improved Error Handling: A custom `DDSLoadError` exception provides more
-//     structured and informative error messages.
-// 3.  Namespace Grouping: Related utility functions are grouped into namespaces
-//     (XboxUtils, CryEngineUtils, NumpyUtils) for better readability.
-// 4.  Robust, size-based heuristics to correct malformed CryEngine headers.
-// 5.  Comprehensive NumPy conversion for a wide variety of pixel formats.
+// 1.  Robust "Try-Fallback" Loading: Attempts to load with DirectXTex, then falls
+//     back to a comprehensive manual parser for legacy/malformed headers.
+// 2.  Full Legacy Support: Includes pixel-level corrections for legacy Xbox 360
+//     (endian swapping) and CryEngine (unswizzling) formats.
+// 3.  Python-Native Error Handling: A custom `DDSLoadError` exception is registered
+//     and can be caught directly in Python.
+// 4.  Consolidated Code Structure: Legacy utilities are grouped into a single
+//     `LegacyUtils` namespace.
+// 5.  Full Texture Array Loading: Can load all slices of a cubemap or texture array
+//     into a single stacked NumPy array.
+// 6.  Comprehensive NumPy conversion for a wide variety of pixel formats.
 // =======================================================================================
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
+
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -80,9 +84,6 @@ constexpr uint32_t FOURCC_BC5S = MAKEFOURCC('B', 'C', '5', 'S');
 constexpr uint32_t FOURCC_CRYF = MAKEFOURCC('C', 'R', 'Y', 'F');
 constexpr uint32_t FOURCC_FYRC = MAKEFOURCC('F', 'Y', 'R', 'C');
 
-// HRESULT for COM mode change
-constexpr HRESULT CUSTOM_RPC_E_CHANGED_MODE = static_cast<HRESULT>(0x80010106);
-
 #pragma pack(push, 1)
 struct DDS_PIXELFORMAT {
     uint32_t dwSize, dwFlags, dwFourCC, dwRGBBitCount, dwRBitMask, dwGBitMask, dwBBitMask, dwABitMask;
@@ -108,7 +109,6 @@ std::string HResultToString(HRESULT hr);
 // Error Handling & COM Initialization
 // =======================================================================================
 
-// Converts a Windows HRESULT to a readable string.
 std::string HResultToString(HRESULT hr) {
     char* msg_buf = nullptr;
     DWORD result = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, hr, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), reinterpret_cast<LPSTR>(&msg_buf), 0, nullptr);
@@ -125,7 +125,6 @@ std::string HResultToString(HRESULT hr) {
     return msg;
 }
 
-// Custom exception for cleaner error propagation to Python.
 class DDSLoadError : public std::runtime_error {
 public:
     DDSLoadError(const std::string& message, HRESULT hr = S_OK)
@@ -135,19 +134,17 @@ private:
     HRESULT hresult_;
 };
 
-// Helper to throw our custom exception if an HRESULT is a failure code.
 inline void ThrowIfFailed(HRESULT hr, const std::string& message) {
     if (FAILED(hr)) {
         throw DDSLoadError(message, hr);
     }
 }
 
-// RAII wrapper for COM initialization/uninitialization.
 class CoInitializer {
 public:
     CoInitializer() {
         hr_ = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        if (hr_ == CUSTOM_RPC_E_CHANGED_MODE) hr_ = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        if (hr_ == RPC_E_CHANGED_MODE) hr_ = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         should_uninit_ = SUCCEEDED(hr_);
         if (hr_ == S_FALSE) { hr_ = S_OK; should_uninit_ = false; }
     }
@@ -160,9 +157,9 @@ private:
 };
 
 // =======================================================================================
-//  Xbox 360 Utilities Namespace
+//  Legacy Format Utilities Namespace (Xbox, CryEngine)
 // =======================================================================================
-namespace XboxUtils {
+namespace LegacyUtils {
     template<typename T>
     T SwapBytes(T value) {
         static_assert(std::is_integral<T>::value, "SwapBytes can only be used with integral types");
@@ -238,12 +235,7 @@ namespace XboxUtils {
             }
         }
     }
-} // namespace XboxUtils
 
-// =======================================================================================
-// CryEngine Utilities Namespace
-// =======================================================================================
-namespace CryEngineUtils {
     void UnswizzleBlockLinear(const uint8_t* src, uint8_t* dst, uint32_t width, uint32_t height, uint32_t blockBytes, size_t srcSize, size_t dstSize) {
         uint32_t blockWidth = (width + 3) / 4;
         uint32_t blockHeight = (height + 3) / 4;
@@ -274,7 +266,7 @@ namespace CryEngineUtils {
             }
         }
     }
-} // namespace CryEngineUtils
+} // namespace LegacyUtils
 
 // =======================================================================================
 // NumPy Conversion Utilities Namespace
@@ -521,7 +513,6 @@ namespace NumpyUtils {
 // Core Loading and Decoding Logic
 // =======================================================================================
 
-// Centralized structure to hold results of header analysis.
 struct AnalyzedHeaderInfo {
     DDS_HEADER header;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
@@ -531,7 +522,6 @@ struct AnalyzedHeaderInfo {
     bool is_xbox = false;
 };
 
-// Centralized function to analyze and correct DDS headers.
 AnalyzedHeaderInfo analyze_header(const uint8_t* dds_data_ptr, size_t dds_data_size) {
     if (dds_data_size < sizeof(DDS_HEADER) + 4) throw DDSLoadError("Input data too small for a DDS file");
     if (memcmp(dds_data_ptr, "DDS ", 4) != 0) throw DDSLoadError("Not a DDS file (missing 'DDS ' magic number)");
@@ -541,15 +531,13 @@ AnalyzedHeaderInfo analyze_header(const uint8_t* dds_data_ptr, size_t dds_data_s
     const uint8_t* file_end = dds_data_ptr + dds_data_size;
     if (info.header.dwSize != sizeof(DDS_HEADER)) throw DDSLoadError("Invalid DDS header size.");
 
-    info.is_xbox = XboxUtils::IsXbox360Format(info.header.ddspf.dwFourCC);
+    info.is_xbox = LegacyUtils::IsXbox360Format(info.header.ddspf.dwFourCC);
 
     const DDS_PIXELFORMAT& pf = info.header.ddspf;
     if (pf.dwSize != sizeof(DDS_PIXELFORMAT)) throw DDSLoadError("Invalid DDS_PIXELFORMAT size.");
 
-    // Determine initial format from FourCC
     if (pf.dwFlags & DDPF_FOURCC) {
-        uint32_t fourCC = info.is_xbox ? XboxUtils::Xbox360ToStandardFourCC(pf.dwFourCC) : pf.dwFourCC;
-
+        uint32_t fourCC = info.is_xbox ? LegacyUtils::Xbox360ToStandardFourCC(pf.dwFourCC) : pf.dwFourCC;
         switch (fourCC) {
             case FOURCC_DXT1: info.format = DXGI_FORMAT_BC1_UNORM; break;
             case FOURCC_DXT2: case FOURCC_DXT3: info.format = DXGI_FORMAT_BC2_UNORM; break;
@@ -558,7 +546,6 @@ AnalyzedHeaderInfo analyze_header(const uint8_t* dds_data_ptr, size_t dds_data_s
             case FOURCC_BC4S: info.format = DXGI_FORMAT_BC4_SNORM; break;
             case FOURCC_ATI2: case FOURCC_BC5U: info.format = DXGI_FORMAT_BC5_UNORM; break;
             case FOURCC_BC5S: info.format = DXGI_FORMAT_BC5_SNORM; break;
-
             case FOURCC_DX10: {
                 const auto* ext = reinterpret_cast<const DDS_HEADER_DXT10*>(&info.header + 1);
                 if (reinterpret_cast<const uint8_t*>(ext) + sizeof(DDS_HEADER_DXT10) > file_end) throw DDSLoadError("DX10 header is out of bounds.");
@@ -567,7 +554,6 @@ AnalyzedHeaderInfo analyze_header(const uint8_t* dds_data_ptr, size_t dds_data_s
             }
         }
     }
-    // Determine format from RGB bitmasks for uncompressed data
     else if (pf.dwFlags & DDPF_RGB) {
         switch (pf.dwRGBBitCount) {
             case 32:
@@ -584,21 +570,16 @@ AnalyzedHeaderInfo analyze_header(const uint8_t* dds_data_ptr, size_t dds_data_s
     else if ((pf.dwFlags & DDPF_LUMINANCE) && pf.dwRGBBitCount == 8) info.format = DXGI_FORMAT_R8_UNORM;
     else if ((pf.dwFlags & DDPF_ALPHAPIXELS) && pf.dwRGBBitCount == 8) info.format = DXGI_FORMAT_A8_UNORM;
 
-    // Calculate data offset, accounting for the DX10 header if present
     info.data_ptr = dds_data_ptr + 4 + sizeof(DDS_HEADER);
-    if (pf.dwFourCC == FOURCC_DX10 || (info.is_xbox && XboxUtils::Xbox360ToStandardFourCC(pf.dwFourCC) == FOURCC_DX10)) {
+    if (pf.dwFourCC == FOURCC_DX10 || (info.is_xbox && LegacyUtils::Xbox360ToStandardFourCC(pf.dwFourCC) == FOURCC_DX10)) {
         info.data_ptr += sizeof(DDS_HEADER_DXT10);
     }
 
-    // Check for CryEngine markers and apply heuristics
     if (info.data_ptr + 4 <= file_end) {
         const uint32_t* marker = reinterpret_cast<const uint32_t*>(info.data_ptr);
-        bool marker_found = (*marker == FOURCC_CRYF || *marker == FOURCC_FYRC);
-
-        if (marker_found) {
+        if (*marker == FOURCC_CRYF || *marker == FOURCC_FYRC) {
             info.is_swizzled = (*marker == FOURCC_CRYF);
             info.data_ptr += (*marker == FOURCC_CRYF) ? 8 : 4;
-
             if (pf.dwFlags & DDPF_RGB) {
                 const size_t actual_data_size = file_end - info.data_ptr;
                 size_t expected_size_dxt1 = std::max(1u, (info.header.dwWidth + 3) / 4) * std::max(1u, (info.header.dwHeight + 3) / 4) * 8;
@@ -608,15 +589,11 @@ AnalyzedHeaderInfo analyze_header(const uint8_t* dds_data_ptr, size_t dds_data_s
             }
         }
     }
-
     if (info.data_ptr >= file_end) throw DDSLoadError("Image data offset is out of bounds.");
     info.data_size = file_end - info.data_ptr;
-
     return info;
 }
 
-
-// Fallback loader using manual header analysis for legacy/broken files.
 std::unique_ptr<ScratchImage> load_with_fallback(const uint8_t* dds_data_ptr, size_t dds_data_size) {
     AnalyzedHeaderInfo info = analyze_header(dds_data_ptr, dds_data_size);
 
@@ -629,13 +606,13 @@ std::unique_ptr<ScratchImage> load_with_fallback(const uint8_t* dds_data_ptr, si
 
     if (info.is_swizzled) {
         size_t blockBytes = IsCompressed(info.format) ? ((info.format == DXGI_FORMAT_BC1_UNORM || info.format == DXGI_FORMAT_BC4_UNORM) ? 8 : 16) : ((4 * 4 * BitsPerPixel(info.format)) / 8);
-        CryEngineUtils::UnswizzleBlockLinear(info.data_ptr, mutable_pixel_data, info.header.dwWidth, info.header.dwHeight, blockBytes, info.data_size, slice_pitch);
+        LegacyUtils::UnswizzleBlockLinear(info.data_ptr, mutable_pixel_data, info.header.dwWidth, info.header.dwHeight, blockBytes, info.data_size, slice_pitch);
     } else {
         memcpy(mutable_pixel_data, info.data_ptr, slice_pitch);
     }
 
     if (info.is_xbox) {
-        XboxUtils::PerformXboxEndianSwap(mutable_pixel_data, slice_pitch, info.format);
+        LegacyUtils::PerformXboxEndianSwap(mutable_pixel_data, slice_pitch, info.format);
     }
 
     auto image = std::make_unique<ScratchImage>();
@@ -645,7 +622,6 @@ std::unique_ptr<ScratchImage> load_with_fallback(const uint8_t* dds_data_ptr, si
     return image;
 }
 
-// Main Python-exposed function to decode pixel data.
 py::dict decode_dds(const py::bytes& dds_bytes, size_t mip_level = 0, py::ssize_t array_index = -1, bool force_rgba8 = false) {
     py::buffer_info info(py::buffer(dds_bytes).request());
     const auto* dds_data_ptr = static_cast<const uint8_t*>(info.ptr);
@@ -753,20 +729,49 @@ py::dict decode_dds(const py::bytes& dds_bytes, size_t mip_level = 0, py::ssize_
     return result_dict;
 }
 
-// Main Python-exposed function to get metadata without decoding.
 py::dict get_dds_metadata(const py::bytes& dds_bytes) {
     py::buffer_info info(py::buffer(dds_bytes).request());
-    AnalyzedHeaderInfo header_info = analyze_header(static_cast<const uint8_t*>(info.ptr), info.size);
+    const auto* dds_data_ptr = static_cast<const uint8_t*>(info.ptr);
+    size_t dds_data_size = static_cast<size_t>(info.size);
 
+    py::gil_scoped_release gil_release;
+    CoInitializer com_init;
+    if (!com_init.IsValid()) {
+        throw DDSLoadError("COM initialization failed", com_init.GetResult());
+    }
+
+    TexMetadata metadata;
+    HRESULT hr = GetMetadataFromDDSMemory(dds_data_ptr, dds_data_size, DDS_FLAGS_NONE, metadata);
+
+    if (FAILED(hr)) {
+        try {
+            AnalyzedHeaderInfo header_info = analyze_header(dds_data_ptr, dds_data_size);
+            py::gil_scoped_acquire gil_acquire;
+            return py::dict(
+                py::arg("width") = header_info.header.dwWidth,
+                py::arg("height") = header_info.header.dwHeight,
+                py::arg("depth") = (header_info.header.dwFlags & DDSD_DEPTH) ? header_info.header.dwDepth : 1,
+                py::arg("format_str") = DXGIFormatToString(header_info.format),
+                py::arg("mip_levels") = (header_info.header.dwFlags & DDSD_MIPMAPCOUNT) ? header_info.header.dwMipMapCount : 1,
+                py::arg("array_size") = (header_info.header.dwCaps2 & DDSCAPS2_CUBEMAP) ? 6 : 1,
+                py::arg("is_cubemap") = (header_info.header.dwCaps2 & DDSCAPS2_CUBEMAP) != 0,
+                py::arg("is_3d") = (header_info.header.dwCaps2 & DDSCAPS2_VOLUME) != 0
+            );
+        } catch (const std::exception& e) {
+            throw DDSLoadError(std::string("DDS metadata parsing failed on all paths. Fallback error: ") + e.what());
+        }
+    }
+
+    py::gil_scoped_acquire gil_acquire;
     return py::dict(
-        py::arg("width") = header_info.header.dwWidth,
-        py::arg("height") = header_info.header.dwHeight,
-        py::arg("depth") = (header_info.header.dwFlags & DDSD_DEPTH) ? header_info.header.dwDepth : 1,
-        py::arg("format_str") = DXGIFormatToString(header_info.format),
-        py::arg("mip_levels") = (header_info.header.dwFlags & DDSD_MIPMAPCOUNT) ? header_info.header.dwMipMapCount : 1,
-        py::arg("array_size") = (header_info.header.dwCaps2 & DDSCAPS2_CUBEMAP) ? 6 : 1,
-        py::arg("is_cubemap") = (header_info.header.dwCaps2 & DDSCAPS2_CUBEMAP) != 0,
-        py::arg("is_3d") = (header_info.header.dwCaps2 & DDSCAPS2_VOLUME) != 0
+        py::arg("width") = metadata.width,
+        py::arg("height") = metadata.height,
+        py::arg("depth") = metadata.depth,
+        py::arg("format_str") = DXGIFormatToString(metadata.format),
+        py::arg("mip_levels") = metadata.mipLevels,
+        py::arg("array_size") = metadata.arraySize,
+        py::arg("is_cubemap") = metadata.IsCubemap(),
+        py::arg("is_3d") = (metadata.dimension == TEX_DIMENSION_TEXTURE3D)
     );
 }
 
@@ -888,18 +893,21 @@ std::string DXGIFormatToString(DXGI_FORMAT format) {
 // Python Module Definition
 // =======================================================================================
 PYBIND11_MODULE(directxtex_decoder, m) {
-    m.doc() = "High-performance DDS decoder with fixes for legacy CryEngine and Xbox 360 files.";
+    m.doc() = "High-performance DDS decoder with robust fallback for legacy CryEngine and Xbox 360 files.";
 
     m.def("decode_dds", &decode_dds,
-          "Decodes a DDS file from bytes, using a manual fallback for legacy/malformed formats.",
+          "Decodes a DDS file from bytes. Falls back to a manual parser for malformed files.",
           py::arg("dds_bytes"),
           py::arg("mip_level") = 0,
-          py::arg("array_index") = -1,
+          py::arg("array_index") = -1, // -1 means load all array slices
           py::arg("force_rgba8") = false);
 
     m.def("get_dds_metadata", &get_dds_metadata,
-          "Extracts DDS metadata without decoding pixel data, using a fallback for legacy/malformed formats.",
+          "Extracts DDS metadata without decoding pixel data. Uses a fallback for malformed files.",
           py::arg("dds_bytes"));
 
-    m.attr("__version__") = "23.1.0";
+    // Register the custom exception to be catchable in Python
+    py::register_exception<DDSLoadError>(m, "DDSLoadError");
+
+    m.attr("__version__") = "24.0.0";
 }
