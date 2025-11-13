@@ -5,9 +5,10 @@ This follows a Chain of Responsibility or Pipeline pattern, where each stage
 processes data and passes a context object to the next stage.
 """
 
-import importlib.util
 import logging
 import multiprocessing
+import shutil
+import tempfile
 import threading
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
@@ -17,7 +18,9 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import numpy as np
+import polars as pl  # Import polars
 
+from app.constants import LANCEDB_AVAILABLE
 from app.data_models import ImageFingerprint, ScanConfig, ScanState
 from app.services.signal_bus import SignalBus
 from app.utils import find_best_in_group
@@ -27,7 +30,9 @@ from .hashing_worker import worker_collect_all_data
 from .helpers import FileFinder
 from .pipeline import PipelineManager
 
-IMAGEHASH_AVAILABLE = bool(importlib.util.find_spec("imagehash"))
+if LANCEDB_AVAILABLE:
+    import lancedb
+
 try:
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import connected_components
@@ -160,21 +165,6 @@ class PrecisionCluster:
 
 
 class PrecisionClusterManager:
-    """
-    Manages the creation and merging of duplicate groups (clusters) based on evidence.
-
-    This class builds a graph of relationships between files. Each connection ("evidence")
-    has a type (xxHash, pHash, AI) and a confidence score. The manager ensures that
-    files are grouped logically, even through indirect connections (A is similar to B,
-    and B is similar to C, so A, B, C are in one group).
-
-    Key features:
-    - Evidence Priority: More reliable methods (like exact hash) override less reliable ones.
-    - Cluster Merging: Small, related clusters are merged to form a complete group.
-    - Size Limiting: Prevents clusters from growing infinitely large, which could occur
-      with low AI similarity thresholds and degrade performance and relevance.
-    """
-
     __slots__ = ("clusters", "max_cluster_size", "next_cluster_id", "path_to_cluster")
 
     def __init__(self, max_cluster_size: int = MAX_CLUSTER_SIZE):
@@ -184,7 +174,6 @@ class PrecisionClusterManager:
         self.max_cluster_size = max_cluster_size
 
     def add_evidence(self, path1: Path, path2: Path, method: str, confidence: float):
-        """Adds a piece of evidence connecting two files, creating or merging clusters as needed."""
         cluster1_id = self.path_to_cluster.get(path1)
         cluster2_id = self.path_to_cluster.get(path2)
         if cluster1_id is None and cluster2_id is None:
@@ -199,7 +188,6 @@ class PrecisionClusterManager:
             self.clusters[cluster1_id].add_direct_evidence(path1, path2, method, confidence)
 
     def _create_new_cluster_with_evidence(self, path1: Path, path2: Path, method: str, confidence: float):
-        """Creates a new cluster for two previously unseen files."""
         new_id = self.next_cluster_id
         self.clusters[new_id] = PrecisionCluster(new_id)
         self.clusters[new_id].add_direct_evidence(path1, path2, method, confidence)
@@ -208,13 +196,11 @@ class PrecisionClusterManager:
         self.next_cluster_id += 1
 
     def _add_to_existing_cluster(self, cluster_id: int, path1: Path, path2: Path, method: str, confidence: float):
-        """Adds a new file to an existing cluster."""
         self.clusters[cluster_id].add_direct_evidence(path1, path2, method, confidence)
         new_path = path2 if path1 in self.path_to_cluster else path1
         self.path_to_cluster[new_path] = cluster_id
 
     def _merge_or_link_clusters(self, id1: int, id2: int, path1: Path, path2: Path, method: str, confidence: float):
-        """Decides whether to merge two clusters or simply link them based on size."""
         if self._should_merge(id1, id2):
             final_id = self._merge_clusters(id1, id2)
             self.clusters[final_id].add_direct_evidence(path1, path2, method, confidence)
@@ -225,16 +211,9 @@ class PrecisionClusterManager:
             self.clusters[larger_id].add_direct_evidence(path1, path2, method, confidence)
 
     def _should_merge(self, id1: int, id2: int) -> bool:
-        """Determines if two clusters are small enough to be merged."""
         return (len(self.clusters[id1].members) + len(self.clusters[id2].members)) <= self.max_cluster_size
 
     def _merge_clusters(self, id1: int, id2: int) -> int:
-        """
-        Merges the smaller cluster into the larger one.
-
-        This is a critical optimization to keep the cluster management efficient.
-        It updates the internal data structures of the larger cluster and removes the smaller one.
-        """
         if len(self.clusters[id1].members) < len(self.clusters[id2].members):
             id1, id2 = id2, id1
         cluster1, cluster2 = self.clusters[id1], self.clusters[id2]
@@ -248,7 +227,6 @@ class PrecisionClusterManager:
         return id1
 
     def get_final_groups(self, all_fingerprints: dict[Path, ImageFingerprint]) -> dict:
-        """Converts the final clusters into a dictionary of {best_file: [duplicates]}."""
         final_groups: dict = {}
         for cluster in self.clusters.values():
             if len(cluster.members) < 2:
@@ -265,7 +243,6 @@ class PrecisionClusterManager:
     def _find_duplicates_in_cluster(
         self, cluster: PrecisionCluster, best_fp: ImageFingerprint, fingerprints: list[ImageFingerprint]
     ) -> set[tuple[ImageFingerprint, int, str]]:
-        """Finds the relationship between the best file and all others in the cluster."""
         duplicates: set[tuple[ImageFingerprint, int, str]] = set()
         for fp in fingerprints:
             if fp.path == best_fp.path:
@@ -422,23 +399,61 @@ class PerceptualGroupingStage(ScanStage):
     def _find_phash_components(
         self, paths: tuple[Path, ...], hashes: tuple[Any, ...], threshold: int
     ) -> dict[int, list[Path]]:
-        if not SCIPY_AVAILABLE or not IMAGEHASH_AVAILABLE:
-            return {i: [p] for i, p in enumerate(paths)}
-        rows, cols = [], []
+        """
+        Finds groups of similar pHashes using a high-performance LanceDB index.
+        """
         n = len(paths)
-        for i in range(n):
-            for j in range(i + 1, n):
-                if hashes[i] - hashes[j] <= threshold:
-                    rows.append(i)
-                    cols.append(j)
-        if not rows:
+        if not hashes or n < 2:
             return {i: [p] for i, p in enumerate(paths)}
-        graph = csr_matrix((np.ones_like(rows), (rows, cols)), (n, n))
-        _, labels = connected_components(graph, directed=False, return_labels=True)
-        components = defaultdict(list)
-        for i, label in enumerate(labels):
-            components[label].append(paths[i])
-        return components
+
+        if not LANCEDB_AVAILABLE:
+            app_logger.warning("LanceDB not available, skipping perceptual hash indexing.")
+            return {i: [p] for i, p in enumerate(paths)}
+
+        temp_db_path = None
+        try:
+            temp_db_path = tempfile.mkdtemp()
+
+            powers_of_2 = 2 ** np.arange(64, dtype=np.uint64)
+            uint64_hashes = [np.sum(h.hash.flatten().astype(np.uint64) * powers_of_2) for h in hashes]
+            hash_array = np.array(uint64_hashes, dtype=np.uint64)
+
+            unpacked_bits = (hash_array[:, np.newaxis] >> np.arange(64, dtype=np.uint8)) & 1
+            vectors = unpacked_bits.astype("float32")
+            data = [{"vector": v, "id": i} for i, v in enumerate(vectors)]
+
+            db = lancedb.connect(temp_db_path)
+            tbl = db.create_table("phashes", data=data)
+
+            rows, cols = [], []
+            radius = np.sqrt(threshold) + 0.001
+            limit = 250
+
+            for i in range(n):
+                query_vector = vectors[i]
+                # Use .to_polars() instead of .to_df()
+                results = tbl.search(query_vector).metric("L2").limit(limit).to_polars()
+                # Use polars filtering syntax
+                neighbors = results.filter(pl.col("_distance") <= radius)
+
+                for neighbor_id in neighbors["id"]:
+                    if i < neighbor_id:
+                        rows.append(i)
+                        cols.append(neighbor_id)
+
+            if not rows:
+                return {i: [Path(p)] for i, p in enumerate(paths)}
+
+            graph = csr_matrix((np.ones_like(rows), (rows, cols)), (n, n))
+            _, labels = connected_components(graph, directed=False, return_labels=True)
+            components = defaultdict(list)
+            for i, label in enumerate(labels):
+                components[label].append(paths[i])
+            return components
+
+        finally:
+            if temp_db_path and Path(temp_db_path).exists():
+                shutil.rmtree(temp_db_path, ignore_errors=True)
 
     def _process_phash_components(self, components: dict[int, list[Path]], context: ScanContext) -> list[Path]:
         final_representatives = []
@@ -448,7 +463,6 @@ class PerceptualGroupingStage(ScanStage):
             if not group:
                 continue
 
-            # Add all paths from this component to the processed set
             processed_paths.update(group)
 
             if len(group) > 1:
@@ -465,7 +479,6 @@ class PerceptualGroupingStage(ScanStage):
             elif group:
                 final_representatives.append(group[0])
 
-        # Add any remaining representatives that were not part of any pHash component
         for path in context.files_to_process:
             if path not in processed_paths:
                 final_representatives.append(path)
