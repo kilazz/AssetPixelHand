@@ -156,6 +156,7 @@ class CacheManager:
     def put_many(self, fingerprints: list[ImageFingerprint]):
         if not self.conn or not fingerprints:
             return
+
         data_to_insert: list[tuple[Any, ...]] = [
             (
                 str(fp.path),
@@ -173,32 +174,58 @@ class CacheManager:
             for fp in fingerprints
             if fp
         ]
+
+        if not data_to_insert:
+            return
+
         try:
-            update_setters = [
-                "mtime = excluded.mtime",
-                "size = excluded.size",
-                "hashes = excluded.hashes",
-                "resolution_w = excluded.resolution_w",
-                "resolution_h = excluded.resolution_h",
-                "capture_date = excluded.capture_date",
-                "format_str = excluded.format_str",
-                "format_details = excluded.format_details",
-                "has_alpha = excluded.has_alpha",
-                "bit_depth = excluded.bit_depth",
-            ]
-            sql = (
-                "INSERT INTO fingerprints (path, mtime, size, hashes, resolution_w, resolution_h, "
-                "capture_date, format_str, format_details, has_alpha, bit_depth) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                f"ON CONFLICT(path) DO UPDATE SET {', '.join(update_setters)}"
-            )
+            # Begin transaction
             self.conn.begin()
-            self.conn.executemany(sql, data_to_insert)
+
+            # 1. Create a temporary table and bulk insert all new data into it
+            self.conn.execute("CREATE OR REPLACE TEMP TABLE fingerprints_upsert AS SELECT * FROM fingerprints LIMIT 0")
+            self.conn.executemany(
+                "INSERT INTO fingerprints_upsert VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", data_to_insert
+            )
+
+            # 2. In one query, update all existing records in the main table
+            self.conn.execute("""
+                UPDATE fingerprints
+                SET
+                    mtime = u.mtime,
+                    size = u.size,
+                    hashes = u.hashes,
+                    resolution_w = u.resolution_w,
+                    resolution_h = u.resolution_h,
+                    capture_date = u.capture_date,
+                    format_str = u.format_str,
+                    format_details = u.format_details,
+                    has_alpha = u.has_alpha,
+                    bit_depth = u.bit_depth
+                FROM fingerprints_upsert AS u
+                WHERE fingerprints.path = u.path;
+            """)
+
+            # 3. In one query, insert only the records that are not yet in the main table
+            self.conn.execute("""
+                INSERT INTO fingerprints
+                SELECT u.*
+                FROM fingerprints_upsert AS u
+                LEFT JOIN fingerprints AS f ON u.path = f.path
+                WHERE f.path IS NULL;
+            """)
+
+            # Commit transaction
             self.conn.commit()
+
         except duckdb.Error as e:
             app_logger.warning(f"File cache 'put_many' transaction failed: {e}")
             if self.conn:
                 self.conn.rollback()
+        finally:
+            # 4. Clean up the temporary table
+            if self.conn:
+                self.conn.execute("DROP TABLE IF EXISTS fingerprints_upsert")
 
     def close(self):
         if not self.conn:

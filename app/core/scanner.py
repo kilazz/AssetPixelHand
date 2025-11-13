@@ -12,6 +12,7 @@ import time
 import pyarrow as pa
 from PySide6.QtCore import QObject, QThread, Slot
 
+from app.cache import setup_caches, teardown_caches
 from app.constants import CACHE_DIR, DB_TABLE_NAME, DUCKDB_AVAILABLE, LANCEDB_AVAILABLE
 from app.core.strategies import FindDuplicatesStrategy, SearchStrategy
 from app.data_models import FINGERPRINT_FIELDS, ScanConfig, ScanMode, ScanState
@@ -38,8 +39,6 @@ class ScannerCore(QObject):
 
     def run(self, stop_event: threading.Event):
         """Main entry point for the scanner logic, executed in a separate thread."""
-        from app.cache import setup_caches, teardown_caches
-
         self.scan_has_finished = False
         start_time = time.time()
         self.all_skipped_files.clear()

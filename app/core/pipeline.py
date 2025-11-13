@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pyarrow as pa
 from PySide6.QtCore import QObject
+from transformers import AutoProcessor
 
 from app.cache import CacheManager
 from app.constants import DB_WRITE_BATCH_SIZE, FP16_MODEL_SUFFIX, LANCEDB_AVAILABLE, MODELS_DIR
@@ -91,8 +92,6 @@ class PipelineManager(QObject):
 
     def _get_model_and_buffer_config(self) -> tuple[tuple[int, int], tuple, Any]:
         """Determines model input size and required buffer configuration."""
-        from transformers import AutoProcessor
-
         try:
             proc = AutoProcessor.from_pretrained(MODELS_DIR / self.config.model_name)
             image_proc = getattr(proc, "image_processor", proc)

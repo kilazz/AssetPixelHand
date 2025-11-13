@@ -9,7 +9,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import send2trash
-from PySide6.QtCore import QModelIndex, QObject, QRunnable, Signal
+from PIL import Image
+from PIL.ImageQt import ImageQt
+from PySide6.QtCore import (
+    Q_ARG,
+    QMetaObject,
+    QModelIndex,
+    QObject,
+    QRunnable,
+    Qt,
+    Signal,
+)
+from PySide6.QtGui import QImage
 
 from app.cache import get_thumbnail_cache_key, thumbnail_cache
 from app.constants import (
@@ -28,7 +39,6 @@ if DUCKDB_AVAILABLE:
 
 if TYPE_CHECKING:
     import torch
-    from PIL import Image
 
 app_logger = logging.getLogger("AssetPixelHand.gui.tasks")
 
@@ -248,11 +258,6 @@ class ImageLoader(QRunnable):
         return self._is_cancelled
 
     def run(self):
-        from PIL import Image
-        from PIL.ImageQt import ImageQt
-        from PySide6.QtCore import Q_ARG, QMetaObject, Qt
-        from PySide6.QtGui import QImage
-
         try:
             if self.is_cancelled:
                 return
