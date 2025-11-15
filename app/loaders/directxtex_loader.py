@@ -123,33 +123,42 @@ class DirectXTexLoader(BaseLoader):
 
     def _handle_alpha_logic(self, pil_image: Image.Image) -> Image.Image:
         """
-        Optimized alpha handling for premultiplied alpha using Numba.
+        Optimized alpha handling for premultiplied alpha and other edge cases.
         """
         if pil_image.mode != "RGBA":
             return pil_image
 
         arr = np.array(pil_image)
 
-        # Edge case handling remains on NumPy as it's not the "hot path"
-        # and runs infrequently. Numba wouldn't provide much benefit here.
         rgb = arr[:, :, :3]
         alpha = arr[:, :, 3]
 
         alpha_max = np.max(alpha)
         rgb_max = np.max(rgb)
 
+        # Case 1: Handle common export errors where alpha is near-zero but color exists.
         if alpha_max < 5 and rgb_max > 0:
+            # Use the color's brightness as the new alpha channel.
             arr[:, :, 3] = np.max(rgb, axis=2)
             return Image.fromarray(arr)
 
+        # Case 2: Handle images where RGB is black, but alpha contains information.
         if rgb_max == 0 and alpha_max > 0:
-            arr[:, :, :3] = alpha[:, :, np.newaxis]
-            arr[:, :, 3] = 255
+            # Check if the alpha channel has any contrast (i.e., is not a solid color).
+            alpha_min = np.min(alpha)
+            if alpha_max != alpha_min:
+                # If the alpha channel has contrast, it's likely a grayscale mask.
+                # Copy it to RGB for visualization purposes.
+                arr[:, :, :3] = alpha[:, :, np.newaxis]
+                arr[:, :, 3] = 255
+
+            # If the alpha channel is a solid color (like a black, opaque image),
+            # this block is skipped, preserving the original black RGB values.
+            # This correctly handles the user-reported issue.
             return Image.fromarray(arr)
 
-        # Hot Path: Call the fast, JIT-compiled function.
-        # The first run of this function will be slightly slower due to compilation.
-        # All subsequent calls will execute at maximum speed.
+        # Case 3 (Hot Path): Call the fast, JIT-compiled function for unpremultiplying alpha.
+        # This reverses the effect where RGB values have been multiplied by alpha.
         processed_arr = _unpremultiply_alpha_numba(arr)
 
         return Image.fromarray(processed_arr)
