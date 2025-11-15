@@ -4,6 +4,7 @@ This file is kept separate from worker.py to ensure that processes
 spawned for these tasks do not load heavy AI libraries (torch, onnxruntime, etc.).
 """
 
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -22,51 +23,82 @@ except ImportError:
     IMAGEHASH_AVAILABLE = False
 
 
-def worker_collect_all_data(path: Path) -> dict[str, Any] | None:
+def worker_calculate_hashes_and_meta(path: Path) -> dict[str, Any] | None:
     """
-    A "super-worker" that collects all hashes and metadata for a file.
-    It may read the file twice in the worst case (once for xxhash, once for image loading)
-    but does so in a single worker pass to simplify the main pipeline and improve stability.
+    A lightweight worker that collects basic file metadata and a full-file xxHash.
+
+    This function is designed to be fast. It avoids loading or decoding the image data,
+    only reading the raw bytes for hashing.
+
+    Args:
+        path: The path to the image file.
+
+    Returns:
+        A dictionary containing the path, metadata, and xxHash, or None on failure.
     """
     try:
         # 1. Get basic metadata from stat, which is fast and handles file-not-found.
-        initial_meta = get_image_metadata(path)
-        if not initial_meta:
+        meta = get_image_metadata(path)
+        if not meta:
             return None
 
-        # 2. Calculate xxHash by reading the file bytes.
+        # 2. Calculate xxHash by reading the file bytes in chunks.
         hasher = xxhash.xxh64()
         with open(path, "rb") as f:
-            while chunk := f.read(4 * 1024 * 1024):
+            while chunk := f.read(4 * 1024 * 1024):  # Read in 4MB chunks
                 hasher.update(chunk)
         xxh = hasher.hexdigest()
 
-        dhash, phash = None, None
+        return {
+            "path": path,
+            "meta": meta,
+            "xxhash": xxh,
+        }
+    except OSError:
+        # File could have been deleted between finding and processing.
+        return None
+    except Exception as e:
+        # Log unexpected crashes within the worker for better debugging.
+        print(f"!!! XXHASH WORKER CRASH on {path.name}: {e}")
+        traceback.print_exc()
+        return None
 
-        # 3. Load the image reliably from the path to calculate perceptual hashes.
-        # This is a trade-off for stability over the "read-once" memory buffer approach.
+
+def worker_calculate_perceptual_hashes(path: Path) -> dict[str, Any] | None:
+    """
+    A medium-weight worker that loads an image to calculate its perceptual hashes (dHash, pHash).
+
+    This is more expensive than the xxHash worker because it requires decoding the image.
+
+    Args:
+        path: The path to the image file.
+
+    Returns:
+        A dictionary containing the path, dHash, pHash, and any precise metadata
+        gleaned from loading the image, or None on failure.
+    """
+    try:
         pil_img = load_image(path)
 
         if pil_img and IMAGEHASH_AVAILABLE:
             dhash = imagehash.dhash(pil_img)
             phash = imagehash.phash(pil_img)
-            # Update metadata with precise info from the loaded image if it differs
-            initial_meta["resolution"] = pil_img.size
-            initial_meta["format_details"] = f"{pil_img.mode}"
-            initial_meta["has_alpha"] = "A" in pil_img.getbands()
 
-        return {
-            "path": path,
-            "meta": initial_meta,
-            "xxhash": xxh,
-            "dhash": dhash,
-            "phash": phash,
-        }
-    except OSError:
+            # Get more precise metadata from the loaded image if it differs from stat.
+            precise_meta = {
+                "resolution": pil_img.size,
+                "format_details": f"{pil_img.mode}",
+                "has_alpha": "A" in pil_img.getbands(),
+            }
+
+            return {
+                "path": path,
+                "dhash": dhash,
+                "phash": phash,
+                "precise_meta": precise_meta,
+            }
         return None
     except Exception as e:
-        import traceback
-
-        print(f"!!! WORKER CRASH on {path.name}: {e}")
+        print(f"!!! PERCEPTUAL HASH WORKER CRASH on {path.name}: {e}")
         traceback.print_exc()
         return None

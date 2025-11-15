@@ -24,8 +24,7 @@ from app.constants import (
     FP16_MODEL_SUFFIX,
     MODELS_DIR,
 )
-from app.data_models import ImageFingerprint
-from app.image_io import get_image_metadata, load_image
+from app.image_io import load_image
 
 if TYPE_CHECKING:
     from app.data_models import ScanConfig
@@ -158,54 +157,42 @@ def init_preprocessor_worker(config: dict, queue: "multiprocessing.Queue"):
         _log_worker_crash(e, "init_preprocessor_worker")
 
 
-def _process_batch_from_paths(
+def _process_batch_from_paths_for_ai(
     paths: list[Path], input_size
-) -> tuple[list[Image.Image], list[ImageFingerprint], list[tuple[str, str]]]:
-    """
-    Loads images and metadata for a batch of paths using the centralized `load_image` function.
-    """
-    images, fingerprints, skipped_tuples = [], [], []
-
+) -> tuple[list[Image.Image], list[Path], list[tuple[str, str]]]:
+    """Loads and preprocesses images specifically for AI inference."""
+    images, successful_paths, skipped_tuples = [], [], []
     for path in paths:
         try:
-            metadata = get_image_metadata(path)
-            if not metadata or not metadata.get("resolution") or metadata["resolution"][0] == 0:
-                skipped_tuples.append((str(path), "Metadata extraction failed"))
-                continue
-
             pil_image = load_image(path)
-
             if pil_image:
+                # Resize to the model's expected input size
                 pil_image.thumbnail(input_size, Image.Resampling.LANCZOS)
+                # Ensure image is in RGB format for the model
                 processed_image = pil_image.convert("RGB") if pil_image.mode != "RGB" else pil_image
                 images.append(processed_image)
-                fingerprints.append(ImageFingerprint(path=path, hashes=np.array([]), **metadata))
+                successful_paths.append(path)
             else:
                 skipped_tuples.append((str(path), "Image loading failed"))
-
         except Exception as e:
-            app_logger.error(f"Error processing {path.name} in batch", exc_info=True)
+            app_logger.error(f"Error processing {path.name} in AI batch", exc_info=True)
             skipped_tuples.append((str(path), f"{type(e).__name__}: {str(e).splitlines()[0]}"))
+    return images, successful_paths, skipped_tuples
 
-    return images, fingerprints, skipped_tuples
 
-
-def worker_wrapper_from_paths_cpu_shared_mem(
+def worker_preprocess_for_ai(
     paths: list[Path], input_size: tuple[int, int], buffer_shape, dtype, config: "ScanConfig"
 ) -> tuple:
-    """CPU worker function that preprocesses images and puts the resulting tensor into shared memory."""
+    """CPU worker that loads, preprocesses images, and places the tensor into shared memory."""
     global g_free_buffers_q, g_preprocessor
     if g_free_buffers_q is None or g_preprocessor is None:
         raise RuntimeError("Preprocessor worker not initialized correctly.")
     try:
-        images, fps, skipped_tuples = _process_batch_from_paths(paths, input_size)
+        images, successful_paths, skipped_tuples = _process_batch_from_paths_for_ai(paths, input_size)
         if not images:
             return None, [], skipped_tuples
 
-        # If compare_by_luminance is enabled, convert images to grayscale before processing.
         if config.compare_by_luminance:
-            # Convert to 'L' (luminance), then back to 'RGB' to create a 3-channel
-            # grayscale image that the AI model expects.
             images = [img.convert("L").convert("RGB") for img in images]
 
         pixel_values = g_preprocessor(images=images, return_tensors="np").pixel_values
@@ -216,11 +203,18 @@ def worker_wrapper_from_paths_cpu_shared_mem(
         current_batch_size = pixel_values.shape[0]
         shared_array[:current_batch_size] = pixel_values.astype(dtype)
 
-        meta_message = {"shm_name": shm_name, "shape": (current_batch_size, *buffer_shape[1:]), "dtype": dtype}
+        # The meta message now includes the list of paths for the inference worker
+        meta_message = {
+            "shm_name": shm_name,
+            "shape": (current_batch_size, *buffer_shape[1:]),
+            "dtype": dtype,
+            "paths": [str(p) for p in successful_paths],
+        }
         existing_shm.close()
-        return meta_message, fps, skipped_tuples
+        # The second element (fingerprints) is no longer created here
+        return meta_message, [], skipped_tuples
     except Exception as e:
-        _log_worker_crash(e, "worker_wrapper_from_paths_cpu_shared_mem")
+        _log_worker_crash(e, "worker_preprocess_for_ai")
         return None, [], [(str(p), f"Batch failed: {type(e).__name__}") for p in paths]
 
 
@@ -239,14 +233,19 @@ def inference_worker_loop(config: dict, tensor_q, results_q, free_buffers_q):
             except Empty:
                 continue
 
-            if item is None:  # Sentinel value indicates end of processing
+            if item is None:
                 results_q.put(None)
                 break
 
-            meta_message, fps, skipped_tuples = item
-            pixel_values = None
+            meta_message, _, skipped_tuples = item
+            pixel_values, paths = None, []
             if meta_message:
-                shm_name, shape, dtype = meta_message["shm_name"], meta_message["shape"], meta_message["dtype"]
+                shm_name, shape, dtype, paths = (
+                    meta_message["shm_name"],
+                    meta_message["shape"],
+                    meta_message["dtype"],
+                    meta_message["paths"],
+                )
                 existing_shm = shared_memory.SharedMemory(name=shm_name)
                 shared_array = np.ndarray(shape, dtype=dtype, buffer=existing_shm.buf)
                 pixel_values = np.copy(shared_array)
@@ -261,17 +260,18 @@ def inference_worker_loop(config: dict, tensor_q, results_q, free_buffers_q):
 
                 if embeddings is None or embeddings.size == 0:
                     app_logger.error("Inference worker: model returned empty output")
-                    for fp in fps:
-                        skipped_tuples.append((str(fp.path), "Inference returned empty"))
-                    results_q.put(([], skipped_tuples))
+                    for p in paths:
+                        skipped_tuples.append((p, "Inference returned empty"))
+                    results_q.put(({}, skipped_tuples))
                     continue
 
                 embeddings = normalize_vectors_numpy(embeddings)
-                for i, data in enumerate(fps):
-                    data.hashes = embeddings[i].flatten()
-                results_q.put((fps, skipped_tuples))
-            elif fps or skipped_tuples:
-                results_q.put(([], skipped_tuples))
+
+                # Return a dictionary mapping the path string to its calculated vector
+                batch_results = {path: vec for path, vec in zip(paths, embeddings, strict=False)}
+                results_q.put((batch_results, skipped_tuples))
+            elif skipped_tuples:
+                results_q.put(({}, skipped_tuples))
     except Exception as e:
         _log_worker_crash(e, "inference_worker_loop")
         results_q.put(None)
@@ -292,7 +292,7 @@ def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
     if g_inference_engine is None:
         return None
     try:
-        images, _, skipped = _process_batch_from_paths([image_path], g_inference_engine.input_size)
+        images, _, skipped = _process_batch_from_paths_for_ai([image_path], g_inference_engine.input_size)
         if skipped:
             app_logger.warning(f"Failed to process single vector for {image_path}: {skipped[0][1]}")
             return None

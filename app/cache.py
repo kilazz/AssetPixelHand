@@ -1,7 +1,5 @@
 # app/cache.py
-"""Manages file and fingerprint caching to avoid reprocessing unchanged files.
-Also manages the persistent thumbnail cache.
-"""
+"""Manages file and fingerprint caching to avoid reprocessing unchanged files."""
 
 import abc
 import hashlib
@@ -17,6 +15,16 @@ from app.data_models import ImageFingerprint
 
 if DUCKDB_AVAILABLE:
     import duckdb
+
+# This import is now needed for converting perceptual hashes
+try:
+    import imagehash
+
+    IMAGEHASH_AVAILABLE = True
+except ImportError:
+    imagehash = None
+    IMAGEHASH_AVAILABLE = False
+
 
 if TYPE_CHECKING:
     from app.data_models import ScanConfig
@@ -90,7 +98,10 @@ class CacheManager:
                         format_str VARCHAR,
                         format_details VARCHAR,
                         has_alpha BOOLEAN,
-                        bit_depth INTEGER
+                        bit_depth INTEGER,
+                        xxhash VARCHAR,
+                        dhash VARCHAR,
+                        phash VARCHAR
                     )
                     """
                 )
@@ -129,7 +140,9 @@ class CacheManager:
                     try:
                         fp = ImageFingerprint(
                             path=Path(row_dict["path"]),
-                            hashes=np.frombuffer(row_dict["hashes"], dtype=np.float32),
+                            hashes=np.frombuffer(row_dict["hashes"], dtype=np.float32)
+                            if row_dict["hashes"]
+                            else np.array([]),
                             resolution=(row_dict["resolution_w"], row_dict["resolution_h"]),
                             file_size=row_dict["size"],
                             mtime=row_dict["mtime"],
@@ -138,6 +151,13 @@ class CacheManager:
                             format_details=row_dict["format_details"],
                             has_alpha=row_dict["has_alpha"],
                             bit_depth=row_dict["bit_depth"],
+                            xxhash=row_dict.get("xxhash"),
+                            dhash=imagehash.hex_to_hash(row_dict["dhash"])
+                            if row_dict.get("dhash") and IMAGEHASH_AVAILABLE
+                            else None,
+                            phash=imagehash.hex_to_hash(row_dict["phash"])
+                            if row_dict.get("phash") and IMAGEHASH_AVAILABLE
+                            else None,
                         )
                         cached_fps.append(fp)
                     except Exception as e:
@@ -170,6 +190,9 @@ class CacheManager:
                 fp.format_details,
                 fp.has_alpha,
                 fp.bit_depth,
+                fp.xxhash,
+                str(fp.dhash) if fp.dhash else None,
+                str(fp.phash) if fp.phash else None,
             )
             for fp in fingerprints
             if fp
@@ -179,34 +202,22 @@ class CacheManager:
             return
 
         try:
-            # Begin transaction
             self.conn.begin()
-
-            # 1. Create a temporary table and bulk insert all new data into it
             self.conn.execute("CREATE OR REPLACE TEMP TABLE fingerprints_upsert AS SELECT * FROM fingerprints LIMIT 0")
             self.conn.executemany(
-                "INSERT INTO fingerprints_upsert VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", data_to_insert
+                "INSERT INTO fingerprints_upsert VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", data_to_insert
             )
-
-            # 2. In one query, update all existing records in the main table
             self.conn.execute("""
                 UPDATE fingerprints
                 SET
-                    mtime = u.mtime,
-                    size = u.size,
-                    hashes = u.hashes,
-                    resolution_w = u.resolution_w,
-                    resolution_h = u.resolution_h,
-                    capture_date = u.capture_date,
-                    format_str = u.format_str,
-                    format_details = u.format_details,
-                    has_alpha = u.has_alpha,
-                    bit_depth = u.bit_depth
+                    mtime = u.mtime, size = u.size, hashes = u.hashes,
+                    resolution_w = u.resolution_w, resolution_h = u.resolution_h,
+                    capture_date = u.capture_date, format_str = u.format_str,
+                    format_details = u.format_details, has_alpha = u.has_alpha,
+                    bit_depth = u.bit_depth, xxhash = u.xxhash, dhash = u.dhash, phash = u.phash
                 FROM fingerprints_upsert AS u
                 WHERE fingerprints.path = u.path;
             """)
-
-            # 3. In one query, insert only the records that are not yet in the main table
             self.conn.execute("""
                 INSERT INTO fingerprints
                 SELECT u.*
@@ -214,54 +225,37 @@ class CacheManager:
                 LEFT JOIN fingerprints AS f ON u.path = f.path
                 WHERE f.path IS NULL;
             """)
-
-            # Commit transaction
             self.conn.commit()
-
         except duckdb.Error as e:
             app_logger.warning(f"File cache 'put_many' transaction failed: {e}")
             if self.conn:
                 self.conn.rollback()
         finally:
-            # 4. Clean up the temporary table
             if self.conn:
                 self.conn.execute("DROP TABLE IF EXISTS fingerprints_upsert")
 
     def close(self):
         if not self.conn:
             return
-
         if self.in_memory_mode and self.db_path:
             try:
-                # 1. Remove the old cache file if it exists
                 self.db_path.unlink(missing_ok=True)
-
-                # 2. Attach the on-disk file path as a new database named 'disk_db'
                 self.conn.execute(f"ATTACH '{self.db_path!s}' AS disk_db;")
-
-                # 3. Create a table in the on-disk database by copying everything from the in-memory table
                 self.conn.execute("CREATE TABLE disk_db.fingerprints AS SELECT * FROM main.fingerprints;")
-
-                # 4. Detach the on-disk database, finalizing the write operation
                 self.conn.execute("DETACH disk_db;")
-
                 app_logger.info(f"Successfully wrote in-memory cache to '{self.db_path.name}'.")
             except duckdb.Error as e:
                 app_logger.error(f"Failed to write fingerprint cache to disk: {e}")
         else:
-            # For on-disk mode, just checkpoint
             try:
                 self.conn.execute("CHECKPOINT;")
             except duckdb.Error as e:
                 app_logger.warning(f"Error closing file cache DB: {e}")
-
         self.conn.close()
         self.conn = None
 
 
-# --- New Simplified Thumbnail Cache System ---
-
-
+# --- Simplified Thumbnail Cache System ---
 class AbstractThumbnailCache(abc.ABC):
     @abc.abstractmethod
     def get(self, key: str) -> bytes | None:
@@ -284,7 +278,6 @@ class DuckDBThumbnailCache(AbstractThumbnailCache):
         if not DUCKDB_AVAILABLE:
             app_logger.error("DuckDB not found, thumbnail cache is disabled.")
             return
-
         try:
             db_path = ":memory:" if in_memory else str(THUMBNAIL_CACHE_DB)
             if in_memory:
@@ -347,18 +340,11 @@ def get_thumbnail_cache_key(path_str: str, mtime: float, target_size: int, tonem
     return hashlib.sha1(key_str.encode()).hexdigest()
 
 
-# --- New Cache Lifecycle Management Functions ---
-
-
+# --- Lifecycle Management Functions ---
 def setup_caches(config: "ScanConfig"):
     """Initializes the persistent thumbnail cache based on scan settings."""
     global thumbnail_cache
-
-    # Close any old cache instance
     thumbnail_cache.close()
-
-    # Create a new thumbnail cache instance. It will be in-memory only if the
-    # main LanceDB database is also in-memory. Otherwise, it's persistent.
     thumbnail_cache = DuckDBThumbnailCache(in_memory=config.lancedb_in_memory)
 
 
@@ -366,5 +352,4 @@ def teardown_caches():
     """Closes and cleans up all active caches."""
     global thumbnail_cache
     thumbnail_cache.close()
-    # Reset to the dummy cache to ensure no resources are held after the scan.
     thumbnail_cache = DummyThumbnailCache()

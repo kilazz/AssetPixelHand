@@ -76,7 +76,7 @@ class DirectXTexLoader(BaseLoader):
     def _handle_alpha_logic(self, pil_image: Image.Image) -> Image.Image:
         """
         Optimized alpha handling for premultiplied alpha and other edge cases.
-        This version uses vectorized NumPy operations for maximum performance.
+        Uses vectorized NumPy operations for maximum performance.
         """
         if not pil_image or pil_image.mode != "RGBA":
             return pil_image

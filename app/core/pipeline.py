@@ -28,6 +28,7 @@ from app.services.signal_bus import SignalBus
 from . import worker
 
 if TYPE_CHECKING:
+    from app.core.scan_stages import ScanContext
     from app.data_models import ScanConfig, ScanState
 
 if LANCEDB_AVAILABLE:
@@ -45,7 +46,6 @@ class PipelineManager(QObject):
         state: "ScanState",
         signals: SignalBus,
         lancedb_table: "lancedb.table.Table",
-        files_to_process: list["Path"],
         stop_event: "threading.Event",
     ):
         super().__init__()
@@ -53,7 +53,6 @@ class PipelineManager(QObject):
         self.state = state
         self.signals = signals
         self.lancedb_table = lancedb_table
-        self.files = files_to_process
         self.stop_event = stop_event
 
         self.db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LanceDBAdd")
@@ -62,10 +61,16 @@ class PipelineManager(QObject):
         self.shared_mem_buffers = []
         self.infer_proc = None
 
-    def run(self) -> tuple[bool, list[str]]:
-        """Starts and runs the entire processing pipeline."""
+    def run(self, context: "ScanContext") -> tuple[bool, list[str]]:
+        """
+        Starts and runs the AI fingerprinting pipeline using the provided context.
+        It processes only the files listed in `context.files_to_process` and
+        updates the `ImageFingerprint` objects within `context.all_image_fps`.
+        """
+        files_to_process = context.files_to_process
         log_msg = (
-            f"Starting pipeline: {self.num_workers} CPU workers for preprocessing, inference on {self.config.device}."
+            f"Starting AI pipeline for {len(files_to_process)} unique files: "
+            f"{self.num_workers} CPU workers, inference on {self.config.device}."
         )
         app_logger.info(log_msg)
 
@@ -74,17 +79,17 @@ class PipelineManager(QObject):
 
         try:
             input_size, buffer_shape, dtype = self._get_model_and_buffer_config()
-            buffer_size = int(np.prod(buffer_shape) * np.dtype(dtype).itemsize)
-            free_buffers_q, tensor_q, results_q = self._setup_communication(buffer_size)
+
+            free_buffers_q, tensor_q, results_q = self._setup_communication(len(files_to_process))
             self.infer_proc = self._start_inference_process(tensor_q, results_q, free_buffers_q)
 
             all_skipped = self._run_preprocessing_pool(
-                input_size, buffer_shape, dtype, free_buffers_q, tensor_q, results_q, cache
+                files_to_process, input_size, buffer_shape, dtype, free_buffers_q, tensor_q, results_q, cache, context
             )
             return True, all_skipped
         except Exception as e:
             app_logger.critical(f"Pipeline failed critically: {e}", exc_info=True)
-            return False, [str(f) for f in self.files]
+            return False, [str(f) for f in files_to_process]
         finally:
             self._cleanup()
             cache.close()
@@ -106,9 +111,12 @@ class PipelineManager(QObject):
         buffer_shape = (self.config.perf.batch_size, 3, *input_size)
         return input_size, buffer_shape, dtype
 
-    def _setup_communication(self, buffer_size: int) -> tuple:
+    def _setup_communication(self, num_files: int) -> tuple:
         """Creates shared memory buffers and multiprocessing queues."""
         num_buffers = max(8, self.num_workers * 2)
+        _, buffer_shape, dtype = self._get_model_and_buffer_config()
+        buffer_size = int(np.prod(buffer_shape) * np.dtype(dtype).itemsize)
+
         self.shared_mem_buffers = [
             shared_memory.SharedMemory(create=True, size=buffer_size) for _ in range(num_buffers)
         ]
@@ -116,7 +124,7 @@ class PipelineManager(QObject):
         for mem in self.shared_mem_buffers:
             free_buffers_q.put(mem.name)
         tensor_q = self.ctx.Queue(maxsize=num_buffers)
-        results_q = self.ctx.Queue(maxsize=len(self.files) + 1)
+        results_q = self.ctx.Queue(maxsize=num_files + 1)
         return free_buffers_q, tensor_q, results_q
 
     def _start_inference_process(self, tensor_q, results_q, free_buffers_q) -> "multiprocessing.Process":
@@ -138,7 +146,7 @@ class PipelineManager(QObject):
         return infer_proc
 
     def _run_preprocessing_pool(
-        self, input_size, buffer_shape, dtype, free_buffers_q, tensor_q, results_q, cache
+        self, files_to_process, input_size, buffer_shape, dtype, free_buffers_q, tensor_q, results_q, cache, context
     ) -> list[str]:
         """Runs the main pipeline loop, processing data through the worker pool."""
         preproc_init_cfg = {
@@ -146,33 +154,30 @@ class PipelineManager(QObject):
             "low_priority": self.config.perf.run_at_low_priority,
         }
         worker_func = partial(
-            worker.worker_wrapper_from_paths_cpu_shared_mem,
+            worker.worker_preprocess_for_ai,
             input_size=input_size,
             buffer_shape=buffer_shape,
             dtype=dtype,
-            config=self.config,  # Pass the full config to the worker
+            config=self.config,
         )
         with self.ctx.Pool(
             processes=self.num_workers,
             initializer=worker.init_preprocessor_worker,
             initargs=(preproc_init_cfg, free_buffers_q),
         ) as pool:
-            preproc_results_iterator = pool.imap_unordered(
-                worker_func, self._data_generator(self.config.perf.batch_size)
+            data_generator = (
+                files_to_process[i : i + self.config.perf.batch_size]
+                for i in range(0, len(files_to_process), self.config.perf.batch_size)
             )
-            _, all_skipped = self._pipeline_loop(preproc_results_iterator, tensor_q, results_q, cache)
+            preproc_results_iterator = pool.imap_unordered(worker_func, data_generator)
+            _, all_skipped = self._pipeline_loop(preproc_results_iterator, tensor_q, results_q, cache, context)
         return all_skipped
 
-    def _data_generator(self, batch_size: int):
-        """Generator that yields batches of file paths."""
-        for i in range(0, len(self.files), batch_size):
-            if self.stop_event.is_set():
-                return
-            yield self.files[i : i + batch_size]
-
-    def _pipeline_loop(self, preproc_results, tensor_q, results_q, cache) -> tuple[int, list[str]]:
+    def _pipeline_loop(
+        self, preproc_results, tensor_q, results_q, cache, context: "ScanContext"
+    ) -> tuple[int, list[str]]:
         """The core loop that orchestrates the data flow between workers."""
-        total_files, processed_count, fps_to_cache, all_skipped = len(self.files), 0, [], []
+        total_files, processed_count, fps_to_cache, all_skipped = len(context.files_to_process), 0, [], []
         feeding_complete = False
 
         while processed_count < total_files:
@@ -180,28 +185,27 @@ class PipelineManager(QObject):
                 app_logger.error("Inference process terminated unexpectedly.")
                 break
 
-            # 1. Feed the GPU queue from the CPU workers if work is not yet complete.
             if not feeding_complete:
                 try:
                     preproc_output = next(preproc_results)
                     if preproc_output is not None:
                         tensor_q.put(preproc_output)
                 except StopIteration:
-                    tensor_q.put(None)  # Sentinel value to signal completion
+                    tensor_q.put(None)
                     feeding_complete = True
 
-            # 2. Process any available results from the GPU queue without blocking.
-            processed_now, should_break = self._process_gpu_results_queue(results_q, cache, fps_to_cache, all_skipped)
+            processed_now, should_break = self._process_gpu_results_queue(
+                results_q, cache, fps_to_cache, all_skipped, context
+            )
             if processed_now > 0:
                 processed_count += processed_now
                 self.state.update_progress(processed_count, total_files)
             if should_break:
                 break
 
-        # 3. After the main loop, drain any remaining items from the results queue.
         while True:
             processed_now, should_break = self._process_gpu_results_queue(
-                results_q, cache, fps_to_cache, all_skipped, timeout=1.0
+                results_q, cache, fps_to_cache, all_skipped, context, timeout=1.0
             )
             if processed_now > 0:
                 processed_count += processed_now
@@ -213,7 +217,9 @@ class PipelineManager(QObject):
             cache.put_many(fps_to_cache)
         return processed_count, all_skipped
 
-    def _process_gpu_results_queue(self, results_q, cache, fps_to_cache, all_skipped, timeout=0.01) -> tuple[int, bool]:
+    def _process_gpu_results_queue(
+        self, results_q, cache, fps_to_cache, all_skipped, context: "ScanContext", timeout=0.01
+    ) -> tuple[int, bool]:
         """Processes one batch of results from the GPU worker's queue."""
         processed_count = 0
         try:
@@ -221,29 +227,44 @@ class PipelineManager(QObject):
             if gpu_result is None:
                 return 0, True  # Sentinel received, break the loop.
 
-            batch_fps, skipped_items = gpu_result
-            self._handle_batch_results(batch_fps, skipped_items, cache, fps_to_cache)
+            batch_results, skipped_items = gpu_result
+            self._handle_batch_results(batch_results, skipped_items, cache, fps_to_cache, context)
             all_skipped.extend([path for path, _ in skipped_items])
-            processed_count += len(batch_fps) + len(skipped_items)
+            processed_count += len(batch_results) + len(skipped_items)
 
         except Empty:
             pass  # No results available, continue.
 
         return processed_count, False
 
-    def _handle_batch_results(self, batch_fps, skipped_items, cache, fps_to_cache):
-        """Processes a batch of results from the inference worker."""
+    def _handle_batch_results(self, batch_results, skipped_items, cache, fps_to_cache, context: "ScanContext"):
+        """
+        Processes a batch of results from the inference worker by UPDATING
+        the existing ImageFingerprint objects in the ScanContext.
+        """
+        updated_fps = []
+        for path_str, vector in batch_results.items():
+            path = Path(path_str)
+            if path in context.all_image_fps:
+                # Find the existing fingerprint object and update it with the AI vector
+                fp = context.all_image_fps[path]
+                fp.hashes = vector
+                updated_fps.append(fp)
+            else:
+                app_logger.warning(f"Received AI vector for an unknown path: {path_str}. Skipping.")
+
         for path_str, reason in skipped_items:
             self.signals.log_message.emit(f"Skipped {Path(path_str).name}: {reason}", "warning")
-        if batch_fps:
-            self._add_to_lancedb(batch_fps)
-            fps_to_cache.extend(batch_fps)
+
+        if updated_fps:
+            self._add_to_lancedb(updated_fps)
+            fps_to_cache.extend(updated_fps)
             if len(fps_to_cache) >= DB_WRITE_BATCH_SIZE:
                 cache.put_many(fps_to_cache)
                 fps_to_cache.clear()
 
     def _add_to_lancedb(self, fingerprints: list[ImageFingerprint]):
-        """Adds a list of fingerprints to the LanceDB table in a separate thread."""
+        """Adds a list of fully populated fingerprints to the LanceDB table."""
         if not fingerprints or not LANCEDB_AVAILABLE:
             return
 

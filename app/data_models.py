@@ -63,26 +63,10 @@ class FileOperation(Enum):
     REFLINKING = auto()
 
 
-@dataclass
+@dataclass(slots=True)
 class ImageFingerprint:
-    """A container for all metadata and the AI-generated hash of an image."""
+    """A container for all metadata and hashes of an image, evolving through the pipeline."""
 
-    __slots__ = [
-        "bit_depth",
-        "capture_date",
-        "color_space",
-        "compression_format",
-        "file_size",
-        "format_details",
-        "format_str",
-        "has_alpha",
-        "hashes",
-        "mipmap_count",
-        "mtime",
-        "path",
-        "resolution",
-        "texture_type",
-    ]
     path: Path
     hashes: np.ndarray
     resolution: tuple[int, int]
@@ -98,6 +82,11 @@ class ImageFingerprint:
     texture_type: str
     color_space: str | None
 
+    # This is the correct way to define default-valued fields in a slotted dataclass
+    xxhash: str | None = field(default=None)
+    dhash: Any | None = field(default=None)
+    phash: Any | None = field(default=None)
+
     def __hash__(self) -> int:
         return hash(self.path)
 
@@ -107,8 +96,7 @@ class ImageFingerprint:
         return NotImplemented
 
     def to_lancedb_dict(self) -> dict[str, Any]:
-        """Converts the object to a dictionary suitable for writing to LanceDB,
-        with explicit type casting for robustness."""
+        """Converts the object to a dictionary suitable for writing to LanceDB."""
         data = {
             "id": str(uuid.uuid5(uuid.NAMESPACE_URL, str(self.path))),
             "vector": self.hashes,
@@ -131,7 +119,7 @@ class ImageFingerprint:
 
     @classmethod
     def from_db_row(cls, row: dict) -> "ImageFingerprint":
-        """Factory method to create an ImageFingerprint from a database row (dict)."""
+        """Factory method to create an ImageFingerprint from a final results database row."""
         vector_data = row.get("vector")
         hashes = np.array(vector_data) if vector_data is not None else np.array([])
 
@@ -153,19 +141,16 @@ class ImageFingerprint:
         )
 
 
+# Type Aliases for Clarity
 DuplicateInfo = tuple[ImageFingerprint, int]
 DuplicateGroup = set[DuplicateInfo]
 DuplicateResults = dict[ImageFingerprint, Any]
 SearchResult = list[tuple[ImageFingerprint, float]]
 
 
-# --- Type-safe nodes for the results tree view model ---
-
-
+# Type-safe nodes for the results tree view model
 @dataclass
 class ResultNode:
-    """Represents a single file (result) in the results tree view."""
-
     path: str
     is_best: bool
     group_id: int
@@ -184,14 +169,12 @@ class ResultNode:
     texture_type: str
     color_space: str | None
     found_by: str
-    type: str = "result"  # Field for type checking within the model logic
+    type: str = "result"
 
     @classmethod
     def from_dict(cls, data: dict) -> "ResultNode":
-        """Creates an instance from a dictionary, safely ignoring extra keys."""
         class_fields = {f.name for f in fields(cls)}
         filtered_data = {k: v for k, v in data.items() if k in class_fields}
-        # Backward compatibility for DBs without the new fields
         if "compression_format" not in filtered_data:
             filtered_data["compression_format"] = filtered_data.get("format_str", "Unknown")
         if "mipmap_count" not in filtered_data:
@@ -205,8 +188,6 @@ class ResultNode:
 
 @dataclass
 class GroupNode:
-    """Represents a group of duplicates in the results tree view."""
-
     name: str
     count: int
     total_size: int
@@ -216,10 +197,9 @@ class GroupNode:
     type: str = "group"
 
 
+# Configuration Dataclasses
 @dataclass
 class PerformanceConfig:
-    """Stores performance-related settings for a scan."""
-
     num_workers: int = 4
     run_at_low_priority: bool = True
     batch_size: int = 256
@@ -227,8 +207,6 @@ class PerformanceConfig:
 
 @dataclass
 class ScanConfig:
-    """A comprehensive container for all settings required to run a scan."""
-
     folder_path: Path
     similarity_threshold: int
     save_visuals: bool
@@ -295,8 +273,6 @@ class ViewerSettings:
 
 @dataclass
 class AppSettings:
-    """Represents the application's user-configurable settings, persisted to a JSON file."""
-
     folder_path: str = ""
     threshold: str = "95"
     exclude: str = ""
@@ -312,14 +288,13 @@ class AppSettings:
 
     @classmethod
     def load(cls) -> "AppSettings":
-        """Loads settings from the JSON config file, with fallbacks for safety."""
         if not CONFIG_FILE.exists():
             return cls(selected_extensions=list(ALL_SUPPORTED_EXTENSIONS), folder_path=str(SCRIPT_DIR))
         try:
             with open(CONFIG_FILE, encoding="utf-8") as f:
                 data = json.load(f)
 
-            # --- Backward Compatibility: Handle old flat format ---
+            # Backward Compatibility
             if "find_exact_duplicates" in data:
                 data["hashing"] = {
                     "find_exact": data.pop("find_exact_duplicates", True),
@@ -354,11 +329,9 @@ class AppSettings:
                     "tonemap_view": data.pop("tonemap_view", "Khronos PBR Neutral"),
                 }
 
-            # --- Load into nested structure ---
             settings = cls()
             for key, value in data.items():
                 if hasattr(settings, key):
-                    # If the attribute is a dataclass, update its fields from the dict
                     if isinstance(
                         getattr(settings, key), (HashingSettings, PerformanceSettings, VisualsSettings, ViewerSettings)
                     ):
@@ -368,7 +341,6 @@ class AppSettings:
                                 setattr(nested_obj, nested_key, nested_value)
                     else:
                         setattr(settings, key, value)
-
             if not settings.selected_extensions:
                 settings.selected_extensions = list(ALL_SUPPORTED_EXTENSIONS)
             if not settings.folder_path or not Path(settings.folder_path).is_dir():
@@ -381,9 +353,7 @@ class AppSettings:
             return cls(selected_extensions=list(ALL_SUPPORTED_EXTENSIONS), folder_path=str(SCRIPT_DIR))
 
     def save(self):
-        """Serializes the current settings state to a JSON file."""
         try:
-            # Create a dictionary representation of the dataclass, including nested ones
             data_to_save = {k: v.__dict__ if hasattr(v, "__dict__") else v for k, v in self.__dict__.items()}
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(data_to_save, f, indent=4)
@@ -392,11 +362,8 @@ class AppSettings:
 
 
 class ScanState:
-    """A thread-safe class to hold and update the current state of a scan."""
-
     def __init__(self):
         self.lock = threading.Lock()
-        # Initialize all attributes in the constructor
         self.phase_name: str = ""
         self.phase_details: str = ""
         self.phase_current: int = 0
@@ -405,7 +372,6 @@ class ScanState:
         self.phase_weight: float = 0.0
 
     def reset(self):
-        """Resets the state to its initial values for a new scan."""
         with self.lock:
             self.phase_name = ""
             self.phase_details = ""
@@ -415,23 +381,19 @@ class ScanState:
             self.phase_weight = 0.0
 
     def set_phase(self, name: str, weight: float):
-        """Transitions to a new scan phase and updates the base progress."""
         with self.lock:
             self.base_progress += self.phase_weight
             self.phase_name, self.phase_weight = name, weight
             self.phase_current, self.phase_total = 0, 0
 
     def update_progress(self, current: int, total: int, details: str = ""):
-        """Updates the progress within the current phase."""
         with self.lock:
             self.phase_current, self.phase_total = current, total
             if details:
                 self.phase_details = details
 
     def get_snapshot(self) -> dict[str, Any]:
-        """Returns a thread-safe copy of the current state for UI updates."""
         with self.lock:
-            # Create a copy of attributes that don't include the lock object
             return {
                 "phase_name": self.phase_name,
                 "phase_details": self.phase_details,

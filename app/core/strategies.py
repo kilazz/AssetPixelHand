@@ -8,17 +8,14 @@ import multiprocessing
 import threading
 import time
 from abc import ABC, abstractmethod
-from contextlib import suppress
 from pathlib import Path
 
-import duckdb
 import numpy as np
 import polars as pl
+import pyarrow as pa
 
-from app.cache import _configure_db_connection
 from app.constants import BEST_FILE_METHOD_NAME, DUCKDB_AVAILABLE, RESULTS_DB_FILE
 from app.data_models import (
-    FINGERPRINT_FIELDS,
     DuplicateResults,
     ImageFingerprint,
     ScanConfig,
@@ -34,14 +31,16 @@ from .pipeline import PipelineManager
 from .scan_stages import (
     AILinkingStage,
     DatabaseIndexStage,
-    ExactGroupingStage,
+    EvidenceMethod,
+    ExactDuplicateStage,
     FileDiscoveryStage,
     FingerprintGenerationStage,
-    HashingStage,
-    PerceptualGroupingStage,
+    PerceptualDuplicateStage,
     ScanContext,
 )
-from .worker import init_worker, worker_get_single_vector, worker_get_text_vector
+
+if DUCKDB_AVAILABLE:
+    import duckdb
 
 app_logger = logging.getLogger("AssetPixelHand.strategies")
 
@@ -78,37 +77,44 @@ class ScanStrategy(ABC):
 
     def _create_dummy_fp(self, path: Path) -> ImageFingerprint | None:
         """Create a dummy fingerprint for search queries."""
-        with suppress(Exception):
+        try:
             meta = get_image_metadata(path)
             if meta:
                 return ImageFingerprint(path=path, hashes=np.array([]), **meta)
-        self.all_skipped_files.append(str(path))
+        except Exception:
+            self.all_skipped_files.append(str(path))
         return None
 
     def _save_results_to_db(self, final_groups: DuplicateResults, search_context: str | None = None):
-        """Save final results to DuckDB database."""
+        """Save final results to DuckDB database using a fast Arrow-based path."""
         if not DUCKDB_AVAILABLE:
             return
 
         RESULTS_DB_FILE.unlink(missing_ok=True)
 
         try:
+            from app.cache import _configure_db_connection
+
             with duckdb.connect(database="", read_only=False) as conn:
                 _configure_db_connection(conn)
                 self._create_results_table(conn)
+
                 data = self._prepare_results_data(final_groups, search_context)
                 if data:
-                    num_columns = len(data[0])
-                    placeholders = ", ".join("?" for _ in range(num_columns))
-                    conn.executemany(f"INSERT INTO results VALUES ({placeholders})", data)
+                    arrow_table = pa.Table.from_pylist(data)
+                    conn.register("results_arrow", arrow_table)
+                    conn.execute("INSERT INTO results SELECT * FROM results_arrow")
+
                 self._persist_database(conn)
                 app_logger.info(f"Results saved to '{RESULTS_DB_FILE.name}'.")
-        except duckdb.Error as e:
+        except (duckdb.Error, pa.ArrowInvalid) as e:
             self.signals.log_message.emit(f"Failed to write results to DuckDB: {e}", "error")
             app_logger.error(f"Failed to write results DB: {e}", exc_info=True)
 
     @staticmethod
     def _create_results_table(conn):
+        from app.data_models import FINGERPRINT_FIELDS
+
         columns_sql = ", ".join([f"{name} {types['duckdb']}" for name, types in FINGERPRINT_FIELDS.items()])
         conn.execute(
             f"""CREATE TABLE results (
@@ -126,8 +132,8 @@ class ScanStrategy(ABC):
             "DETACH disk_db;"
         )
 
-    def _prepare_results_data(self, final_groups: DuplicateResults, search_context: str | None = None) -> list[tuple]:
-        """Prepare results data for database insertion."""
+    def _prepare_results_data(self, final_groups: DuplicateResults, search_context: str | None = None) -> list[dict]:
+        """Prepare results data as a list of dictionaries for PyArrow."""
         data = []
         for i, (best_fp, dups) in enumerate(final_groups.items(), 1):
             data.append(self._create_result_row(i, True, best_fp, -1, search_context, BEST_FILE_METHOD_NAME))
@@ -138,43 +144,41 @@ class ScanStrategy(ABC):
     @staticmethod
     def _create_result_row(
         group_id: int, is_best: bool, fp: ImageFingerprint, distance: int, search_context: str | None, found_by: str
-    ) -> tuple:
-        """Create a single result row tuple."""
+    ) -> dict:
+        """Create a single result row as a dictionary."""
+        from app.data_models import FINGERPRINT_FIELDS
 
-        row_data = [group_id, is_best]
+        row_data = {"group_id": group_id, "is_best": is_best}
         for field_name in FINGERPRINT_FIELDS:
             if field_name == "path":
-                row_data.append(str(fp.path))
+                row_data[field_name] = str(fp.path)
             elif field_name == "resolution_w":
-                row_data.append(fp.resolution[0])
+                row_data[field_name] = fp.resolution[0]
             elif field_name == "resolution_h":
-                row_data.append(fp.resolution[1])
+                row_data[field_name] = fp.resolution[1]
             else:
-                row_data.append(getattr(fp, field_name, None))
+                row_data[field_name] = getattr(fp, field_name, None)
 
-        row_data.extend([distance, search_context, found_by])
-        return tuple(row_data)
+        row_data.update({"distance": distance, "search_context": search_context, "found_by": found_by})
+        return row_data
 
 
 class FindDuplicatesStrategy(ScanStrategy):
-    """Strategy for finding duplicate images using a pipeline of stages."""
+    """Strategy for finding duplicate images using a granular pipeline of stages."""
 
     def __init__(self, *args):
         super().__init__(*args)
-        # The entire scan pipeline is defined centrally here as a list of stages and their
-        # approximate weight for the progress bar calculation.
         self.pipeline = [
             (FileDiscoveryStage(), 0.05),
-            (HashingStage(), 0.25),
-            (ExactGroupingStage(), 0.10),
-            (PerceptualGroupingStage(), 0.05),
-            (FingerprintGenerationStage(), 0.40),
+            (ExactDuplicateStage(), 0.15),
+            (PerceptualDuplicateStage(), 0.20),
+            (FingerprintGenerationStage(), 0.45),
             (DatabaseIndexStage(), 0.0),
             (AILinkingStage(), 0.15),
         ]
 
     def execute(self, stop_event: threading.Event, start_time: float):
-        """Executes the duplicate finding strategy by running a pipeline of stages."""
+        """Executes the duplicate finding strategy by running the pipeline."""
         context = ScanContext(
             config=self.config,
             state=self.state,
@@ -202,7 +206,6 @@ class FindDuplicatesStrategy(ScanStrategy):
             self._report_and_cleanup({}, start_time)
 
     def _report_and_cleanup(self, final_groups: DuplicateResults, start_time: float):
-        """Finalize scan, save results, and signal completion."""
         num_found = sum(len(d) for d in final_groups.values())
         duration = time.time() - start_time
         db_path = RESULTS_DB_FILE if num_found > 0 else None
@@ -223,17 +226,25 @@ class SearchStrategy(ScanStrategy):
         if self._should_abort(stop_event, all_files, start_time):
             return
 
-        # Use the unified, high-performance pipeline to generate fingerprints
         self.state.set_phase("Phase 2/2: Creating AI fingerprints...", 0.8)
         pipeline_manager = PipelineManager(
             config=self.config,
             state=self.state,
             signals=self.signals,
             lancedb_table=self.table,
-            files_to_process=all_files,
             stop_event=stop_event,
         )
-        success, skipped = pipeline_manager.run()
+
+        search_context = ScanContext(
+            config=self.config,
+            state=self.state,
+            signals=self.signals,
+            stop_event=stop_event,
+            scanner_core=self.scanner_core,
+            files_to_process=all_files,
+        )
+
+        success, skipped = pipeline_manager.run(search_context)
         self.all_skipped_files.extend(skipped)
 
         if not success and not stop_event.is_set():
@@ -254,7 +265,6 @@ class SearchStrategy(ScanStrategy):
         )
 
     def _should_abort(self, stop_event: threading.Event, files: list[Path], start_time: float) -> bool:
-        """Check if search should be aborted."""
         return self.scanner_core._check_stop_or_empty(
             stop_event, files, self.config.scan_mode, {"db_path": None, "groups_data": None}, start_time
         )
@@ -267,8 +277,6 @@ class SearchStrategy(ScanStrategy):
         if query_vector is None:
             self.signals.scan_error.emit("Could not generate a vector for the search query.")
             return None, None
-
-        from .scan_stages import EvidenceMethod
 
         sim_engine = LanceDBSimilarityEngine(self.config, self.state, self.signals, self.scanner_core.db, self.table)
         raw_hits = (
@@ -288,12 +296,12 @@ class SearchStrategy(ScanStrategy):
         if not results:
             return 0, None
 
-        self._save_search_results(results, EvidenceMethod)
+        self._save_search_results(results)
         return len(results), str(RESULTS_DB_FILE)
 
-    def _save_search_results(self, results: list[tuple[ImageFingerprint, float]], evidence_method_enum):
+    def _save_search_results(self, results: list[tuple[ImageFingerprint, float]]):
         """Format and save search results to database."""
-        dups = [(fp, int(max(0.0, (1.0 - d)) * 100), evidence_method_enum.AI.value) for fp, d in results]
+        dups = [(fp, int(max(0.0, (1.0 - d)) * 100), EvidenceMethod.AI.value) for fp, d in results]
         best_fp = self._create_search_context_fingerprint()
 
         if best_fp:
@@ -332,6 +340,8 @@ class SearchStrategy(ScanStrategy):
 
     def _get_query_vector(self) -> np.ndarray | None:
         """Generate query vector from text or sample image."""
+        from .worker import init_worker, worker_get_single_vector, worker_get_text_vector
+
         ctx = multiprocessing.get_context("spawn")
         pool_config = {"model_name": self.config.model_name, "device": self.config.device}
 

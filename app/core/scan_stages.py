@@ -26,7 +26,10 @@ from app.services.signal_bus import SignalBus
 from app.utils import find_best_in_group
 
 from .engines import LanceDBSimilarityEngine
-from .hashing_worker import worker_collect_all_data
+from .hashing_worker import (
+    worker_calculate_hashes_and_meta,
+    worker_calculate_perceptual_hashes,
+)
 from .helpers import FileFinder
 from .pipeline import PipelineManager
 
@@ -268,7 +271,6 @@ class ScanContext:
     stop_event: threading.Event
     scanner_core: Any
     all_image_fps: dict[Path, ImageFingerprint] = field(default_factory=dict)
-    all_hashed_data: list[dict] = field(default_factory=list)
     files_to_process: list[Path] = field(default_factory=list)
     cluster_manager: PrecisionClusterManager = field(default_factory=PrecisionClusterManager)
     all_skipped_files: list[str] = field(default_factory=list)
@@ -302,119 +304,128 @@ class FileDiscoveryStage(ScanStage):
         return bool(context.files_to_process) and not context.stop_event.is_set()
 
 
-class HashingStage(ScanStage):
+class ExactDuplicateStage(ScanStage):
     @property
     def name(self) -> str:
-        return "Phase 2/6: Collecting file hashes and metadata..."
+        return "Phase 2/6: Finding exact duplicates (xxHash)..."
 
     def run(self, context: ScanContext) -> bool:
-        all_results = []
-        files_to_hash = context.files_to_process
-        total_files = len(files_to_hash)
+        if not context.files_to_process or not context.config.find_exact_duplicates:
+            return True
+
+        total_files = len(context.files_to_process)
+        context.state.update_progress(0, total_files, "Calculating exact file hashes...")
+        hash_map = defaultdict(list)
+
         ctx = multiprocessing.get_context("spawn")
         with ctx.Pool(processes=context.config.perf.num_workers) as pool:
-            for i, result in enumerate(pool.imap_unordered(worker_collect_all_data, files_to_hash, chunksize=50), 1):
+            for i, result in enumerate(
+                pool.imap_unordered(worker_calculate_hashes_and_meta, context.files_to_process, chunksize=50), 1
+            ):
                 if context.stop_event.is_set():
                     pool.terminate()
                     return False
                 if (i % 100) == 0:
                     context.state.update_progress(i, total_files)
                 if result:
-                    all_results.append(result)
-
-        if not all_results or context.stop_event.is_set():
-            return False
-
-        for data in all_results:
-            fp = ImageFingerprint(path=data["path"], hashes=np.array([]), **data["meta"])
-            context.all_image_fps[fp.path] = fp
-
-        context.all_hashed_data = all_results
-        return True
-
-
-class ExactGroupingStage(ScanStage):
-    @property
-    def name(self) -> str:
-        return "Phase 3/6: Finding duplicates by exact hashes..."
-
-    def run(self, context: ScanContext) -> bool:
-        reps_data = context.all_hashed_data
-
-        if context.config.find_exact_duplicates:
-            reps_data = self._group_by_hash_key(reps_data, "xxhash", EvidenceMethod.XXHASH.value, context)
-            if context.stop_event.is_set():
-                return False
-
-        # dHash grouping is now handled by the PerceptualGroupingStage
-        context.files_to_process = [d["path"] for d in reps_data]
-        return True
-
-    def _group_by_hash_key(self, data_list: list[dict], key: str, method: str, context: ScanContext) -> list[dict]:
-        hash_map = defaultdict(list)
-        for item in data_list:
-            if item.get(key) is not None:
-                hash_map[item[key]].append(item["path"])
+                    fp = ImageFingerprint(path=result["path"], hashes=np.array([]), **result["meta"])
+                    fp.xxhash = result["xxhash"]
+                    context.all_image_fps[fp.path] = fp
+                    hash_map[fp.xxhash].append(fp.path)
 
         representatives = []
         for paths in hash_map.values():
-            if paths:
-                rep_path = paths[0]
-                representatives.append(next(d for d in data_list if d["path"] == rep_path))
-                if len(paths) > 1:
-                    for other_path in paths[1:]:
-                        context.cluster_manager.add_evidence(rep_path, other_path, method, 0.0)
-        return representatives
+            if not paths:
+                continue
+
+            rep_path = paths[0]
+            representatives.append(rep_path)
+
+            if len(paths) > 1:
+                for other_path in paths[1:]:
+                    context.cluster_manager.add_evidence(rep_path, other_path, EvidenceMethod.XXHASH.value, 0.0)
+
+        context.files_to_process = representatives
+        app_logger.info(f"ExactDuplicateStage: {len(context.files_to_process)} unique files remain for next stage.")
+        return not context.stop_event.is_set()
 
 
-class PerceptualGroupingStage(ScanStage):
+class PerceptualDuplicateStage(ScanStage):
     @property
     def name(self) -> str:
-        return "Phase 3/6: Finding duplicates by perceptual hashes..."
+        return "Phase 3/6: Finding near-identical duplicates (pHash/dHash)..."
 
     def run(self, context: ScanContext) -> bool:
-        # Step 1: Cluster by dHash (simple duplicates)
+        if not context.files_to_process or not (
+            context.config.find_simple_duplicates or context.config.find_perceptual_duplicates
+        ):
+            return True
+
+        total_files = len(context.files_to_process)
+        context.state.update_progress(0, total_files, "Calculating perceptual hashes...")
+
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(processes=context.config.perf.num_workers) as pool:
+            for i, result in enumerate(
+                pool.imap_unordered(worker_calculate_perceptual_hashes, context.files_to_process, chunksize=50), 1
+            ):
+                if context.stop_event.is_set():
+                    pool.terminate()
+                    return False
+                if (i % 100) == 0:
+                    context.state.update_progress(i, total_files)
+                if result and result["path"] in context.all_image_fps:
+                    fp = context.all_image_fps[result["path"]]
+                    fp.dhash = result["dhash"]
+                    fp.phash = result["phash"]
+                    fp.resolution = result["precise_meta"]["resolution"]
+                    fp.format_details = result["precise_meta"]["format_details"]
+                    fp.has_alpha = result["precise_meta"]["has_alpha"]
+
         if context.config.find_simple_duplicates:
-            self._run_clustering(
-                context=context,
-                hash_key="dhash",
-                method=EvidenceMethod.DHASH,
-                threshold=context.config.dhash_threshold,
-            )
-
-        # Step 2: Cluster by pHash (near-identical duplicates)
+            self._run_phash_clustering(context, "dhash", EvidenceMethod.DHASH, context.config.dhash_threshold)
         if context.config.find_perceptual_duplicates:
-            self._run_clustering(
-                context=context,
-                hash_key="phash",
-                method=EvidenceMethod.PHASH,
-                threshold=context.config.phash_threshold,
-            )
+            self._run_phash_clustering(context, "phash", EvidenceMethod.PHASH, context.config.phash_threshold)
 
-        context.signals.log_message.emit(
-            f"Found {len(context.files_to_process)} unique candidates for AI processing.", "info"
-        )
-        return True
+        app_logger.info(f"PerceptualDuplicateStage: {len(context.files_to_process)} unique files remain for AI stage.")
+        return not context.stop_event.is_set()
 
-    def _run_clustering(self, context: ScanContext, hash_key: str, method: EvidenceMethod, threshold: int):
-        """Generic logic to run clustering for a given hash type."""
-        rep_paths = set(context.files_to_process)
-        reps_data = [d for d in context.all_hashed_data if d["path"] in rep_paths]
+    def _run_phash_clustering(self, context: ScanContext, hash_key: str, method: EvidenceMethod, threshold: int):
+        hashes_to_process = [
+            (getattr(fp, hash_key), fp.path)
+            for path in context.files_to_process
+            if (fp := context.all_image_fps.get(path)) and getattr(fp, hash_key) is not None
+        ]
 
-        hashes_to_process = [(d[hash_key], d["path"]) for d in reps_data if d.get(hash_key) is not None]
         if not hashes_to_process:
             return
 
         hashes, paths = zip(*hashes_to_process, strict=True)
         components = self._find_hash_components_lancedb(paths, hashes, threshold)
-        final_reps = self._process_hash_components(components, context, method)
 
+        final_reps = []
+        processed_paths = set()
+        for group in components.values():
+            if not group:
+                continue
+
+            processed_paths.update(group)
+            if len(group) > 1:
+                group_fps = [context.all_image_fps[p] for p in group]
+                best = find_best_in_group(group_fps)
+                final_reps.append(best.path)
+                for path in group:
+                    if path != best.path:
+                        context.cluster_manager.add_evidence(best.path, path, method.value, 0.0)
+            else:
+                final_reps.append(group[0])
+
+        final_reps.extend([p for p in context.files_to_process if p not in processed_paths])
         context.files_to_process = final_reps
 
     def _find_hash_components_lancedb(
         self, paths: tuple[Path, ...], hashes: tuple[Any, ...], threshold: int
     ) -> dict[int, list[Path]]:
-        """Finds groups of similar hashes (dHash or pHash) using LanceDB."""
         n = len(paths)
         if not hashes or n < 2:
             return {i: [p] for i, p in enumerate(paths)}
@@ -466,40 +477,6 @@ class PerceptualGroupingStage(ScanStage):
             if temp_db_path and Path(temp_db_path).exists():
                 shutil.rmtree(temp_db_path, ignore_errors=True)
 
-    def _process_hash_components(
-        self, components: dict[int, list[Path]], context: ScanContext, method: EvidenceMethod
-    ) -> list[Path]:
-        """Processes the found hash clusters to update representatives and evidence."""
-        final_representatives = []
-        processed_paths = set()
-
-        for group in components.values():
-            if not group:
-                continue
-
-            processed_paths.update(group)
-
-            if len(group) > 1:
-                group_fps = [context.all_image_fps[p] for p in group if p in context.all_image_fps]
-                if not group_fps:
-                    continue
-                best = find_best_in_group(group_fps)
-                if not best:
-                    continue
-                final_representatives.append(best.path)
-                for path in group:
-                    if path != best.path:
-                        context.cluster_manager.add_evidence(best.path, path, method.value, 0.0)
-            elif group:
-                final_representatives.append(group[0])
-
-        # Add back any files that were not part of any cluster
-        for path in context.files_to_process:
-            if path not in processed_paths:
-                final_representatives.append(path)
-
-        return final_representatives
-
 
 class FingerprintGenerationStage(ScanStage):
     @property
@@ -516,10 +493,9 @@ class FingerprintGenerationStage(ScanStage):
             state=context.state,
             signals=context.signals,
             lancedb_table=context.scanner_core.table,
-            files_to_process=context.files_to_process,
             stop_event=context.stop_event,
         )
-        success, skipped = pipeline_manager.run()
+        success, skipped = pipeline_manager.run(context)  # Pass context here
         context.all_skipped_files.extend(skipped)
         return success
 
