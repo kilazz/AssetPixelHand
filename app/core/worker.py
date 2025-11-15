@@ -158,26 +158,40 @@ def init_preprocessor_worker(config: dict, queue: "multiprocessing.Queue"):
 
 
 def _process_batch_from_paths_for_ai(
-    paths: list[Path], input_size
-) -> tuple[list[Image.Image], list[Path], list[tuple[str, str]]]:
+    paths: list[Path], input_size, config: "ScanConfig"
+) -> tuple[list[Image.Image], list[tuple[Path, str]], list[tuple[str, str]]]:
     """Loads and preprocesses images specifically for AI inference."""
-    images, successful_paths, skipped_tuples = [], [], []
+    images, successful_paths_with_channels, skipped_tuples = [], [], []
     for path in paths:
         try:
             pil_image = load_image(path)
-            if pil_image:
-                # Resize to the model's expected input size
-                pil_image.thumbnail(input_size, Image.Resampling.LANCZOS)
-                # Ensure image is in RGB format for the model
-                processed_image = pil_image.convert("RGB") if pil_image.mode != "RGB" else pil_image
-                images.append(processed_image)
-                successful_paths.append(path)
-            else:
+            if not pil_image:
                 skipped_tuples.append((str(path), "Image loading failed"))
+                continue
+
+            pil_image = pil_image.convert("RGBA")
+
+            if config.compare_by_channel:
+                channels_to_process = pil_image.split()
+                channel_names = ["R", "G", "B", "A"]
+                for i, channel_img in enumerate(channels_to_process):
+                    # Convert single channel to RGB for the model
+                    processed_image = Image.merge("RGB", (channel_img, channel_img, channel_img))
+                    images.append(processed_image)
+                    successful_paths_with_channels.append((path, channel_names[i]))
+            else:
+                # Standard logic
+                processed_image = pil_image.convert("RGB")
+                if config.compare_by_luminance:
+                    processed_image = processed_image.convert("L").convert("RGB")
+
+                images.append(processed_image)
+                successful_paths_with_channels.append((path, "RGB"))  # Default channel identifier
+
         except Exception as e:
             app_logger.error(f"Error processing {path.name} in AI batch", exc_info=True)
             skipped_tuples.append((str(path), f"{type(e).__name__}: {str(e).splitlines()[0]}"))
-    return images, successful_paths, skipped_tuples
+    return images, successful_paths_with_channels, skipped_tuples
 
 
 def worker_preprocess_for_ai(
@@ -188,12 +202,11 @@ def worker_preprocess_for_ai(
     if g_free_buffers_q is None or g_preprocessor is None:
         raise RuntimeError("Preprocessor worker not initialized correctly.")
     try:
-        images, successful_paths, skipped_tuples = _process_batch_from_paths_for_ai(paths, input_size)
+        images, successful_paths_with_channels, skipped_tuples = _process_batch_from_paths_for_ai(
+            paths, input_size, config
+        )
         if not images:
             return None, [], skipped_tuples
-
-        if config.compare_by_luminance:
-            images = [img.convert("L").convert("RGB") for img in images]
 
         pixel_values = g_preprocessor(images=images, return_tensors="np").pixel_values
 
@@ -203,15 +216,13 @@ def worker_preprocess_for_ai(
         current_batch_size = pixel_values.shape[0]
         shared_array[:current_batch_size] = pixel_values.astype(dtype)
 
-        # The meta message now includes the list of paths for the inference worker
         meta_message = {
             "shm_name": shm_name,
             "shape": (current_batch_size, *buffer_shape[1:]),
             "dtype": dtype,
-            "paths": [str(p) for p in successful_paths],
+            "paths_with_channels": [(str(p), c) for p, c in successful_paths_with_channels],
         }
         existing_shm.close()
-        # The second element (fingerprints) is no longer created here
         return meta_message, [], skipped_tuples
     except Exception as e:
         _log_worker_crash(e, "worker_preprocess_for_ai")
@@ -238,13 +249,13 @@ def inference_worker_loop(config: dict, tensor_q, results_q, free_buffers_q):
                 break
 
             meta_message, _, skipped_tuples = item
-            pixel_values, paths = None, []
+            pixel_values, paths_with_channels = None, []
             if meta_message:
-                shm_name, shape, dtype, paths = (
+                shm_name, shape, dtype, paths_with_channels = (
                     meta_message["shm_name"],
                     meta_message["shape"],
                     meta_message["dtype"],
-                    meta_message["paths"],
+                    meta_message["paths_with_channels"],
                 )
                 existing_shm = shared_memory.SharedMemory(name=shm_name)
                 shared_array = np.ndarray(shape, dtype=dtype, buffer=existing_shm.buf)
@@ -260,15 +271,15 @@ def inference_worker_loop(config: dict, tensor_q, results_q, free_buffers_q):
 
                 if embeddings is None or embeddings.size == 0:
                     app_logger.error("Inference worker: model returned empty output")
-                    for p in paths:
+                    for p, _ in paths_with_channels:
                         skipped_tuples.append((p, "Inference returned empty"))
                     results_q.put(({}, skipped_tuples))
                     continue
 
                 embeddings = normalize_vectors_numpy(embeddings)
 
-                # Return a dictionary mapping the path string to its calculated vector
-                batch_results = {path: vec for path, vec in zip(paths, embeddings, strict=False)}
+                # Return a dictionary mapping the (path, channel) tuple to its vector
+                batch_results = {pc: vec for pc, vec in zip(paths_with_channels, embeddings, strict=False)}
                 results_q.put((batch_results, skipped_tuples))
             elif skipped_tuples:
                 results_q.put(({}, skipped_tuples))
@@ -292,7 +303,36 @@ def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
     if g_inference_engine is None:
         return None
     try:
-        images, _, skipped = _process_batch_from_paths_for_ai([image_path], g_inference_engine.input_size)
+        # For sample search, we don't split by channel, so a dummy config is fine.
+        from app.data_models import PerformanceConfig, ScanConfig, ScanMode
+
+        dummy_config = ScanConfig(
+            folder_path=Path("."),
+            similarity_threshold=0,
+            save_visuals=False,
+            max_visuals=0,
+            excluded_folders=[],
+            model_name="",
+            model_dim=0,
+            selected_extensions=[],
+            perf=PerformanceConfig(),
+            search_precision="",
+            scan_mode=ScanMode.SAMPLE_SEARCH,
+            device="",
+            find_exact_duplicates=False,
+            find_simple_duplicates=False,
+            dhash_threshold=0,
+            find_perceptual_duplicates=False,
+            phash_threshold=0,
+            compare_by_luminance=False,
+            compare_by_channel=False,
+            lancedb_in_memory=True,
+            visuals_columns=0,
+            tonemap_visuals=False,
+            tonemap_view="",
+        )
+
+        images, _, skipped = _process_batch_from_paths_for_ai([image_path], g_inference_engine.input_size, dummy_config)
         if skipped:
             app_logger.warning(f"Failed to process single vector for {image_path}: {skipped[0][1]}")
             return None

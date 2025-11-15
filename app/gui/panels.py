@@ -410,6 +410,14 @@ class ScanOptionsPanel(QGroupBox):
         )
         hashing_grid.addWidget(self.luminance_check, 3, 0, 1, 3)
 
+        self.channel_check = QCheckBox("Compare by individual channels (R,G,B,A)")
+        self.channel_check.setToolTip(
+            "Splits each image into its channels and compares them individually.\n"
+            "Useful for finding textures with packed maps (e.g., metallic, roughness).\n"
+            "Warning: Significantly increases scan time and memory usage."
+        )
+        hashing_grid.addWidget(self.channel_check, 4, 0, 1, 3)
+
         layout.addLayout(hashing_grid)
 
         self.lancedb_in_memory_check = QCheckBox("Use in-memory database (fastest)")
@@ -451,6 +459,7 @@ class ScanOptionsPanel(QGroupBox):
         self.perceptual_duplicates_check.toggled.connect(self.settings_manager.set_find_perceptual)
         self.phash_threshold_spin.valueChanged.connect(self.settings_manager.set_phash_threshold)
         self.luminance_check.toggled.connect(self.settings_manager.set_compare_by_luminance)
+        self.channel_check.toggled.connect(self.settings_manager.set_compare_by_channel)
         self.lancedb_in_memory_check.toggled.connect(self.settings_manager.set_lancedb_in_memory)
         self.save_visuals_check.toggled.connect(self.settings_manager.set_save_visuals)
         self.visuals_tonemap_check.toggled.connect(self.settings_manager.set_visuals_tonemap)
@@ -512,6 +521,7 @@ class ScanOptionsPanel(QGroupBox):
         self.dhash_threshold_spin.setValue(s.hashing.dhash_threshold)
         self.phash_threshold_spin.setValue(s.hashing.phash_threshold)
         self.luminance_check.setChecked(s.hashing.compare_by_luminance)
+        self.channel_check.setChecked(s.hashing.compare_by_channel)
         self._update_hashing_options_state()
 
         self.lancedb_in_memory_check.setChecked(s.lancedb_in_memory)
@@ -1335,7 +1345,7 @@ class ImageViewerPanel(QGroupBox):
     def _on_compare_tonemap_changed(self, checked: bool):
         self.tonemap_view_combo.setEnabled(checked)
         self.tonemap_view_label.setEnabled(checked)
-        if self.compare_container.isVisible() and len(self.state.get_candidate_paths()) == 2:
+        if self.compare_container.isVisible() and len(self.state.get_candidates()) == 2:
             self._show_comparison_view()
 
     @Slot(str)
@@ -1408,10 +1418,13 @@ class ImageViewerPanel(QGroupBox):
 
     @Slot(str, str)
     def _on_candidate_updated(self, added_path: str, removed_path: str):
-        for path_str in [added_path, removed_path]:
-            if path_str and (row := self.model.get_row_for_path(Path(path_str))) is not None:
-                index = self.model.index(row, 0)
-                self.list_view.update(index)
+        paths_to_update = {p for p in [added_path, removed_path] if p}
+        for path_str in paths_to_update:
+            for row in range(self.model.rowCount()):
+                item = self.model.items[row]
+                if str(item.path) == path_str:
+                    index = self.model.index(row, 0)
+                    self.list_view.update(index)
 
     @Slot(int)
     def _update_compare_button(self, count):
@@ -1419,7 +1432,7 @@ class ImageViewerPanel(QGroupBox):
         self.compare_button.setEnabled(count == 2)
 
     def _show_comparison_view(self):
-        if len(self.state.get_candidate_paths()) != 2:
+        if len(self.state.get_candidates()) != 2:
             return
         self._set_view_mode(is_list=False)
         tonemap_mode = TonemapMode.ENABLED.value if self.compare_tonemap_check.isChecked() else TonemapMode.NONE.value
@@ -1429,9 +1442,11 @@ class ImageViewerPanel(QGroupBox):
 
     @Slot(str, QPixmap)
     def _on_full_res_image_loaded(self, path_str: str, pixmap: QPixmap):
-        paths = self.state.get_candidate_paths()
-        if len(paths) < 2:
+        candidates = self.state.get_candidates()
+        if len(candidates) < 2:
             return
+
+        paths = [str(node.path) for node in candidates]
         if path_str == paths[0]:
             self.compare_view_1.setPixmap(pixmap)
         elif path_str == paths[1]:

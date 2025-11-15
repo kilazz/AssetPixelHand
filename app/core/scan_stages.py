@@ -13,7 +13,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 import numba
 import numpy as np
@@ -81,7 +81,6 @@ def _find_hash_edges_numba(hashes: np.ndarray, threshold: int) -> tuple[np.ndarr
         for j in range(i + 1, n):
             distance = _popcount(hashes[i] ^ hashes[j])
             if distance <= threshold:
-                # Explicitly cast `i` and `j` to int64 to suppress the warning
                 rows_list[i].append(np.int64(i))
                 cols_list[i].append(np.int64(j))
 
@@ -133,7 +132,8 @@ PHASH_THRESHOLD = 3
 MAX_CLUSTER_SIZE = 500
 
 
-class EvidenceRecord(NamedTuple):
+@dataclass(frozen=True)
+class EvidenceRecord:
     method: str
     confidence: float
     direct: bool
@@ -333,6 +333,7 @@ class ScanContext:
     files_to_process: list[Path] = field(default_factory=list)
     cluster_manager: PrecisionClusterManager = field(default_factory=PrecisionClusterManager)
     all_skipped_files: list[str] = field(default_factory=list)
+    ai_links: list[tuple] = field(default_factory=list)
 
 
 class ScanStage(ABC):
@@ -485,27 +486,19 @@ class PerceptualDuplicateStage(ScanStage):
     def _find_hash_components_fast(
         self, paths: tuple[Path, ...], hashes: tuple[Any, ...], threshold: int
     ) -> dict[int, list[Path]]:
-        """
-        Finds connected components of hashes based on Hamming distance threshold.
-        This method is fast, in-memory, and optimized with Numba.
-        """
         n = len(paths)
         if not hashes or n < 2:
             return {i: [p] for i, p in enumerate(paths)}
 
-        # 1. Convert imagehash objects to a NumPy array of uint64.
         uint64_hashes = np.array(
             [int("".join(row.astype(int).astype(str)), 2) for row in (h.hash.flatten() for h in hashes)],
             dtype=np.uint64,
         )
-
-        # 2. Call the JIT-compiled function to find all pairs (graph edges).
         rows, cols = _find_hash_edges_numba(uint64_hashes, threshold)
 
-        if not rows.size:  # Check if the array is empty
+        if not rows.size:
             return {i: [Path(p)] for i, p in enumerate(paths)}
 
-        # 3. Build the graph and find connected components.
         if not SCIPY_AVAILABLE:
             app_logger.warning("Scipy not available, pHash/dHash clustering will be incomplete.")
             components = defaultdict(list)
@@ -525,10 +518,7 @@ class PerceptualDuplicateStage(ScanStage):
         return components
 
     def _find_hash_components_lancedb(self, *args, **kwargs):
-        """DEPRECATED: This method is slow and has been replaced by _find_hash_components_fast."""
-        raise NotImplementedError(
-            "The LanceDB method for pHash/dHash clustering is deprecated in favor of the faster Numba-based method."
-        )
+        raise NotImplementedError()
 
 
 class FingerprintGenerationStage(ScanStage):
@@ -541,6 +531,26 @@ class FingerprintGenerationStage(ScanStage):
             context.signals.log_message.emit("No new unique images found for AI processing.", "info")
             return True
 
+        from app.image_io import get_image_metadata
+
+        files_to_process_now = []
+        for path in context.files_to_process:
+            if path not in context.all_image_fps:
+                meta = get_image_metadata(path)
+                if meta:
+                    context.all_image_fps[path] = ImageFingerprint(path=path, hashes=np.array([]), **meta)
+                    files_to_process_now.append(path)
+                else:
+                    context.all_skipped_files.append(str(path))
+                    app_logger.warning(f"Could not create initial fingerprint for {path.name}, skipping from AI stage.")
+            else:
+                files_to_process_now.append(path)
+
+        context.files_to_process = files_to_process_now
+        if not context.files_to_process:
+            context.signals.log_message.emit("All remaining files failed metadata extraction.", "warning")
+            return True
+
         pipeline_manager = PipelineManager(
             config=context.config,
             state=context.state,
@@ -548,7 +558,7 @@ class FingerprintGenerationStage(ScanStage):
             lancedb_table=context.scanner_core.table,
             stop_event=context.stop_event,
         )
-        success, skipped = pipeline_manager.run(context)  # Pass context here
+        success, skipped = pipeline_manager.run(context)
         context.all_skipped_files.extend(skipped)
         return success
 
@@ -590,8 +600,18 @@ class AILinkingStage(ScanStage):
         sim_engine = LanceDBSimilarityEngine(
             context.config, context.state, context.signals, context.scanner_core.db, context.scanner_core.table
         )
-        for path1, path2, dist in sim_engine.find_similar_pairs(context.stop_event):
-            if context.stop_event.is_set():
-                return False
-            context.cluster_manager.add_evidence(Path(path1), Path(path2), EvidenceMethod.AI.value, dist)
+
+        # In channel mode, collect all raw links into the context attribute
+        if context.config.compare_by_channel:
+            for link_tuple in sim_engine.find_similar_pairs(context.stop_event):
+                if context.stop_event.is_set():
+                    return False
+                context.ai_links.append(link_tuple)
+        # Use the standard ClusterManager for normal duplicate finding mode
+        else:
+            for path1, _ch1, path2, _ch2, dist in sim_engine.find_similar_pairs(context.stop_event):
+                if context.stop_event.is_set():
+                    return False
+                context.cluster_manager.add_evidence(Path(path1), Path(path2), EvidenceMethod.AI.value, dist)
+
         return not context.stop_event.is_set()

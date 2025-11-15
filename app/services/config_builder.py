@@ -63,6 +63,7 @@ class ScanConfigBuilder:
             find_perceptual_duplicates=self.settings.hashing.find_perceptual,
             phash_threshold=self.settings.hashing.phash_threshold,
             compare_by_luminance=self.settings.hashing.compare_by_luminance,
+            compare_by_channel=self.settings.hashing.compare_by_channel,
             lancedb_in_memory=self.settings.lancedb_in_memory,
             save_visuals=self.settings.visuals.save,
             max_visuals=int(self.settings.visuals.max_count),

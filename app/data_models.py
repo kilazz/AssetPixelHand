@@ -45,6 +45,7 @@ FINGERPRINT_FIELDS = {
     "mipmap_count": {"pyarrow": pa.int32(), "duckdb": "INTEGER"},
     "texture_type": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
     "color_space": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
+    "channel": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
 }
 
 
@@ -86,19 +87,24 @@ class ImageFingerprint:
     xxhash: str | None = field(default=None)
     dhash: Any | None = field(default=None)
     phash: Any | None = field(default=None)
+    channel: str | None = field(default=None)
 
     def __hash__(self) -> int:
-        return hash(self.path)
+        # Define a stable hash based on path and channel
+        return hash((self.path, self.channel))
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, ImageFingerprint):
-            return self.path == other.path
+            return self.path == other.path and self.channel == other.channel
         return NotImplemented
 
-    def to_lancedb_dict(self) -> dict[str, Any]:
+    def to_lancedb_dict(self, channel: str | None = None) -> dict[str, Any]:
         """Converts the object to a dictionary suitable for writing to LanceDB."""
+        # Use the passed channel argument, which comes from the pipeline
+        final_channel = channel or self.channel
+
         data = {
-            "id": str(uuid.uuid5(uuid.NAMESPACE_URL, str(self.path))),
+            "id": str(uuid.uuid5(uuid.NAMESPACE_URL, str(self.path) + (final_channel or ""))),
             "vector": self.hashes,
             "path": str(self.path),
             "resolution_w": int(self.resolution[0]),
@@ -114,6 +120,7 @@ class ImageFingerprint:
             "mipmap_count": int(self.mipmap_count),
             "texture_type": str(self.texture_type),
             "color_space": str(self.color_space) if self.color_space is not None else None,
+            "channel": final_channel,
         }
         return data
 
@@ -123,7 +130,7 @@ class ImageFingerprint:
         vector_data = row.get("vector")
         hashes = np.array(vector_data) if vector_data is not None else np.array([])
 
-        return cls(
+        fp = cls(
             path=Path(row["path"]),
             hashes=hashes,
             resolution=(row["resolution_w"], row["resolution_h"]),
@@ -139,6 +146,10 @@ class ImageFingerprint:
             texture_type=row.get("texture_type", "2D"),
             color_space=row.get("color_space", "sRGB"),
         )
+        # Also assign channel if it exists in the row
+        if "channel" in row:
+            fp.channel = row["channel"]
+        return fp
 
 
 # Type Aliases for Clarity
@@ -149,7 +160,7 @@ SearchResult = list[tuple[ImageFingerprint, float]]
 
 
 # Type-safe nodes for the results tree view model
-@dataclass
+@dataclass(frozen=True)
 class ResultNode:
     path: str
     is_best: bool
@@ -169,6 +180,7 @@ class ResultNode:
     texture_type: str
     color_space: str | None
     found_by: str
+    channel: str | None = None
     type: str = "result"
 
     @classmethod
@@ -225,6 +237,7 @@ class ScanConfig:
     find_perceptual_duplicates: bool
     phash_threshold: int
     compare_by_luminance: bool
+    compare_by_channel: bool
     lancedb_in_memory: bool
     visuals_columns: int
     tonemap_visuals: bool
@@ -242,6 +255,7 @@ class HashingSettings:
     find_perceptual: bool = True
     phash_threshold: int = 8
     compare_by_luminance: bool = False
+    compare_by_channel: bool = False
 
 
 @dataclass
@@ -303,6 +317,7 @@ class AppSettings:
                     "find_perceptual": data.pop("find_perceptual_duplicates", True),
                     "phash_threshold": data.pop("phash_threshold", 8),
                     "compare_by_luminance": data.pop("compare_by_luminance", False),
+                    "compare_by_channel": data.pop("compare_by_channel", False),
                 }
             if "perf_num_workers" in data:
                 data["performance"] = {

@@ -8,10 +8,10 @@ import multiprocessing
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
-import polars as pl
 import pyarrow as pa
 
 from app.constants import BEST_FILE_METHOD_NAME, DUCKDB_AVAILABLE, RESULTS_DB_FILE
@@ -24,6 +24,7 @@ from app.data_models import (
 )
 from app.image_io import get_image_metadata
 from app.services.signal_bus import SignalBus
+from app.utils import find_best_in_group
 
 from .engines import LanceDBSimilarityEngine
 from .helpers import FileFinder
@@ -136,7 +137,11 @@ class ScanStrategy(ABC):
         """Prepare results data as a list of dictionaries for PyArrow."""
         data = []
         for i, (best_fp, dups) in enumerate(final_groups.items(), 1):
-            data.append(self._create_result_row(i, True, best_fp, -1, search_context, BEST_FILE_METHOD_NAME))
+            group_context = search_context
+            if not group_context and best_fp.channel:
+                group_context = f"channel:{best_fp.channel}"
+
+            data.append(self._create_result_row(i, True, best_fp, -1, group_context, BEST_FILE_METHOD_NAME))
             for dup_fp, dist, method in dups:
                 data.append(self._create_result_row(i, False, dup_fp, dist, None, method))
         return data
@@ -156,6 +161,8 @@ class ScanStrategy(ABC):
                 row_data[field_name] = fp.resolution[0]
             elif field_name == "resolution_h":
                 row_data[field_name] = fp.resolution[1]
+            elif field_name == "channel":
+                row_data[field_name] = fp.channel if hasattr(fp, "channel") else None
             else:
                 row_data[field_name] = getattr(fp, field_name, None)
 
@@ -200,10 +207,94 @@ class FindDuplicatesStrategy(ScanStrategy):
         self.all_skipped_files.extend(context.all_skipped_files)
 
         if not stop_event.is_set():
-            final_groups = context.cluster_manager.get_final_groups(context.all_image_fps)
+            if context.config.compare_by_channel:
+                final_groups = self._process_channel_results(context)
+            else:
+                final_groups = context.cluster_manager.get_final_groups(context.all_image_fps)
             self._report_and_cleanup(final_groups, start_time)
         else:
             self._report_and_cleanup({}, start_time)
+
+    def _process_channel_results(self, context: ScanContext) -> DuplicateResults:
+        """
+        Processes results for channel-comparison mode by finding connected components
+        of similar channels from the raw AI links.
+        """
+        import copy
+
+        app_logger.info("Processing channel-comparison results from raw AI links using connected components.")
+
+        raw_links = context.ai_links
+        if not raw_links:
+            return {}
+
+        nodes = set()
+        edges = []
+        evidence_map = {}
+        all_fps = context.all_image_fps
+
+        for p1_str, ch1, p2_str, ch2, dist in raw_links:
+            node1, node2 = (Path(p1_str), ch1), (Path(p2_str), ch2)
+            nodes.add(node1)
+            nodes.add(node2)
+            edges.append((node1, node2))
+            evidence_map[tuple(sorted((node1, node2)))] = dist
+
+        adj = defaultdict(list)
+        for u, v in edges:
+            adj[u].append(v)
+            adj[v].append(u)
+
+        visited = set()
+        components = []
+        for node in nodes:
+            if node not in visited:
+                component = []
+                stack = [node]
+                visited.add(node)
+                while stack:
+                    curr = stack.pop()
+                    component.append(curr)
+                    for neighbor in adj[curr]:
+                        if neighbor not in visited:
+                            visited.add(neighbor)
+                            stack.append(neighbor)
+                if len(component) > 1:
+                    components.append(component)
+
+        final_groups = {}
+        for component in components:
+            pseudo_fps = []
+            for path, channel in component:
+                if real_fp := all_fps.get(path):
+                    pseudo_fp = copy.copy(real_fp)
+                    pseudo_fp.channel = channel
+                    pseudo_fps.append(pseudo_fp)
+
+            if not pseudo_fps:
+                continue
+
+            best_fp = find_best_in_group(pseudo_fps)
+            best_node = (best_fp.path, best_fp.channel)
+
+            duplicates = set()
+            for dup_fp in pseudo_fps:
+                if dup_fp.path == best_fp.path and dup_fp.channel == best_fp.channel:
+                    continue
+
+                dup_node = (dup_fp.path, dup_fp.channel)
+
+                key = tuple(sorted((best_node, dup_node)))
+                dist = evidence_map.get(key)
+
+                score = int(max(0.0, (1.0 - dist) * 100)) if dist is not None else 0
+
+                duplicates.add((dup_fp, score, EvidenceMethod.AI.value))
+
+            if duplicates:
+                final_groups[best_fp] = duplicates
+
+        return final_groups
 
     def _report_and_cleanup(self, final_groups: DuplicateResults, start_time: float):
         num_found = sum(len(d) for d in final_groups.values())
@@ -279,15 +370,16 @@ class SearchStrategy(ScanStrategy):
             return None, None
 
         sim_engine = LanceDBSimilarityEngine(self.config, self.state, self.signals, self.scanner_core.db, self.table)
-        raw_hits = (
-            self.table.search(query_vector)
+
+        # Use radius search here as well for consistency and correctness
+        hits = (
+            self.table.search(query_vector, radius=sim_engine.distance_threshold)
             .metric("cosine")
-            .limit(1000)
+            .limit(1000)  # Keep limit as a safety cap
             .nprobes(sim_engine.nprobes)
             .refine_factor(sim_engine.refine_factor)
             .to_polars()
         )
-        hits = raw_hits.filter(pl.col("_distance") < sim_engine.distance_threshold)
 
         results = [
             (ImageFingerprint.from_db_row(row_dict), row_dict["_distance"]) for row_dict in hits.iter_rows(named=True)

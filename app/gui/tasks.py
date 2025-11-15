@@ -94,7 +94,6 @@ class ModelConverter(QRunnable):
                 self.signals.log.emit("Converting model to FP16 precision...", "info")
                 model.half()
 
-            # Read the 'use_dynamo' flag from the model's configuration.
             use_dynamo = self.model_info.get("use_dynamo", False)
             if use_dynamo:
                 self.signals.log.emit("Using modern Dynamo exporter for this model.", "info")
@@ -129,43 +128,33 @@ class ModelConverter(QRunnable):
         return target_dir
 
     def _export_with_dynamo(self, model, processor, target_dir, torch: "torch", Image: "Image"):
-        """Exports compatible models (like DINOv2) using the modern Dynamo backend."""
         import torch._dynamo
         from torch.export import Dim
 
-        # This is the "expert mode" flag to bypass the ConstraintViolationError.
         torch._dynamo.config.suppress_errors = True
-
-        # Opset 18 is known to be compatible with DINOv2 on DirectML.
         opset_version = 18
-
         self.signals.log.emit(f"Exporting vision model (opset {opset_version}) via Dynamo...", "info")
 
         vision_wrapper = self.adapter.get_vision_wrapper(model, torch)
         input_size = self.adapter.get_input_size(processor)
         dummy_input = processor(images=Image.new("RGB", input_size), return_tensors="pt")
 
-        # TRICK: Trace with a batch of 2 to force Dynamo to handle dynamic batch sizes.
         pixel_values = dummy_input["pixel_values"].repeat(2, 1, 1, 1)
         if self.quant_mode == QuantizationMode.FP16:
             pixel_values = pixel_values.half()
 
         torch.onnx.export(
             vision_wrapper,
-            (pixel_values,),  # Pass args as a tuple for Dynamo
+            (pixel_values,),
             str(target_dir / "visual.onnx"),
             input_names=["pixel_values"],
             output_names=["image_embeds"],
             dynamic_shapes={"pixel_values": {0: Dim("batch_size", min=1)}},
             opset_version=opset_version,
         )
-        # Text model is not exported here as this path is only for vision-only models like DINOv2
 
     def _export_with_legacy(self, model, processor, target_dir, torch: "torch", Image: "Image"):
-        """Exports models using the stable, TorchScript-based legacy exporter."""
-        # Opset 18 is the highest stable version for the legacy exporter.
         opset_version = 18
-
         self.signals.log.emit(f"Exporting vision model (opset {opset_version}) via legacy exporter...", "info")
 
         vision_wrapper = self.adapter.get_vision_wrapper(model, torch)
@@ -177,7 +166,7 @@ class ModelConverter(QRunnable):
 
         torch.onnx.export(
             vision_wrapper,
-            pixel_values,  # Pass tensor directly for legacy
+            pixel_values,
             str(target_dir / "visual.onnx"),
             input_names=["pixel_values"],
             output_names=["image_embeds"],
@@ -240,6 +229,7 @@ class ImageLoader(QRunnable):
         receiver: QObject | None = None,
         on_finish_slot=None,
         on_error_slot=None,
+        channel_to_load: str | None = None,
     ):
         super().__init__()
         self.setAutoDelete(True)
@@ -252,6 +242,7 @@ class ImageLoader(QRunnable):
         self.receiver = receiver
         self.on_finish_slot = on_finish_slot
         self.on_error_slot = on_error_slot
+        self.channel_to_load = channel_to_load
 
     @property
     def is_cancelled(self) -> bool:
@@ -263,30 +254,51 @@ class ImageLoader(QRunnable):
                 return
 
             pil_img = None
-            cache_key = get_thumbnail_cache_key(self.path_str, self.mtime, self.target_size, self.tonemap_mode)
+            cache_key = get_thumbnail_cache_key(
+                self.path_str, self.mtime, self.target_size, self.tonemap_mode, self.channel_to_load
+            )
 
-            cached_data = thumbnail_cache.get(cache_key)
-            if cached_data:
-                try:
-                    pil_img = Image.open(io.BytesIO(cached_data))
-                except Exception as e:
-                    app_logger.warning(f"Could not load from thumbnail cache for {self.path_str}: {e}")
-                    pil_img = None
+            if self.use_cache:
+                cached_data = thumbnail_cache.get(cache_key)
+                if cached_data:
+                    try:
+                        pil_img = Image.open(io.BytesIO(cached_data))
+                    except Exception as e:
+                        app_logger.warning(f"Could not load from thumbnail cache for {self.path_str}: {e}")
+                        pil_img = None
 
             if pil_img is None:
-                pil_img = load_image(
+                full_pil_img = load_image(
                     self.path_str,
-                    target_size=(self.target_size, self.target_size) if self.target_size else None,
+                    target_size=None,
                     tonemap_mode=self.tonemap_mode,
                 )
 
-                if pil_img and not self.is_cancelled:
-                    try:
-                        buffer = io.BytesIO()
-                        pil_img.save(buffer, "WEBP", quality=90)
-                        thumbnail_cache.put(cache_key, buffer.getvalue())
-                    except Exception as e:
-                        app_logger.warning(f"Could not save thumbnail to cache for {self.path_str}: {e}")
+                if full_pil_img:
+                    if self.channel_to_load:
+                        full_pil_img = full_pil_img.convert("RGBA")
+                        channels = full_pil_img.split()
+                        channel_map = {"R": 0, "G": 1, "B": 2, "A": 3}
+                        channel_index = channel_map.get(self.channel_to_load)
+
+                        if channel_index is not None and channel_index < len(channels):
+                            single_channel = channels[channel_index]
+                            pil_img = Image.merge("RGB", (single_channel, single_channel, single_channel))
+                        else:
+                            pil_img = full_pil_img.convert("RGB")
+                    else:
+                        pil_img = full_pil_img.convert("RGBA")
+
+                    if self.target_size:
+                        pil_img.thumbnail((self.target_size, self.target_size), Image.Resampling.LANCZOS)
+
+                    if self.use_cache and not self.is_cancelled:
+                        try:
+                            buffer = io.BytesIO()
+                            pil_img.save(buffer, "WEBP", quality=90)
+                            thumbnail_cache.put(cache_key, buffer.getvalue())
+                        except Exception as e:
+                            app_logger.warning(f"Could not save thumbnail to cache for {self.path_str}: {e}")
 
             if self.is_cancelled:
                 return
@@ -356,7 +368,8 @@ class GroupFetcherTask(QRunnable):
                 for row_tuple in conn.execute(query, [self.group_id]).fetchall():
                     child_dict = dict(zip(cols, row_tuple, strict=False))
                     if Path(child_dict["path"]).exists():
-                        child_dict["distance"] = int(child_dict.get("distance", -1) or -1)
+                        dist_val = child_dict.get("distance")
+                        child_dict["distance"] = int(dist_val) if dist_val is not None else -1
                         children.append(child_dict)
                     else:
                         app_logger.info(f"Stale file reference found and removed from view: {child_dict['path']}")

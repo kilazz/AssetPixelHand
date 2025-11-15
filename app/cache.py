@@ -380,8 +380,11 @@ class DummyThumbnailCache(AbstractThumbnailCache):
 thumbnail_cache: AbstractThumbnailCache = DummyThumbnailCache()
 
 
-def get_thumbnail_cache_key(path_str: str, mtime: float, target_size: int, tonemap_mode: str) -> str:
-    key_str = f"{path_str}|{mtime}|{target_size}|{tonemap_mode}"
+def get_thumbnail_cache_key(
+    path_str: str, mtime: float, target_size: int, tonemap_mode: str, channel_to_load: str | None
+) -> str:
+    """Generates a unique cache key that includes the specific channel to be loaded."""
+    key_str = f"{path_str}|{mtime}|{target_size}|{tonemap_mode}|{channel_to_load or 'full'}"
     return hashlib.sha1(key_str.encode()).hexdigest()
 
 

@@ -105,6 +105,12 @@ class SettingsManager(QObject):
             self._request_save()
 
     @Slot(bool)
+    def set_compare_by_channel(self, checked: bool):
+        if self._settings.hashing.compare_by_channel != checked:
+            self._settings.hashing.compare_by_channel = checked
+            self._request_save()
+
+    @Slot(bool)
     def set_lancedb_in_memory(self, checked: bool):
         if self._settings.lancedb_in_memory != checked:
             self._settings.lancedb_in_memory = checked

@@ -221,7 +221,7 @@ SEARCH_PRECISION_PRESETS = {
     "Exhaustive (Slow)": {"nprobes": 256, "refine_factor": 20},
 }
 DEFAULT_SEARCH_PRECISION = "Balanced (Default)"
-SIMILARITY_SEARCH_K_NEIGHBORS = 100
+SIMILARITY_SEARCH_K_NEIGHBORS = 10000
 
 
 class CompareMode(Enum):

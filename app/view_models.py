@@ -31,7 +31,7 @@ class ImageComparerState(QObject):
         """
         super().__init__()
         self.thread_pool = thread_pool
-        self._candidates: OrderedDict[str, ResultNode] = OrderedDict()
+        self._candidates: OrderedDict[ResultNode, None] = OrderedDict()
         self._pil_images: dict[str, Image.Image] = {}
         self._active_loaders: dict[str, ImageLoader] = {}
 
@@ -39,33 +39,34 @@ class ImageComparerState(QObject):
         """Adds or removes an item from the comparison candidates list.
         Maintains a maximum of two candidates and emits signals for UI updates.
         """
-        path_str = item_data.path
-        is_currently_candidate = path_str in self._candidates
+        is_currently_candidate = item_data in self._candidates
 
-        added_path, removed_path = "", ""
+        added_node, removed_node = None, None
 
         if is_currently_candidate:
-            # Remove the item
-            del self._candidates[path_str]
-            removed_path = path_str
+            del self._candidates[item_data]
+            removed_node = item_data
         else:
-            # Add the item
-            self._candidates[path_str] = item_data
-            added_path = path_str
+            self._candidates[item_data] = None
+            added_node = item_data
             if len(self._candidates) > 2:
-                # If we've added a 3rd, remove the oldest one
-                oldest_path, _ = self._candidates.popitem(last=False)
-                removed_path = oldest_path
+                # If we've added a 3rd, remove the oldest one (FIFO)
+                removed_node, _ = self._candidates.popitem(last=False)
 
         self.candidates_changed.emit(len(self._candidates))
+
+        # The view listens to this signal to know which rows to redraw.
+        # Sending the original path string is sufficient for this.
+        added_path = str(added_node.path) if added_node else ""
+        removed_path = str(removed_node.path) if removed_node else ""
         self.candidate_updated.emit(added_path, removed_path)
 
-    def is_candidate(self, path_str: str) -> bool:
-        """Checks if a given path is currently a comparison candidate."""
-        return path_str in self._candidates
+    def is_candidate(self, item_data: ResultNode) -> bool:
+        """Checks if a given ResultNode is currently a comparison candidate."""
+        return item_data in self._candidates
 
-    def get_candidate_paths(self) -> list[str]:
-        """Returns the paths of the current comparison candidates."""
+    def get_candidates(self) -> list[ResultNode]:
+        """Returns the list of current comparison candidates."""
         return list(self._candidates.keys())
 
     def clear_candidates(self):
@@ -73,35 +74,37 @@ class ImageComparerState(QObject):
         if not self._candidates:
             return
 
-        removed_paths = list(self._candidates.keys())
+        removed_nodes = self.get_candidates()
         self._candidates.clear()
-
         self.candidates_changed.emit(0)
-        # Notify UI to un-highlight all previously selected items
-        if len(removed_paths) == 1:
-            self.candidate_updated.emit("", removed_paths[0])
-        elif len(removed_paths) == 2:
-            self.candidate_updated.emit(removed_paths[0], removed_paths[1])
+
+        # Notify UI to update all previously selected items
+        for node in removed_nodes:
+            self.candidate_updated.emit("", str(node.path))
 
     def load_full_res_images(self, tonemap_mode: str):
-        """Starts loading full-resolution images for the selected candidates in the background."""
+        """Starts loading full-resolution, full-color images for the selected candidates."""
         self.stop_loaders()
         self._pil_images.clear()
 
-        if len(self._candidates) != 2:
+        candidates = self.get_candidates()
+        if len(candidates) != 2:
             return
 
         self.images_loading.emit()
-        for path_str, item_data in self._candidates.items():
+        for node in candidates:
+            # IMPORTANT: Use the original path and force full-color loading by setting channel_to_load=None.
+            path_str = str(node.path)
             loader = ImageLoader(
                 path_str=path_str,
-                mtime=item_data.mtime,
+                mtime=node.mtime,
                 target_size=None,  # Load full resolution
                 tonemap_mode=tonemap_mode,
                 use_cache=False,  # Always reload full-res to apply new settings
                 receiver=self,
                 on_finish_slot="_on_image_loaded",
                 on_error_slot="_on_load_error",
+                channel_to_load=None,  # This ensures the original color image is loaded
             )
             self._active_loaders[path_str] = loader
             self.thread_pool.start(loader)
@@ -136,8 +139,10 @@ class ImageComparerState(QObject):
             self.load_complete.emit()
 
     def get_pil_images(self) -> list[Image.Image]:
-        """Returns the loaded PIL images for processing, ensuring correct order."""
-        return [self._pil_images[path] for path in self.get_candidate_paths() if path in self._pil_images]
+        """Returns the loaded PIL images for processing, ensuring correct selection order."""
+        return [
+            self._pil_images[str(node.path)] for node in self.get_candidates() if str(node.path) in self._pil_images
+        ]
 
     def stop_loaders(self):
         """Cancels all currently active image loading tasks."""

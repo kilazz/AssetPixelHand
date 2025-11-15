@@ -4,6 +4,7 @@ Contains the PipelineManager, which encapsulates the entire logic for running
 the multi-process fingerprinting pipeline for both CPU and GPU.
 """
 
+import copy
 import logging
 import multiprocessing
 import os
@@ -108,7 +109,9 @@ class PipelineManager(QObject):
 
         is_fp16 = FP16_MODEL_SUFFIX in self.config.model_name.lower()
         dtype = np.float16 if is_fp16 else np.float32
-        buffer_shape = (self.config.perf.batch_size, 3, *input_size)
+
+        batch_multiplier = 4 if self.config.compare_by_channel else 1
+        buffer_shape = (self.config.perf.batch_size * batch_multiplier, 3, *input_size)
         return input_size, buffer_shape, dtype
 
     def _setup_communication(self, num_files: int) -> tuple:
@@ -124,7 +127,9 @@ class PipelineManager(QObject):
         for mem in self.shared_mem_buffers:
             free_buffers_q.put(mem.name)
         tensor_q = self.ctx.Queue(maxsize=num_buffers)
-        results_q = self.ctx.Queue(maxsize=num_files + 1)
+
+        queue_size_multiplier = 4 if self.config.compare_by_channel else 1
+        results_q = self.ctx.Queue(maxsize=(num_files * queue_size_multiplier) + 1)
         return free_buffers_q, tensor_q, results_q
 
     def _start_inference_process(self, tensor_q, results_q, free_buffers_q) -> "multiprocessing.Process":
@@ -179,6 +184,7 @@ class PipelineManager(QObject):
         """The core loop that orchestrates the data flow between workers."""
         total_files, processed_count, fps_to_cache, all_skipped = len(context.files_to_process), 0, [], []
         feeding_complete = False
+        processed_paths = set()
 
         while processed_count < total_files:
             if self.stop_event.is_set() or not self.infer_proc.is_alive():
@@ -195,20 +201,20 @@ class PipelineManager(QObject):
                     feeding_complete = True
 
             processed_now, should_break = self._process_gpu_results_queue(
-                results_q, cache, fps_to_cache, all_skipped, context
+                results_q, cache, fps_to_cache, all_skipped, context, processed_paths
             )
             if processed_now > 0:
-                processed_count += processed_now
+                processed_count = len(processed_paths)
                 self.state.update_progress(processed_count, total_files)
             if should_break:
                 break
 
         while True:
             processed_now, should_break = self._process_gpu_results_queue(
-                results_q, cache, fps_to_cache, all_skipped, context, timeout=1.0
+                results_q, cache, fps_to_cache, all_skipped, context, processed_paths, timeout=1.0
             )
             if processed_now > 0:
-                processed_count += processed_now
+                processed_count = len(processed_paths)
                 self.state.update_progress(processed_count, total_files)
             if should_break or processed_now == 0:
                 break
@@ -218,57 +224,71 @@ class PipelineManager(QObject):
         return processed_count, all_skipped
 
     def _process_gpu_results_queue(
-        self, results_q, cache, fps_to_cache, all_skipped, context: "ScanContext", timeout=0.01
+        self, results_q, cache, fps_to_cache, all_skipped, context: "ScanContext", processed_paths: set, timeout=0.01
     ) -> tuple[int, bool]:
         """Processes one batch of results from the GPU worker's queue."""
         processed_count = 0
         try:
             gpu_result = results_q.get(timeout=timeout)
             if gpu_result is None:
-                return 0, True  # Sentinel received, break the loop.
+                return 0, True
 
             batch_results, skipped_items = gpu_result
-            self._handle_batch_results(batch_results, skipped_items, cache, fps_to_cache, context)
+            self._handle_batch_results(batch_results, skipped_items, cache, fps_to_cache, context, processed_paths)
             all_skipped.extend([path for path, _ in skipped_items])
             processed_count += len(batch_results) + len(skipped_items)
 
         except Empty:
-            pass  # No results available, continue.
+            pass
 
         return processed_count, False
 
-    def _handle_batch_results(self, batch_results, skipped_items, cache, fps_to_cache, context: "ScanContext"):
+    def _handle_batch_results(
+        self, batch_results, skipped_items, cache, fps_to_cache, context: "ScanContext", processed_paths: set
+    ):
         """
-        Processes a batch of results from the inference worker by UPDATING
-        the existing ImageFingerprint objects in the ScanContext.
+        Processes a batch of results from the inference worker, creating copies of
+        ImageFingerprint objects for each channel to avoid race conditions.
         """
-        updated_fps = []
-        for path_str, vector in batch_results.items():
+        updated_fps_with_channels = []
+        for (path_str, channel), vector in batch_results.items():
             path = Path(path_str)
+            processed_paths.add(path)
             if path in context.all_image_fps:
-                # Find the existing fingerprint object and update it with the AI vector
-                fp = context.all_image_fps[path]
-                fp.hashes = vector
-                updated_fps.append(fp)
+                # Create a shallow copy to avoid overwriting the 'hashes' attribute
+                # of the same object in a loop. This is the critical fix.
+                fp_orig = context.all_image_fps[path]
+                fp_copy = copy.copy(fp_orig)
+                fp_copy.hashes = vector  # Assign the vector to the copy
+                updated_fps_with_channels.append((fp_copy, channel))
             else:
                 app_logger.warning(f"Received AI vector for an unknown path: {path_str}. Skipping.")
 
         for path_str, reason in skipped_items:
-            self.signals.log_message.emit(f"Skipped {Path(path_str).name}: {reason}", "warning")
+            path = Path(path_str)
+            processed_paths.add(path)
+            self.signals.log_message.emit(f"Skipped {path.name}: {reason}", "warning")
 
-        if updated_fps:
-            self._add_to_lancedb(updated_fps)
-            fps_to_cache.extend(updated_fps)
+        if updated_fps_with_channels:
+            self._add_to_lancedb(updated_fps_with_channels)
+
+            unique_fps = list({fp for fp, _ in updated_fps_with_channels})
+            fps_to_cache.extend(unique_fps)
+
             if len(fps_to_cache) >= DB_WRITE_BATCH_SIZE:
                 cache.put_many(fps_to_cache)
                 fps_to_cache.clear()
 
-    def _add_to_lancedb(self, fingerprints: list[ImageFingerprint]):
+    def _add_to_lancedb(self, fingerprints_with_channels: list[tuple[ImageFingerprint, str]]):
         """Adds a list of fully populated fingerprints to the LanceDB table."""
-        if not fingerprints or not LANCEDB_AVAILABLE:
+        if not fingerprints_with_channels or not LANCEDB_AVAILABLE:
             return
 
-        data_to_convert = [fp.to_lancedb_dict() for fp in fingerprints if fp.hashes is not None and fp.hashes.size > 0]
+        data_to_convert = [
+            fp.to_lancedb_dict(channel=channel)
+            for fp, channel in fingerprints_with_channels
+            if fp.hashes is not None and fp.hashes.size > 0
+        ]
 
         if not data_to_convert:
             return

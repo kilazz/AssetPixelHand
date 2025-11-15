@@ -151,12 +151,18 @@ class ResultsTreeModel(QAbstractItemModel):
                 for row in conn.execute(group_query, params).fetchall():
                     group_id, count, total_size, search_context = row
                     group_name = find_common_base_name(paths_by_group.get(group_id, []))
+
                     if search_context:
                         count -= 1
                         if search_context.startswith("sample:"):
                             group_name = f"Sample: {search_context.split(':', 1)[1]}"
                         elif search_context.startswith("query:"):
                             group_name = f"Query: '{search_context.split(':', 1)[1]}'"
+                        elif search_context.startswith("channel:"):
+                            channel = search_context.split(":", 1)[1]
+                            base_name = paths_by_group.get(group_id, [Path("Unknown")])[0].name
+                            group_name = f"{base_name} ({channel})"
+
                     self.groups_data[group_id] = GroupNode(
                         name=group_name, count=count, total_size=total_size, group_id=group_id
                     )
@@ -269,19 +275,16 @@ class ResultsTreeModel(QAbstractItemModel):
 
         if role == SortRole:
             if isinstance(node, GroupNode):
-                return -1  # Groups should not be sorted with children
-
+                return -1
             if node.is_best:
-                return 102  # Highest value for "Best"
-
+                return 102
             method = node.found_by
             if method == "xxHash":
-                return 101  # Exact Match
+                return 101
             if method == "dHash":
-                return 100  # Simple Match (Higher)
+                return 100
             if method == "pHash":
-                return 99  # Near-Identical (Lower)
-
+                return 99
             return node.distance
 
         if role == Qt.ItemDataRole.DisplayRole:
@@ -289,23 +292,18 @@ class ResultsTreeModel(QAbstractItemModel):
 
         if role == Qt.ItemDataRole.CheckStateRole and index.column() == 0 and self.hasChildren():
             if isinstance(node, GroupNode):
-                if not node.fetched:
+                if not node.fetched or not node.children:
                     return Qt.CheckState.Unchecked
-
-                if not node.children:
-                    return Qt.CheckState.Unchecked
-
                 checked_count = sum(
                     1 for child in node.children if self.check_states.get(child.path) == Qt.CheckState.Checked
                 )
-
                 if checked_count == 0:
                     return Qt.CheckState.Unchecked
                 elif checked_count == len(node.children):
                     return Qt.CheckState.Checked
                 else:
                     return Qt.CheckState.PartiallyChecked
-            else:  # ResultNode
+            else:
                 return self.check_states.get(node.path, Qt.CheckState.Unchecked)
 
         if (role == Qt.ItemDataRole.FontRole and index.column() == 0) and (
@@ -333,15 +331,18 @@ class ResultsTreeModel(QAbstractItemModel):
         col = index.column()
 
         if col == 0:
-            return path.name
+            display_name = path.name
+            if node.channel:
+                display_name += f" ({node.channel})"
+            return display_name
         elif col == 1:
             if node.is_best:
+                if node.channel:
+                    return f"[{BEST_FILE_METHOD_NAME} - {node.channel}]"
                 return f"[{BEST_FILE_METHOD_NAME}]"
-
             method_map = METHOD_DISPLAY_NAMES
             if display_text := method_map.get(node.found_by):
                 return display_text
-
             return f"{node.distance}%" if node.distance >= 0 else ""
         elif col == 2:
             return str(path.parent)
@@ -526,6 +527,7 @@ class ImagePreviewModel(QAbstractListModel):
         self.tonemap_mode = "none"
         self.target_size = 250
         self.error_paths = {}
+        self.group_base_channel: str | None = None
 
     def set_tonemap_mode(self, mode: str):
         if self.tonemap_mode != mode:
@@ -552,6 +554,7 @@ class ImagePreviewModel(QAbstractListModel):
         self.pixmap_cache.clear()
         self.loading_paths.clear()
         self.error_paths.clear()
+        self.group_base_channel = None
         self.endResetModel()
 
     def set_group(self, db_path: Path, group_id: int):
@@ -562,17 +565,25 @@ class ImagePreviewModel(QAbstractListModel):
         self.pixmap_cache.clear()
         self.loading_paths.clear()
         self.error_paths.clear()
+        self.group_base_channel = None
         if DUCKDB_AVAILABLE and self.group_id != -1:
             try:
                 with duckdb.connect(database=str(self.db_path), read_only=True) as conn:
+                    # Determine the group's context (e.g., which channel it's based on)
+                    group_context_query = "SELECT search_context FROM results WHERE group_id = ? AND is_best = TRUE"
+                    context_result = conn.execute(group_context_query, [self.group_id]).fetchone()
+                    if context_result and context_result[0] and context_result[0].startswith("channel:"):
+                        self.group_base_channel = context_result[0].split(":", 1)[1]
+
                     is_search = conn.execute(
                         "SELECT MAX(search_context) IS NOT NULL FROM results WHERE group_id = ?",
                         [self.group_id],
                     ).fetchone()[0]
                     query = "SELECT * FROM results WHERE group_id = ?"
-                    if is_search:
+                    if is_search and not self.group_base_channel:
                         query += " AND is_best = FALSE"
                     query += " ORDER BY is_best DESC, distance DESC"
+
                     cols = [desc[0] for desc in conn.execute(query, [self.group_id]).description]
                     for row_tuple in conn.execute(query, [self.group_id]).fetchall():
                         row_dict = dict(zip(cols, row_tuple, strict=False))
@@ -591,17 +602,23 @@ class ImagePreviewModel(QAbstractListModel):
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid() or not (0 <= index.row() < len(self.items)):
             return None
+
         item = self.items[index.row()]
         path_str = item.path
+
+        channel_to_load = item.channel
+
+        cache_key = f"{path_str}_{channel_to_load or 'full'}"
+
         if role == Qt.ItemDataRole.UserRole:
             return item
         if role == Qt.ItemDataRole.ToolTipRole:
-            return path_str
+            return f"{path_str}\nChannel: {channel_to_load or 'Full'}"
         if role == Qt.ItemDataRole.DecorationRole:
-            if path_str in self.pixmap_cache:
-                return self.pixmap_cache[path_str]
-            if path_str not in self.loading_paths:
-                self.loading_paths.add(path_str)
+            if cache_key in self.pixmap_cache:
+                return self.pixmap_cache[cache_key]
+            if cache_key not in self.loading_paths:
+                self.loading_paths.add(cache_key)
                 loader = ImageLoader(
                     path_str=path_str,
                     mtime=item.mtime,
@@ -611,6 +628,7 @@ class ImagePreviewModel(QAbstractListModel):
                     receiver=self,
                     on_finish_slot="_on_image_loaded",
                     on_error_slot="_on_image_error",
+                    channel_to_load=channel_to_load,
                 )
                 self.thread_pool.start(loader)
             return None
@@ -618,21 +636,34 @@ class ImagePreviewModel(QAbstractListModel):
 
     @Slot(str, QImage)
     def _on_image_loaded(self, path_str: str, q_img: QImage):
-        if path_str in self.loading_paths:
-            self.loading_paths.remove(path_str)
-        if not q_img.isNull():
-            pixmap = QPixmap.fromImage(q_img)
-            self.pixmap_cache[path_str] = pixmap
-            if len(self.pixmap_cache) > self.CACHE_SIZE_LIMIT:
-                self.pixmap_cache.popitem(last=False)
-            self._emit_data_changed_for_path(path_str)
+        # We need to find which cache_key this belongs to
+        key_to_remove = None
+        for key in self.loading_paths:
+            if key.startswith(path_str):
+                key_to_remove = key
+                break
+
+        if key_to_remove:
+            self.loading_paths.remove(key_to_remove)
+            if not q_img.isNull():
+                pixmap = QPixmap.fromImage(q_img)
+                self.pixmap_cache[key_to_remove] = pixmap
+                if len(self.pixmap_cache) > self.CACHE_SIZE_LIMIT:
+                    self.pixmap_cache.popitem(last=False)
+                self._emit_data_changed_for_path(path_str)
 
     @Slot(str, str)
     def _on_image_error(self, path_str: str, error_msg: str):
-        if path_str in self.loading_paths:
-            self.loading_paths.remove(path_str)
-        self.error_paths[path_str] = error_msg
-        self._emit_data_changed_for_path(path_str)
+        key_to_remove = None
+        for key in self.loading_paths:
+            if key.startswith(path_str):
+                key_to_remove = key
+                break
+
+        if key_to_remove:
+            self.loading_paths.remove(key_to_remove)
+            self.error_paths[key_to_remove] = error_msg
+            self._emit_data_changed_for_path(path_str)
 
     def _emit_data_changed_for_path(self, path_str: str):
         for i, item in enumerate(self.items):
@@ -694,7 +725,7 @@ class ImageItemDelegate(QStyledItemDelegate):
             highlight_color.setAlpha(80)
             painter.fillRect(option.rect, highlight_color)
 
-        if item_data.path and self.state.is_candidate(item_data.path):
+        if self.state.is_candidate(item_data):
             painter.setPen(QPen(QColor(UIConfig.Colors.HIGHLIGHT), 2))
             painter.drawRect(option.rect.adjusted(1, 1, -1, -1))
 
@@ -706,7 +737,13 @@ class ImageItemDelegate(QStyledItemDelegate):
                 AlphaBackgroundWidget._get_checkered_pixmap(thumb_rect.size(), self.bg_alpha),
             )
         pixmap = index.data(Qt.ItemDataRole.DecorationRole)
-        error_msg = self.parent().model.error_paths.get(index.data(Qt.ItemDataRole.UserRole).path)
+
+        # Check for error using a combination of path and channel
+        item_data = index.data(Qt.ItemDataRole.UserRole)
+        channel = item_data.channel if item_data else None
+        cache_key = f"{item_data.path}_{channel}"
+        error_msg = self.parent().model.error_paths.get(cache_key)
+
         if pixmap and not pixmap.isNull():
             scaled = pixmap.scaled(
                 thumb_rect.size(),
@@ -744,6 +781,9 @@ class ImageItemDelegate(QStyledItemDelegate):
         painter.setFont(self.bold_font)
         painter.setPen(main_color)
         filename = path.name
+        if item_data.channel:
+            filename += f" ({item_data.channel})"
+
         painter.drawText(x, y, self.bold_font_metrics.elidedText(filename, Qt.ElideRight, text_rect.width()))
 
         y += line_height
@@ -752,7 +792,10 @@ class ImageItemDelegate(QStyledItemDelegate):
 
         dist_text = ""
         if item_data.is_best:
-            dist_text = f"[{BEST_FILE_METHOD_NAME}] | "
+            if item_data.channel:
+                dist_text = f"[{BEST_FILE_METHOD_NAME} - {item_data.channel}] | "
+            else:
+                dist_text = f"[{BEST_FILE_METHOD_NAME}] | "
         else:
             method = item_data.found_by
             dist = item_data.distance
