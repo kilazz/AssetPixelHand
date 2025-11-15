@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import numba  # Import Numba
 import numpy as np
 from PIL import Image
 
@@ -17,10 +18,51 @@ if DIRECTXTEX_AVAILABLE:
 app_logger = logging.getLogger("AssetPixelHand.dds_loader")
 
 
+# ==============================================================================
+# Numba JIT-Compiled Function
+# ==============================================================================
+# The @numba.njit decorator compiles this function into machine code.
+# - 'njit' stands for "nopython jit," which is the fastest mode.
+# - 'parallel=True' enables multithreading via numba.prange.
+# - 'fastmath=True' allows less precise but faster mathematical operations.
+@numba.njit(parallel=True, fastmath=True)
+def _unpremultiply_alpha_numba(arr: np.ndarray) -> np.ndarray:
+    """
+    Performs an "un-premultiply" operation on a uint8 RGBA NumPy array.
+    This function is heavily optimized with Numba for maximum speed.
+    """
+    # arr.shape[0] -> height, arr.shape[1] -> width
+    # numba.prange parallelizes the outer loop across all available CPU cores.
+    for y in numba.prange(arr.shape[0]):
+        for x in range(arr.shape[1]):
+            alpha = arr[y, x, 3]
+
+            # We only process pixels where alpha is non-zero
+            # to avoid division-by-zero errors.
+            if alpha > 0:
+                # To prevent overflow during multiplication (e.g., 200 * 255 > 255),
+                # we temporarily cast the values to uint16 for the calculation.
+                # The operation is: (color * 255) / alpha
+                r_new = np.uint16(arr[y, x, 0]) * 255 // alpha
+                g_new = np.uint16(arr[y, x, 1]) * 255 // alpha
+                b_new = np.uint16(arr[y, x, 2]) * 255 // alpha
+
+                # After the calculation, we must ensure the result does not
+                # exceed 255 before storing it back as a uint8.
+                # Numba optimizes these checks efficiently.
+                arr[y, x, 0] = min(r_new, 255)
+                arr[y, x, 1] = min(g_new, 255)
+                arr[y, x, 2] = min(b_new, 255)
+    return arr
+
+
 class DirectXTexLoader(BaseLoader):
     """Loader for DDS files using the directxtex_decoder library."""
 
     def load(self, path: Path, tonemap_mode: str) -> Image.Image | None:
+        """
+        Loads a DDS file from the given path and converts it to a PIL Image.
+        """
         if not DIRECTXTEX_AVAILABLE:
             return None
 
@@ -48,6 +90,9 @@ class DirectXTexLoader(BaseLoader):
         return self._handle_alpha_logic(pil_image)
 
     def get_metadata(self, path: Path, stat_result: Any) -> dict | None:
+        """
+        Retrieves metadata from the DDS file without fully decoding it.
+        """
         if not DIRECTXTEX_AVAILABLE:
             return None
 
@@ -68,6 +113,9 @@ class DirectXTexLoader(BaseLoader):
         }
 
     def _get_alpha_from_format_str(self, format_str: str) -> bool:
+        """
+        Determines if a DXGI format string implies the presence of an alpha channel.
+        """
         fmt = format_str.upper()
         return any(s in fmt for s in ["A8", "A16", "A32", "BC2", "BC3", "BC7"]) or (
             "A" in fmt and any(s in fmt for s in ["R8G8B8A8", "R16G16B16A16", "B8G8R8A8"])
@@ -75,18 +123,15 @@ class DirectXTexLoader(BaseLoader):
 
     def _handle_alpha_logic(self, pil_image: Image.Image) -> Image.Image:
         """
-        Optimized alpha handling for premultiplied alpha and other edge cases.
-        Uses vectorized NumPy operations for maximum performance.
+        Optimized alpha handling for premultiplied alpha using Numba.
         """
-        if not pil_image or pil_image.mode != "RGBA":
+        if pil_image.mode != "RGBA":
             return pil_image
 
-        # Create a mutable copy of the array
         arr = np.array(pil_image)
 
-        if arr.ndim != 3 or arr.shape[2] != 4 or arr.dtype != np.uint8:
-            return pil_image
-
+        # Edge case handling remains on NumPy as it's not the "hot path"
+        # and runs infrequently. Numba wouldn't provide much benefit here.
         rgb = arr[:, :, :3]
         alpha = arr[:, :, 3]
 
@@ -94,29 +139,17 @@ class DirectXTexLoader(BaseLoader):
         rgb_max = np.max(rgb)
 
         if alpha_max < 5 and rgb_max > 0:
-            # Case 1: If alpha is nearly zero but color exists (common export error),
-            # use the color's brightness as the new alpha.
             arr[:, :, 3] = np.max(rgb, axis=2)
+            return Image.fromarray(arr)
 
-        elif rgb_max == 0 and alpha_max > 0:
-            # Case 2: If there's no color but alpha exists, copy the alpha channel to RGB
-            # for visualization purposes and set alpha to full.
+        if rgb_max == 0 and alpha_max > 0:
             arr[:, :, :3] = alpha[:, :, np.newaxis]
             arr[:, :, 3] = 255
-        else:
-            # Case 3 (Hot Path): Perform "un-premultiply" alpha operation.
-            # This reverses the effect where RGB values have been multiplied by alpha.
-            mask = alpha > 0
+            return Image.fromarray(arr)
 
-            # Use uint16 for intermediate calculations to avoid overflow (faster than float).
-            rgb_calc = rgb.astype(np.uint16)
+        # Hot Path: Call the fast, JIT-compiled function.
+        # The first run of this function will be slightly slower due to compilation.
+        # All subsequent calls will execute at maximum speed.
+        processed_arr = _unpremultiply_alpha_numba(arr)
 
-            # Vectorized operation: (rgb * 255) / alpha.
-            # np.newaxis is crucial for correct broadcasting across the RGB channels.
-            alpha_channel = alpha[mask, np.newaxis]
-            rgb_calc[mask] = (rgb_calc[mask] * 255) // alpha_channel
-
-            # Clip values back to the 0-255 range and convert back to uint8.
-            arr[:, :, :3] = np.clip(rgb_calc, 0, 255).astype(np.uint8)
-
-        return Image.fromarray(arr)
+        return Image.fromarray(processed_arr)

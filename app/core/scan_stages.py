@@ -7,8 +7,6 @@ processes data and passes a context object to the next stage.
 
 import logging
 import multiprocessing
-import shutil
-import tempfile
 import threading
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
@@ -17,8 +15,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import numba
 import numpy as np
-import polars as pl
+from numba import types
+from numba.typed import List  # Important import for typed lists
 
 from app.constants import LANCEDB_AVAILABLE
 from app.data_models import ImageFingerprint, ScanConfig, ScanState
@@ -34,7 +34,7 @@ from .helpers import FileFinder
 from .pipeline import PipelineManager
 
 if LANCEDB_AVAILABLE:
-    import lancedb
+    pass
 
 try:
     from scipy.sparse import csr_matrix
@@ -45,6 +45,65 @@ except ImportError:
     SCIPY_AVAILABLE = False
 
 app_logger = logging.getLogger("AssetPixelHand.scan_stages")
+
+
+# --- Numba JIT-compiled helpers for fast perceptual hash clustering ---
+@numba.njit("i8(u8)", cache=True)
+def _popcount(n: np.uint64) -> int:
+    """Calculates the population count (number of set bits) of a uint64."""
+    count = 0
+    val = np.uint64(n)
+    while val != 0:
+        if (val & 1) == 1:
+            count += 1
+        val >>= 1
+    return count
+
+
+@numba.njit(
+    types.UniTuple(types.int64[:], 2)(types.uint64[:], types.int64),
+    parallel=True,
+    cache=True,
+)
+def _find_hash_edges_numba(hashes: np.ndarray, threshold: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Quickly finds all pairs of hashes where the Hamming distance is <= threshold.
+    Uses Numba for JIT compilation, parallelization, and explicit type signatures.
+    """
+    n = len(hashes)
+    rows_list = List()
+    cols_list = List()
+    for _ in range(n):
+        rows_list.append(List.empty_list(types.int64))
+        cols_list.append(List.empty_list(types.int64))
+
+    for i in numba.prange(n):
+        for j in range(i + 1, n):
+            distance = _popcount(hashes[i] ^ hashes[j])
+            if distance <= threshold:
+                # Explicitly cast `i` and `j` to int64 to suppress the warning
+                rows_list[i].append(np.int64(i))
+                cols_list[i].append(np.int64(j))
+
+    total_size = 0
+    for sublist in rows_list:
+        total_size += len(sublist)
+
+    rows = np.empty(total_size, dtype=np.int64)
+    cols = np.empty(total_size, dtype=np.int64)
+
+    current_pos = 0
+    for i in range(n):
+        sublist_rows = rows_list[i]
+        sublist_cols = cols_list[i]
+        list_len = len(sublist_rows)
+        if list_len > 0:
+            for j in range(list_len):
+                rows[current_pos + j] = sublist_rows[j]
+                cols[current_pos + j] = sublist_cols[j]
+            current_pos += list_len
+
+    return rows, cols
 
 
 class EvidenceMethod(Enum):
@@ -401,7 +460,7 @@ class PerceptualDuplicateStage(ScanStage):
             return
 
         hashes, paths = zip(*hashes_to_process, strict=True)
-        components = self._find_hash_components_lancedb(paths, hashes, threshold)
+        components = self._find_hash_components_fast(paths, hashes, threshold)
 
         final_reps = []
         processed_paths = set()
@@ -423,59 +482,53 @@ class PerceptualDuplicateStage(ScanStage):
         final_reps.extend([p for p in context.files_to_process if p not in processed_paths])
         context.files_to_process = final_reps
 
-    def _find_hash_components_lancedb(
+    def _find_hash_components_fast(
         self, paths: tuple[Path, ...], hashes: tuple[Any, ...], threshold: int
     ) -> dict[int, list[Path]]:
+        """
+        Finds connected components of hashes based on Hamming distance threshold.
+        This method is fast, in-memory, and optimized with Numba.
+        """
         n = len(paths)
         if not hashes or n < 2:
             return {i: [p] for i, p in enumerate(paths)}
 
-        if not LANCEDB_AVAILABLE:
-            app_logger.warning(f"LanceDB not available, skipping {hashes[0].__class__.__name__} indexing.")
-            return {i: [p] for i, p in enumerate(paths)}
+        # 1. Convert imagehash objects to a NumPy array of uint64.
+        uint64_hashes = np.array(
+            [int("".join(row.astype(int).astype(str)), 2) for row in (h.hash.flatten() for h in hashes)],
+            dtype=np.uint64,
+        )
 
-        temp_db_path = None
-        try:
-            temp_db_path = tempfile.mkdtemp()
+        # 2. Call the JIT-compiled function to find all pairs (graph edges).
+        rows, cols = _find_hash_edges_numba(uint64_hashes, threshold)
 
-            powers_of_2 = 2 ** np.arange(64, dtype=np.uint64)
-            uint64_hashes = [np.sum(h.hash.flatten().astype(np.uint64) * powers_of_2) for h in hashes]
-            hash_array = np.array(uint64_hashes, dtype=np.uint64)
+        if not rows.size:  # Check if the array is empty
+            return {i: [Path(p)] for i, p in enumerate(paths)}
 
-            unpacked_bits = (hash_array[:, np.newaxis] >> np.arange(64, dtype=np.uint8)) & 1
-            vectors = unpacked_bits.astype("float32")
-            data = [{"vector": v, "id": i} for i, v in enumerate(vectors)]
-
-            db = lancedb.connect(temp_db_path)
-            tbl = db.create_table("hashes", data=data)
-
-            rows, cols = [], []
-            radius = np.sqrt(threshold) + 0.001
-            limit = 250
-
-            for i in range(n):
-                query_vector = vectors[i]
-                results = tbl.search(query_vector).metric("L2").limit(limit).to_polars()
-                neighbors = results.filter(pl.col("_distance") <= radius)
-
-                for neighbor_id in neighbors["id"]:
-                    if i < neighbor_id:
-                        rows.append(i)
-                        cols.append(neighbor_id)
-
-            if not rows:
-                return {i: [Path(p)] for i, p in enumerate(paths)}
-
-            graph = csr_matrix((np.ones_like(rows), (rows, cols)), (n, n))
-            _, labels = connected_components(graph, directed=False, return_labels=True)
+        # 3. Build the graph and find connected components.
+        if not SCIPY_AVAILABLE:
+            app_logger.warning("Scipy not available, pHash/dHash clustering will be incomplete.")
             components = defaultdict(list)
-            for i, label in enumerate(labels):
-                components[label].append(paths[i])
+            for i, r in enumerate(rows):
+                c = cols[i]
+                if not any(r in v or c in v for v in components.values()):
+                    components[r].extend([paths[r], paths[c]])
             return components
 
-        finally:
-            if temp_db_path and Path(temp_db_path).exists():
-                shutil.rmtree(temp_db_path, ignore_errors=True)
+        graph = csr_matrix((np.ones(len(rows), dtype=bool), (rows, cols)), shape=(n, n))
+        _, labels = connected_components(graph, directed=False, return_labels=True)
+
+        components = defaultdict(list)
+        for i, label in enumerate(labels):
+            components[label].append(paths[i])
+
+        return components
+
+    def _find_hash_components_lancedb(self, *args, **kwargs):
+        """DEPRECATED: This method is slow and has been replaced by _find_hash_components_fast."""
+        raise NotImplementedError(
+            "The LanceDB method for pHash/dHash clustering is deprecated in favor of the faster Numba-based method."
+        )
 
 
 class FingerprintGenerationStage(ScanStage):

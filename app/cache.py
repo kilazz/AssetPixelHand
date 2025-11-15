@@ -118,6 +118,10 @@ class CacheManager:
                 app_logger.error(f"Failed to create file cache table: {e}")
 
     def get_cached_fingerprints(self, all_file_paths: list[Path]) -> tuple[list[Path], list[ImageFingerprint]]:
+        """
+        Efficiently determines which files need processing versus which are cached,
+        using Polars for high-performance in-memory joins and filtering.
+        """
         if self.in_memory_mode and self.db_path and self.db_path.exists() and self.conn:
             try:
                 self.conn.execute(f"IMPORT DATABASE '{self.db_path!s}';")
@@ -125,27 +129,43 @@ class CacheManager:
             except duckdb.Error as e:
                 app_logger.warning(f"Could not import existing cache file, starting fresh. Error: {e}")
 
-        if not self.conn or not all_file_paths:
+        if not self.conn or not all_file_paths or not POLARS_AVAILABLE:
+            if not POLARS_AVAILABLE:
+                app_logger.error("Polars library not found; fast caching disabled.")
             return all_file_paths, []
 
         try:
-            disk_files_data = [(str(p), s.st_mtime, s.st_size) for p in all_file_paths if (s := p.stat())]
+            # 1. Create a DataFrame of files currently on disk
+            disk_files_data = [
+                {"path": str(p), "mtime": s.st_mtime, "size": s.st_size} for p in all_file_paths if (s := p.stat())
+            ]
             if not disk_files_data:
                 return [], []
-            self.conn.execute("CREATE OR REPLACE TEMPORARY TABLE disk_files (path VARCHAR, mtime DOUBLE, size UBIGINT)")
-            self.conn.executemany("INSERT INTO disk_files VALUES (?, ?, ?)", disk_files_data)
-            to_process_query = "SELECT df.path FROM disk_files AS df LEFT JOIN fingerprints AS f ON df.path = f.path WHERE f.path IS NULL OR df.mtime != f.mtime OR df.size != f.size"
-            to_process_paths = {Path(row[0]) for row in self.conn.execute(to_process_query).fetchall()}
-            cached_paths_query = "SELECT f.path FROM disk_files AS df JOIN fingerprints AS f ON df.path = f.path WHERE df.mtime = f.mtime AND df.size = f.size"
-            valid_cache_paths = [row[0] for row in self.conn.execute(cached_paths_query).fetchall()]
+            disk_files_df = pl.DataFrame(disk_files_data)
+
+            # 2. Lazily load the entire cache from DuckDB into a Polars DataFrame
+            fingerprints_df = self.conn.pl().scan_table("fingerprints")
+
+            # 3. Perform a single left join to compare disk files against the cache
+            joined_df = disk_files_df.lazy().join(fingerprints_df, on="path", how="left").collect()
+
+            # 4. Identify files to re-process: new files (no match in cache) or modified files
+            to_process_mask = (
+                (pl.col("mtime_right").is_null())
+                | (pl.col("mtime") != pl.col("mtime_right"))
+                | (pl.col("size") != pl.col("size_right"))
+            )
+            to_process_df = joined_df.filter(to_process_mask)
+            to_process_paths = {Path(p) for p in to_process_df["path"].to_list()}
+
+            # 5. Identify valid cached files (the inverse of the `to_process` condition)
+            cached_df = joined_df.filter(~to_process_mask)
+
+            # 6. Efficiently construct ImageFingerprint objects from the cached DataFrame
             cached_fps = []
-            if valid_cache_paths:
-                placeholders = ", ".join("?" for _ in valid_cache_paths)
-                query = f"SELECT * FROM fingerprints WHERE path IN ({placeholders})"
-                result = self.conn.execute(query, valid_cache_paths)
-                cols = [desc[0] for desc in result.description]
-                for row_tuple in result.fetchall():
-                    row_dict = dict(zip(cols, row_tuple, strict=False))
+            if not cached_df.is_empty():
+                cached_rows = cached_df.to_dicts()
+                for row_dict in cached_rows:
                     try:
                         fp = ImageFingerprint(
                             path=Path(row_dict["path"]),
@@ -174,13 +194,12 @@ class CacheManager:
                             f"Could not load cached fingerprint for {row_dict['path']}, will re-process. Error: {e}"
                         )
                         to_process_paths.add(Path(row_dict["path"]))
+
             return list(to_process_paths), cached_fps
-        except duckdb.Error as e:
+
+        except (duckdb.Error, pl.PolarsError) as e:
             app_logger.warning(f"Failed to read from file cache DB: {e}. Rebuilding cache.")
             return all_file_paths, []
-        finally:
-            if self.conn:
-                self.conn.execute("DROP TABLE IF EXISTS disk_files")
 
     def put_many(self, fingerprints: list[ImageFingerprint]):
         """

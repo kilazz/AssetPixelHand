@@ -27,6 +27,7 @@ dependencies = [
     "duckdb>=1.4.2",
     # Data Handling & Utilities
     "numpy>=2.3.4",
+    "numba>=0.62.1",
     "scipy>=1.16.3",
     "pyarrow>=22.0.0",
     "polars>=1.35.2",
