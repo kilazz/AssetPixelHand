@@ -134,7 +134,7 @@ class PipelineManager(QObject):
             "low_priority": self.config.perf.run_at_low_priority,
             "device": self.config.device,
         }
-        if self.config.device == "cpu":
+        if "cpu" in self.config.device.lower():
             infer_cfg["threads_per_worker"] = os.cpu_count() or 4
 
         infer_proc = self.ctx.Process(

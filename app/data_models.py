@@ -250,7 +250,7 @@ class PerformanceSettings:
     batch_size: str = "256"
     low_priority: bool = True
     search_precision: str = DEFAULT_SEARCH_PRECISION
-    device: str = "CPU"
+    device: str = "CPUExecutionProvider"
     quantization_mode: str = QuantizationMode.FP16.value
 
 
