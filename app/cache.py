@@ -6,9 +6,18 @@ import hashlib
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+# Import for the DataFrame-based optimization
+try:
+    import polars as pl
+
+    POLARS_AVAILABLE = True
+except ImportError:
+    pl = None
+    POLARS_AVAILABLE = False
 
 from app.constants import CACHE_DIR, CACHE_VERSION, DUCKDB_AVAILABLE, THUMBNAIL_CACHE_DB
 from app.data_models import ImageFingerprint
@@ -174,26 +183,35 @@ class CacheManager:
                 self.conn.execute("DROP TABLE IF EXISTS disk_files")
 
     def put_many(self, fingerprints: list[ImageFingerprint]):
+        """
+        Optimized batch insert/update (upsert) for fingerprints into the DuckDB cache.
+        This method uses a Polars DataFrame for efficient, vectorized data transfer,
+        which is significantly faster than row-by-row operations with executemany.
+        """
         if not self.conn or not fingerprints:
             return
 
-        data_to_insert: list[tuple[Any, ...]] = [
-            (
-                str(fp.path),
-                fp.mtime,
-                fp.file_size,
-                fp.hashes.tobytes() if fp.hashes is not None else None,
-                fp.resolution[0],
-                fp.resolution[1],
-                fp.capture_date,
-                fp.format_str,
-                fp.format_details,
-                fp.has_alpha,
-                fp.bit_depth,
-                fp.xxhash,
-                str(fp.dhash) if fp.dhash else None,
-                str(fp.phash) if fp.phash else None,
-            )
+        if not POLARS_AVAILABLE:
+            app_logger.error("Polars library not found; optimized caching is disabled.")
+            return
+
+        data_to_insert = [
+            {
+                "path": str(fp.path),
+                "mtime": fp.mtime,
+                "size": fp.file_size,
+                "hashes": fp.hashes.tobytes() if fp.hashes is not None else None,
+                "resolution_w": fp.resolution[0],
+                "resolution_h": fp.resolution[1],
+                "capture_date": fp.capture_date,
+                "format_str": fp.format_str,
+                "format_details": fp.format_details,
+                "has_alpha": fp.has_alpha,
+                "bit_depth": fp.bit_depth,
+                "xxhash": fp.xxhash,
+                "dhash": str(fp.dhash) if fp.dhash else None,
+                "phash": str(fp.phash) if fp.phash else None,
+            }
             for fp in fingerprints
             if fp
         ]
@@ -202,11 +220,15 @@ class CacheManager:
             return
 
         try:
+            # Create a Polars DataFrame for high-performance data transfer
+            df_upsert = pl.DataFrame(data_to_insert)
+
+            # Register the DataFrame as a virtual table in DuckDB
+            self.conn.register("fingerprints_upsert_df", df_upsert)
+
             self.conn.begin()
-            self.conn.execute("CREATE OR REPLACE TEMP TABLE fingerprints_upsert AS SELECT * FROM fingerprints LIMIT 0")
-            self.conn.executemany(
-                "INSERT INTO fingerprints_upsert VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", data_to_insert
-            )
+
+            # Perform the UPDATE using a join with the fast virtual table
             self.conn.execute("""
                 UPDATE fingerprints
                 SET
@@ -215,24 +237,28 @@ class CacheManager:
                     capture_date = u.capture_date, format_str = u.format_str,
                     format_details = u.format_details, has_alpha = u.has_alpha,
                     bit_depth = u.bit_depth, xxhash = u.xxhash, dhash = u.dhash, phash = u.phash
-                FROM fingerprints_upsert AS u
+                FROM fingerprints_upsert_df AS u
                 WHERE fingerprints.path = u.path;
             """)
+
+            # Perform the INSERT for new records, also using the virtual table
             self.conn.execute("""
                 INSERT INTO fingerprints
                 SELECT u.*
-                FROM fingerprints_upsert AS u
+                FROM fingerprints_upsert_df AS u
                 LEFT JOIN fingerprints AS f ON u.path = f.path
                 WHERE f.path IS NULL;
             """)
             self.conn.commit()
-        except duckdb.Error as e:
-            app_logger.warning(f"File cache 'put_many' transaction failed: {e}")
+
+        except (duckdb.Error, pl.PolarsError) as e:
+            app_logger.warning(f"File cache 'put_many' (DataFrame) transaction failed: {e}")
             if self.conn:
                 self.conn.rollback()
         finally:
             if self.conn:
-                self.conn.execute("DROP TABLE IF EXISTS fingerprints_upsert")
+                # Clean up the registered virtual table
+                self.conn.unregister("fingerprints_upsert_df")
 
     def close(self):
         if not self.conn:
