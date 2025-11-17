@@ -180,26 +180,27 @@ def _process_batch_from_paths_for_ai(
                 channels_to_process = pil_image.split()
                 channel_names = ["R", "G", "B", "A"]
                 for i, channel_img in enumerate(channels_to_process):
-                    # If enabled, check if the channel is solid black or white
                     if config.ignore_solid_channels:
-                        # getextrema() returns (min, max) pixel values.
-                        # If min == max, the channel is a solid color.
                         min_val, max_val = channel_img.getextrema()
                         if min_val == max_val and (min_val == 0 or min_val == 255):
-                            continue  # Skip this solid channel
+                            continue
 
-                    # Convert single channel to RGB for the model
                     processed_image = Image.merge("RGB", (channel_img, channel_img, channel_img))
                     images.append(processed_image)
                     successful_paths_with_channels.append((path, channel_names[i]))
             else:
-                # Standard logic
-                processed_image = pil_image.convert("RGB")
+                # Standard logic for composite images
+                if pil_image.mode == "RGBA":
+                    processed_image = Image.new("RGB", pil_image.size, (0, 0, 0))
+                    processed_image.paste(pil_image, mask=pil_image.split()[3])
+                else:
+                    processed_image = pil_image.convert("RGB")
+
                 if config.compare_by_luminance:
                     processed_image = processed_image.convert("L").convert("RGB")
 
                 images.append(processed_image)
-                successful_paths_with_channels.append((path, "RGB"))  # Default channel identifier
+                successful_paths_with_channels.append((path, None))
 
         except Exception as e:
             app_logger.error(f"Error processing {path.name} in AI batch", exc_info=True)
