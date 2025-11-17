@@ -6,6 +6,7 @@ controllers and managers.
 """
 
 import logging
+import tracemalloc
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThreadPool, Slot
@@ -318,6 +319,17 @@ class App(QMainWindow):
 
     @Slot(object, int, object, float, list)
     def on_scan_complete(self, payload, num_found, mode, duration, skipped):
+        # Take a snapshot of memory allocations and print the top 20.
+        snapshot = tracemalloc.take_snapshot()
+        top_stats = snapshot.statistics("lineno")
+
+        print("\n" + "=" * 80)
+        print("TOP 20 MEMORY ALLOCATIONS (tracemalloc report)")
+        print("=" * 80)
+        for stat in top_stats[:20]:
+            print(stat)
+        print("=" * 80 + "\n")
+
         if not mode:
             app_logger.warning("Scan was cancelled by the user.")
             self.on_scan_end()

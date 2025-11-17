@@ -15,11 +15,13 @@ app_logger = logging.getLogger("AssetPixelHand.pillow_loader")
 class PillowLoader(BaseLoader):
     """Fallback loader for common image formats using Pillow."""
 
-    def load(self, path: Path, tonemap_mode: str) -> Image.Image | None:
+    def load(self, path: Path, tonemap_mode: str, shrink: int = 1) -> Image.Image | None:
         if not PILLOW_AVAILABLE:
             return None
 
         with Image.open(path) as img:
+            if shrink > 1:
+                img.thumbnail((img.width // shrink, img.height // shrink), Image.Resampling.LANCZOS)
             img.load()
             return img
 

@@ -156,7 +156,7 @@ class ImageFingerprint:
             format_str=row["format_str"],
             compression_format=row.get("compression_format", row["format_str"]),
             format_details=row["format_details"],
-            has_alpha=row["has_alpha"],
+            has_alpha=bool(row["has_alpha"]),
             bit_depth=row.get("bit_depth", 8),
             mipmap_count=row.get("mipmap_count", 1),
             texture_type=row.get("texture_type", "2D"),

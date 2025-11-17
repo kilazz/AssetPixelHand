@@ -119,8 +119,9 @@ class CacheManager:
 
     def get_cached_fingerprints(self, all_file_paths: list[Path]) -> tuple[list[Path], list[ImageFingerprint]]:
         """
-        Efficiently determines which files need processing versus which are cached,
-        using Polars for high-performance in-memory joins and filtering.
+        Efficiently determines which files need processing versus which are cached.
+        This optimized version uses DuckDB's SQL engine for joins to minimize memory usage,
+        avoiding loading the entire cache into a Polars DataFrame.
         """
         if self.in_memory_mode and self.db_path and self.db_path.exists() and self.conn:
             try:
@@ -143,29 +144,32 @@ class CacheManager:
                 return [], []
             disk_files_df = pl.DataFrame(disk_files_data)
 
-            # 2. Lazily load the entire cache from DuckDB into a Polars DataFrame
-            fingerprints_df = self.conn.pl().scan_table("fingerprints")
+            # 2. Register the on-disk files as a virtual table in DuckDB
+            self.conn.register("disk_files_df", disk_files_df)
 
-            # 3. Perform a single left join to compare disk files against the cache
-            joined_df = disk_files_df.lazy().join(fingerprints_df, on="path", how="left").collect()
+            # 3. Use a SQL query to find files that are new or have been modified
+            to_process_query = """
+                SELECT d.path
+                FROM disk_files_df AS d
+                LEFT JOIN fingerprints AS f ON d.path = f.path
+                WHERE f.path IS NULL OR d.mtime != f.mtime OR d.size != f.size
+            """
+            to_process_paths_result = self.conn.execute(to_process_query).fetchall()
+            to_process_paths = {Path(row[0]) for row in to_process_paths_result}
 
-            # 4. Identify files to re-process: new files (no match in cache) or modified files
-            to_process_mask = (
-                (pl.col("mtime_right").is_null())
-                | (pl.col("mtime") != pl.col("mtime_right"))
-                | (pl.col("size") != pl.col("size_right"))
-            )
-            to_process_df = joined_df.filter(to_process_mask)
-            to_process_paths = {Path(p) for p in to_process_df["path"].to_list()}
+            # 4. Use a SQL query to retrieve all valid, up-to-date cached entries
+            cached_query = """
+                SELECT f.*
+                FROM fingerprints AS f
+                JOIN disk_files_df AS d ON f.path = d.path
+                WHERE f.mtime = d.mtime AND f.size = d.size
+            """
+            cached_df = self.conn.execute(cached_query).pl()
 
-            # 5. Identify valid cached files (the inverse of the `to_process` condition)
-            cached_df = joined_df.filter(~to_process_mask)
-
-            # 6. Efficiently construct ImageFingerprint objects from the cached DataFrame
+            # 5. Efficiently construct ImageFingerprint objects from the cached DataFrame
             cached_fps = []
             if not cached_df.is_empty():
-                cached_rows = cached_df.to_dicts()
-                for row_dict in cached_rows:
+                for row_dict in cached_df.to_dicts():
                     try:
                         fp = ImageFingerprint(
                             path=Path(row_dict["path"]),
@@ -178,7 +182,7 @@ class CacheManager:
                             capture_date=row_dict["capture_date"],
                             format_str=row_dict["format_str"],
                             format_details=row_dict["format_details"],
-                            has_alpha=row_dict["has_alpha"],
+                            has_alpha=bool(row_dict["has_alpha"]),
                             bit_depth=row_dict["bit_depth"],
                             xxhash=row_dict.get("xxhash"),
                             dhash=imagehash.hex_to_hash(row_dict["dhash"])
@@ -200,6 +204,9 @@ class CacheManager:
         except (duckdb.Error, pl.PolarsError) as e:
             app_logger.warning(f"Failed to read from file cache DB: {e}. Rebuilding cache.")
             return all_file_paths, []
+        finally:
+            if self.conn:
+                self.conn.unregister("disk_files_df")
 
     def put_many(self, fingerprints: list[ImageFingerprint]):
         """

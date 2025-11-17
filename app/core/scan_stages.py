@@ -19,8 +19,6 @@ from typing import Any, TypeVar
 
 import numba
 import numpy as np
-from numba import types
-from numba.typed import List
 
 from app.constants import LANCEDB_AVAILABLE
 from app.data_models import (
@@ -44,14 +42,6 @@ from .pipeline import PipelineManager
 if LANCEDB_AVAILABLE:
     pass
 
-try:
-    from scipy.sparse import csr_matrix
-    from scipy.sparse.csgraph import connected_components
-
-    SCIPY_AVAILABLE = True
-except ImportError:
-    SCIPY_AVAILABLE = False
-
 app_logger = logging.getLogger("AssetPixelHand.scan_stages")
 
 # Generic TypeVar for our nodes, which can be a Path or a (Path, channel) tuple.
@@ -69,53 +59,6 @@ def _popcount(n: np.uint64) -> int:
             count += 1
         val >>= 1
     return count
-
-
-@numba.njit(
-    types.UniTuple(types.int64[:], 2)(types.uint64[:], types.int64),
-    parallel=True,
-    cache=True,
-)
-def _find_hash_edges_numba(hashes: np.ndarray, threshold: int) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Quickly finds all pairs of hashes where the Hamming distance is <= threshold.
-    Uses Numba for JIT compilation, parallelization, and explicit type signatures.
-    """
-    n = len(hashes)
-    rows_list = List()
-    cols_list = List()
-    for _ in range(n):
-        rows_list.append(List.empty_list(types.int64))
-        cols_list.append(List.empty_list(types.int64))
-
-    for i in numba.prange(n):
-        for j in range(i + 1, n):
-            distance = _popcount(hashes[i] ^ hashes[j])
-            if distance <= threshold:
-                i_as_int64 = np.int64(i)
-                j_as_int64 = np.int64(j)
-                rows_list[i_as_int64].append(i_as_int64)
-                cols_list[i_as_int64].append(j_as_int64)
-
-    total_size = 0
-    for sublist in rows_list:
-        total_size += len(sublist)
-
-    rows = np.empty(total_size, dtype=np.int64)
-    cols = np.empty(total_size, dtype=np.int64)
-
-    current_pos = 0
-    for i in range(n):
-        sublist_rows = rows_list[i]
-        sublist_cols = cols_list[i]
-        list_len = len(sublist_rows)
-        if list_len > 0:
-            for j in range(list_len):
-                rows[current_pos + j] = sublist_rows[j]
-                cols[current_pos + j] = sublist_cols[j]
-            current_pos += list_len
-
-    return rows, cols
 
 
 class EvidenceMethod(Enum):
@@ -188,7 +131,6 @@ class PrecisionCluster[NodeType]:
 
     @staticmethod
     def _get_edge_key(node1: NodeType, node2: NodeType) -> tuple[NodeType, NodeType]:
-        # Sorting requires nodes to be comparable, which tuples are.
         return tuple(sorted((node1, node2)))
 
     def get_best_evidence(self, node1: NodeType, node2: NodeType) -> EvidenceRecord | None:
@@ -406,7 +348,6 @@ class ExactDuplicateStage(ScanStage):
 
     def run(self, context: ScanContext) -> bool:
         if not context.files_to_process or not context.config.find_exact_duplicates:
-            # Still need to populate fingerprints if this is the only pre-AI stage
             for path in context.files_to_process:
                 if path not in context.all_image_fps:
                     if meta := get_image_metadata(path):
@@ -528,11 +469,13 @@ class PerceptualDuplicateStage(ScanStage):
 
     def _process_hash_results(self, context: ScanContext, results_iterator, total_items: int):
         item_hashes = {}
-        for i, result in enumerate(results_iterator, 1):
+        processed_count = 0
+        for result in results_iterator:
             if context.stop_event.is_set():
                 return
-            if i % 50 == 0:
-                context.state.update_progress(i, total_items)
+            processed_count += 1
+            if processed_count % 50 == 0:
+                context.state.update_progress(processed_count, total_items)
             if not result:
                 continue
 
@@ -547,45 +490,71 @@ class PerceptualDuplicateStage(ScanStage):
                 fp.has_alpha = result["precise_meta"]["has_alpha"]
 
         if context.config.find_simple_duplicates:
-            self._run_phash_clustering(
+            self._run_bucketing_clustering(
                 context, item_hashes, "dhash", EvidenceMethod.DHASH, context.config.dhash_threshold
             )
         if context.config.find_perceptual_duplicates:
-            self._run_phash_clustering(
+            self._run_bucketing_clustering(
                 context, item_hashes, "phash", EvidenceMethod.PHASH, context.config.phash_threshold
             )
         if context.config.find_structural_duplicates:
-            self._run_phash_clustering(
+            self._run_bucketing_clustering(
                 context, item_hashes, "whash", EvidenceMethod.WHASH, context.config.whash_threshold
             )
 
-    def _run_phash_clustering(
+        del item_hashes
+
+    def _run_bucketing_clustering(
         self, context: ScanContext, all_hashes: dict, hash_key: str, method: EvidenceMethod, threshold: int
     ):
+        """Finds clusters of similar hashes using a memory-efficient bucketing algorithm."""
         items_with_hashes = [
             (item, hashes[hash_key]) for item, hashes in all_hashes.items() if hashes.get(hash_key) is not None
         ]
         if not items_with_hashes:
             return
 
-        items, hashes = zip(*items_with_hashes, strict=True)
-        components = self._find_hash_components_fast(items, hashes, threshold)
+        uint64_hashes = np.array(
+            [int("".join(row.astype(int).astype(str)), 2) for row in (h.hash.flatten() for _, h in items_with_hashes)],
+            dtype=np.uint64,
+        )
 
-        for group_items in components.values():
-            if len(group_items) > 1:
-                for i in range(len(group_items)):
-                    for j in range(i + 1, len(group_items)):
-                        item1, item2 = group_items[i], group_items[j]
-                        node1 = (item1.path, item1.analysis_type if item1.analysis_type != "Composite" else None)
-                        node2 = (item2.path, item2.analysis_type if item2.analysis_type != "Composite" else None)
-                        context.cluster_manager.add_evidence(node1, node2, method.value, 0.0)
+        num_bands = 4
+        band_size = 16
+
+        buckets = [defaultdict(list) for _ in range(num_bands)]
+
+        for i, h in enumerate(uint64_hashes):
+            for band_idx in range(num_bands):
+                key = (h >> (band_idx * band_size)) & 0xFFFF
+                buckets[band_idx][key].append(i)
+
+        processed_pairs = set()
+
+        for bucket_group in buckets:
+            for bucket in bucket_group.values():
+                if len(bucket) < 2:
+                    continue
+
+                for i in range(len(bucket)):
+                    for j in range(i + 1, len(bucket)):
+                        idx1, idx2 = bucket[i], bucket[j]
+
+                        pair_key = tuple(sorted((idx1, idx2)))
+                        if pair_key in processed_pairs:
+                            continue
+                        processed_pairs.add(pair_key)
+
+                        distance = _popcount(uint64_hashes[idx1] ^ uint64_hashes[idx2])
+                        if distance <= threshold:
+                            item1 = items_with_hashes[idx1][0]
+                            item2 = items_with_hashes[idx2][0]
+                            node1 = (item1.path, item1.analysis_type if item1.analysis_type != "Composite" else None)
+                            node2 = (item2.path, item2.analysis_type if item2.analysis_type != "Composite" else None)
+                            context.cluster_manager.add_evidence(node1, node2, method.value, 0.0)
 
     def _filter_items_for_ai(self, context: ScanContext):
-        """
-        Reduces the list of items to be processed by AI by selecting only one
-        representative from each near-identical cluster found by perceptual hashes.
-        """
-        if not context.config.use_ai:
+        if not context.config.use_ai or not context.items_to_process:
             return
 
         item_map = {
@@ -607,52 +576,21 @@ class PerceptualDuplicateStage(ScanStage):
 
             cluster_fps = [context.all_image_fps[item.path] for item in cluster_items]
             best_fp = find_best_in_group(cluster_fps)
+            best_fp_path = best_fp.path
 
-            best_item_found = False
+            best_item = next((item for item in cluster_items if item.path == best_fp_path), cluster_items[0])
+
             for item in cluster_items:
-                if context.all_image_fps[item.path] == best_fp and not best_item_found:
-                    best_item_found = True
-                else:
+                if item != best_item:
                     items_to_remove.add(item)
 
         if items_to_remove:
+            original_count = len(context.items_to_process)
             context.items_to_process = [item for item in context.items_to_process if item not in items_to_remove]
             app_logger.info(
                 f"Perceptual hash filter removed {len(items_to_remove)} near-duplicate items. "
-                f"{len(context.items_to_process)} items remain for AI analysis."
+                f"{len(context.items_to_process)} of {original_count} items remain for AI analysis."
             )
-
-    def _find_hash_components_fast(
-        self, items: tuple[AnalysisItem, ...], hashes: tuple[Any, ...], threshold: int
-    ) -> dict[int, list[AnalysisItem]]:
-        n = len(items)
-        if not hashes or n < 2:
-            return {i: [item] for i, item in enumerate(items)}
-
-        uint64_hashes = np.array(
-            [int("".join(row.astype(int).astype(str)), 2) for row in (h.hash.flatten() for h in hashes)],
-            dtype=np.uint64,
-        )
-        rows, cols = _find_hash_edges_numba(uint64_hashes, threshold)
-
-        if not rows.size:
-            return {i: [item] for i, item in enumerate(items)}
-
-        if not SCIPY_AVAILABLE:
-            app_logger.warning("Scipy not available, pHash/dHash clustering will be incomplete.")
-            components = defaultdict(list)
-            for i, r in enumerate(rows):
-                c = cols[i]
-                if not any(items[r] in v or items[c] in v for v in components.values()):
-                    components[r].extend([items[r], items[c]])
-            return components
-
-        graph = csr_matrix((np.ones(len(rows), dtype=bool), (rows, cols)), shape=(n, n))
-        _, labels = connected_components(graph, directed=False, return_labels=True)
-        components = defaultdict(list)
-        for i, label in enumerate(labels):
-            components[label].append(items[i])
-        return components
 
 
 class FingerprintGenerationStage(ScanStage):
@@ -724,7 +662,6 @@ class AILinkingStage(ScanStage):
         for path1, ch1, path2, ch2, dist in sim_engine.find_similar_pairs(context.stop_event):
             if context.stop_event.is_set():
                 return False
-            # Normalize channel from "RGB" (used by worker) to None (used by cluster manager)
             node1 = (Path(path1), ch1 if ch1 != "RGB" else None)
             node2 = (Path(path2), ch2 if ch2 != "RGB" else None)
             context.cluster_manager.add_evidence(node1, node2, EvidenceMethod.AI.value, dist)

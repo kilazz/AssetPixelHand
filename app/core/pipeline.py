@@ -9,6 +9,7 @@ import logging
 import multiprocessing
 import os
 import threading
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from multiprocessing import shared_memory
@@ -30,7 +31,7 @@ from . import worker
 
 if TYPE_CHECKING:
     from app.core.scan_stages import ScanContext
-    from app.data_models import ScanConfig, ScanState
+    from app.data_models import AnalysisItem, ScanConfig, ScanState
 
 if LANCEDB_AVAILABLE:
     import lancedb
@@ -72,7 +73,7 @@ class PipelineManager(QObject):
         if not items_to_process:
             return True, []
 
-        unique_files_count = len(set(item.path for item in items_to_process))
+        unique_files_count = len({item.path for item in items_to_process})
         log_msg = (
             f"Starting AI pipeline for {len(items_to_process)} items ({unique_files_count} unique files): "
             f"{self.num_workers} CPU workers, inference on {self.config.device}."
@@ -154,6 +155,17 @@ class PipelineManager(QObject):
         infer_proc.start()
         return infer_proc
 
+    def _create_ai_job_generator(self, items: list["AnalysisItem"]) -> Generator[list["AnalysisItem"]]:
+        """
+        Generator that yields batches of AnalysisItem objects to send to workers.
+        The file reading is now deferred to the worker process.
+        """
+        batch_size = self.config.perf.batch_size
+        for i in range(0, len(items), batch_size):
+            if self.stop_event.is_set():
+                break
+            yield items[i : i + batch_size]
+
     def _run_preprocessing_pool(
         self, items_to_process, input_size, buffer_shape, dtype, free_buffers_q, tensor_q, results_q, cache, context
     ) -> list[str]:
@@ -162,22 +174,24 @@ class PipelineManager(QObject):
             "model_name": self.config.model_name,
             "low_priority": self.config.perf.run_at_low_priority,
         }
+
+        # Pass only simple, serializable arguments to the worker function.
+        # This avoids the deepcopy overhead of the full ScanConfig object.
+        worker_simple_config = {"ignore_solid_channels": self.config.ignore_solid_channels}
         worker_func = partial(
             worker.worker_preprocess_for_ai,
             input_size=input_size,
             buffer_shape=buffer_shape,
             dtype=dtype,
-            config=self.config,
+            simple_config=worker_simple_config,
         )
+
         with self.ctx.Pool(
             processes=self.num_workers,
             initializer=worker.init_preprocessor_worker,
             initargs=(preproc_init_cfg, free_buffers_q),
         ) as pool:
-            data_generator = (
-                items_to_process[i : i + self.config.perf.batch_size]
-                for i in range(0, len(items_to_process), self.config.perf.batch_size)
-            )
+            data_generator = self._create_ai_job_generator(items_to_process)
             preproc_results_iterator = pool.imap_unordered(worker_func, data_generator)
             _, all_skipped = self._pipeline_loop(preproc_results_iterator, tensor_q, results_q, cache, context)
         return all_skipped
@@ -190,8 +204,7 @@ class PipelineManager(QObject):
         feeding_complete = False
         processed_paths = set()
 
-        # We track progress based on unique files, but process based on items
-        total_files = len(set(item.path for item in context.items_to_process))
+        total_files = len({item.path for item in context.items_to_process})
 
         while processed_count < total_files:
             if self.stop_event.is_set() or not self.infer_proc.is_alive():
@@ -242,7 +255,7 @@ class PipelineManager(QObject):
 
             batch_results, skipped_items = gpu_result
             self._handle_batch_results(batch_results, skipped_items, cache, fps_to_cache, context, processed_paths)
-            all_skipped.extend([path for path, _ in skipped_items])
+            all_skipped.extend([str(path) for path, _ in skipped_items])
             processed_count += len(batch_results) + len(skipped_items)
 
         except Empty:
@@ -262,11 +275,9 @@ class PipelineManager(QObject):
             path = Path(path_str)
             processed_paths.add(path)
             if path in context.all_image_fps:
-                # Create a shallow copy to avoid overwriting the 'hashes' attribute
-                # of the same object in a loop. This is the critical fix.
                 fp_orig = context.all_image_fps[path]
                 fp_copy = copy.copy(fp_orig)
-                fp_copy.hashes = vector  # Assign the vector to the copy
+                fp_copy.hashes = vector
                 updated_fps_with_channels.append((fp_copy, channel))
             else:
                 app_logger.warning(f"Received AI vector for an unknown path: {path_str}. Skipping.")

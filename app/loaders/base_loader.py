@@ -10,7 +10,7 @@ class BaseLoader(ABC):
     """Abstract base class defining the interface for all image loaders."""
 
     @abstractmethod
-    def load(self, path: Path, tonemap_mode: str) -> Image.Image | None:
+    def load(self, path: Path, tonemap_mode: str, shrink: int = 1) -> Image.Image | None:
         """Loads image data into a Pillow Image object."""
         pass
 

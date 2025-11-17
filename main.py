@@ -5,6 +5,7 @@ import multiprocessing
 import os
 import sys
 import traceback
+import tracemalloc
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -62,6 +63,10 @@ def run_application():
 
     # Set the global exception hook to our custom logger.
     sys.excepthook = log_global_crash
+
+    # Start tracing memory allocations. The number 25 indicates that it will store
+    # the 25 most recent frames in the stack trace for each allocation.
+    tracemalloc.start(25)
 
     app = QApplication(sys.argv)
 

@@ -31,7 +31,7 @@ from app.constants import (
     TonemapMode,
 )
 from app.data_models import FileOperation, ScanMode
-from app.image_io import load_image
+from app.image_io import get_image_metadata, load_image
 from app.model_adapter import get_model_adapter
 
 if DUCKDB_AVAILABLE:
@@ -268,16 +268,31 @@ class ImageLoader(QRunnable):
                         pil_img = None
 
             if pil_img is None:
-                full_pil_img = load_image(
+                # 1. Get metadata to determine the original image size
+                metadata = get_image_metadata(Path(self.path_str))
+                shrink = 1
+                if metadata and self.target_size:
+                    width, height = metadata["resolution"]
+                    if width > self.target_size * 1.5 or height > self.target_size * 1.5:
+                        # 2. Calculate shrink factor for efficient loading
+                        shrink_w = width / (self.target_size * 1.5)
+                        shrink_h = height / (self.target_size * 1.5)
+                        shrink = max(1, int(min(shrink_w, shrink_h)))
+                        if shrink > 1:
+                            shrink = 1 << (shrink - 1).bit_length()
+
+                # 3. Load the pre-shrunk image
+                pre_shrunk_img = load_image(
                     self.path_str,
-                    target_size=None,
                     tonemap_mode=self.tonemap_mode,
+                    shrink=shrink,
                 )
 
-                if full_pil_img:
+                if pre_shrunk_img:
+                    # 4. Process the already small image for channel or color conversion
                     if self.channel_to_load:
-                        full_pil_img = full_pil_img.convert("RGBA")
-                        channels = full_pil_img.split()
+                        pre_shrunk_img = pre_shrunk_img.convert("RGBA")
+                        channels = pre_shrunk_img.split()
                         channel_map = {"R": 0, "G": 1, "B": 2, "A": 3}
                         channel_index = channel_map.get(self.channel_to_load)
 
@@ -285,10 +300,11 @@ class ImageLoader(QRunnable):
                             single_channel = channels[channel_index]
                             pil_img = Image.merge("RGB", (single_channel, single_channel, single_channel))
                         else:
-                            pil_img = full_pil_img.convert("RGB")
+                            pil_img = pre_shrunk_img.convert("RGB")
                     else:
-                        pil_img = full_pil_img.convert("RGBA")
+                        pil_img = pre_shrunk_img.convert("RGBA")
 
+                    # 5. Perform the final, high-quality resize to the exact target size
                     if self.target_size:
                         pil_img.thumbnail((self.target_size, self.target_size), Image.Resampling.LANCZOS)
 

@@ -22,7 +22,7 @@ app_logger = logging.getLogger("AssetPixelHand.oiio_loader")
 class OIIOLoader(BaseLoader):
     """Loader for various image formats using OpenImageIO."""
 
-    def load(self, path: Path, tonemap_mode: str) -> Image.Image | None:
+    def load(self, path: Path, tonemap_mode: str, shrink: int = 1) -> Image.Image | None:
         if not OIIO_AVAILABLE:
             return None
 

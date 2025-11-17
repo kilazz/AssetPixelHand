@@ -21,11 +21,21 @@ app_logger = logging.getLogger("AssetPixelHand.pyvips_loader")
 class PyVipsLoader(BaseLoader):
     """High-performance loader for various formats using PyVips."""
 
-    def load(self, path: Path, tonemap_mode: str) -> Image.Image | None:
+    def load(self, path: Path, tonemap_mode: str, shrink: int = 1) -> Image.Image | None:
         if not PYVIPS_AVAILABLE:
             return None
 
-        image = pyvips.Image.new_from_file(str(path), access="sequential")
+        # Use the highly efficient `thumbnail` function if a shrink factor is provided,
+        # which is much more memory-efficient than loading the full image first.
+        # We calculate a target dimension slightly larger than needed for high-quality final resizing.
+        if shrink > 1:
+            # Get dimensions without loading the image
+            width = pyvips.Image.new_from_file(str(path), access="sequential").width
+            # The `thumbnail` function is the most memory-efficient way to downsample.
+            image = pyvips.Image.thumbnail(str(path), width // shrink)
+        else:
+            image = pyvips.Image.new_from_file(str(path), access="sequential")
+
         is_float = "float" in image.format or "double" in image.format
 
         if is_float and tonemap_mode == TonemapMode.ENABLED.value:
