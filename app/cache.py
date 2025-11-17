@@ -164,40 +164,49 @@ class CacheManager:
                 JOIN disk_files_df AS d ON f.path = d.path
                 WHERE f.mtime = d.mtime AND f.size = d.size
             """
-            cached_df = self.conn.execute(cached_query).pl()
 
-            # 5. Efficiently construct ImageFingerprint objects from the cached DataFrame
+            # 5. Efficiently construct ImageFingerprint objects by streaming Arrow batches
             cached_fps = []
-            if not cached_df.is_empty():
-                for row_dict in cached_df.to_dicts():
-                    try:
-                        fp = ImageFingerprint(
-                            path=Path(row_dict["path"]),
-                            hashes=np.frombuffer(row_dict["hashes"], dtype=np.float32)
-                            if row_dict["hashes"]
-                            else np.array([]),
-                            resolution=(row_dict["resolution_w"], row_dict["resolution_h"]),
-                            file_size=row_dict["size"],
-                            mtime=row_dict["mtime"],
-                            capture_date=row_dict["capture_date"],
-                            format_str=row_dict["format_str"],
-                            format_details=row_dict["format_details"],
-                            has_alpha=bool(row_dict["has_alpha"]),
-                            bit_depth=row_dict["bit_depth"],
-                            xxhash=row_dict.get("xxhash"),
-                            dhash=imagehash.hex_to_hash(row_dict["dhash"])
-                            if row_dict.get("dhash") and IMAGEHASH_AVAILABLE
-                            else None,
-                            phash=imagehash.hex_to_hash(row_dict["phash"])
-                            if row_dict.get("phash") and IMAGEHASH_AVAILABLE
-                            else None,
-                        )
-                        cached_fps.append(fp)
-                    except Exception as e:
-                        app_logger.warning(
-                            f"Could not load cached fingerprint for {row_dict['path']}, will re-process. Error: {e}"
-                        )
-                        to_process_paths.add(Path(row_dict["path"]))
+
+            # Execute the query and get an Arrow Reader for streaming results
+            result_stream = self.conn.execute(cached_query)
+            reader = result_stream.fetch_arrow_reader()
+
+            # Iterate over batches (chunks) of data
+            for batch in reader.iter_batches():
+                # Convert ONLY the current batch to a Polars DataFrame. It will be small.
+                batch_df = pl.from_arrow(batch)
+
+                if not batch_df.is_empty():
+                    for row_dict in batch_df.to_dicts():
+                        try:
+                            fp = ImageFingerprint(
+                                path=Path(row_dict["path"]),
+                                hashes=np.frombuffer(row_dict["hashes"], dtype=np.float32)
+                                if row_dict["hashes"]
+                                else np.array([]),
+                                resolution=(row_dict["resolution_w"], row_dict["resolution_h"]),
+                                file_size=row_dict["size"],
+                                mtime=row_dict["mtime"],
+                                capture_date=row_dict["capture_date"],
+                                format_str=row_dict["format_str"],
+                                format_details=row_dict["format_details"],
+                                has_alpha=bool(row_dict["has_alpha"]),
+                                bit_depth=row_dict["bit_depth"],
+                                xxhash=row_dict.get("xxhash"),
+                                dhash=imagehash.hex_to_hash(row_dict["dhash"])
+                                if row_dict.get("dhash") and IMAGEHASH_AVAILABLE
+                                else None,
+                                phash=imagehash.hex_to_hash(row_dict["phash"])
+                                if row_dict.get("phash") and IMAGEHASH_AVAILABLE
+                                else None,
+                            )
+                            cached_fps.append(fp)
+                        except Exception as e:
+                            app_logger.warning(
+                                f"Could not load cached fingerprint for {row_dict['path']}, will re-process. Error: {e}"
+                            )
+                            to_process_paths.add(Path(row_dict["path"]))
 
             return list(to_process_paths), cached_fps
 
