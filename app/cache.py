@@ -121,7 +121,7 @@ class CacheManager:
         """
         Efficiently determines which files need processing versus which are cached.
         This optimized version uses DuckDB's SQL engine for joins to minimize memory usage,
-        avoiding loading the entire cache into a Polars DataFrame.
+        and streams results to avoid loading the entire cache into memory.
         """
         if self.in_memory_mode and self.db_path and self.db_path.exists() and self.conn:
             try:
@@ -168,13 +168,10 @@ class CacheManager:
             # 5. Efficiently construct ImageFingerprint objects by streaming Arrow batches
             cached_fps = []
 
-            # Execute the query and get an Arrow Reader for streaming results
             result_stream = self.conn.execute(cached_query)
             reader = result_stream.fetch_arrow_reader()
 
-            # Iterate over batches (chunks) of data
             for batch in reader.iter_batches():
-                # Convert ONLY the current batch to a Polars DataFrame. It will be small.
                 batch_df = pl.from_arrow(batch)
 
                 if not batch_df.is_empty():
@@ -256,7 +253,8 @@ class CacheManager:
 
         try:
             # Create a Polars DataFrame for high-performance data transfer
-            df_upsert = pl.DataFrame(data_to_insert)
+            # and ensure it's unique by path, keeping the last entry. Use .unique() for backward compatibility.
+            df_upsert = pl.DataFrame(data_to_insert).unique(subset=["path"], keep="last")
 
             # Register the DataFrame as a virtual table in DuckDB
             self.conn.register("fingerprints_upsert_df", df_upsert)
