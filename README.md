@@ -5,24 +5,29 @@
 
 ## Key Features
 
-*   **🧠 AI Search**: Find duplicates with a powerful multi-stage pipeline: from byte-perfect matches (xxHash) and perceptual hashes (pHash) to deep AI-driven visual similarity. Search your way: find duplicates, search by text query, or find images visually similar to a sample file. Choose from various AI models (CLIP, SigLIP, DINOv2) to balance speed and accuracy.
+*   **🧠 Advanced Search Pipeline**: Find duplicates using a multi-stage process you control: from byte-perfect matches (**xxHash**) and perceptual hashes (**dHash, pHash, wHash**) to deep AI-driven visual similarity (CLIP, SigLIP, DINOv2).
 
-*   **🚀 Hardware Acceleration**: GPU-accelerated backends via ONNX Runtime for incredible speed, chosen by you at install time. Tune performance with controls for compute precision (FP16/FP32), batch size, and search accuracy.
+*   **🛠️ Flexible Scan Modes**:
+    *   **Find Duplicates**: The standard mode for cleaning up your collection.
+    *   **Technical Analysis**: Compare images by **Luminance** only or by individual **R, G, B, A Channels** to find assets with reused technical maps (e.g., roughness, metallic).
+    *   **AI Search**: Search your entire library by a **text query** or find images visually similar to a **sample file**.
 
-*   **📊 Comparison Tools**: Analyze finds with tools: Side-by-Side, Wipe, Overlay, and Difference views with RGB/A channel toggling. The app generates visual reports and includes HDR tonemapping for formats like EXR.
+*   **🚀 Hardware Acceleration**: GPU-accelerated backends via **ONNX Runtime** (CUDA, DirectML, WebGPU). Tune performance with controls for compute precision, batch size, and search accuracy.
 
-*   **💾 File Management**: Save disk space by replacing duplicates with either hardlinks or safer copy-on-write **reflinks** (on supported filesystems). All deletions are safely moved to the system's recycle bin.
+*   **📊 Comparison Tools**: Analyze finds with Side-by-Side, Wipe, Overlay, and Difference views with RGB/A channel toggling. Includes HDR tonemapping and generates visual reports.
 
-*   **📁 Format Support**: `JPG`, `PNG`, `WEBP`, `BMP`, `TGA`, `PSD`, `EXR`, `HDR`, `TIF`, `DDS`, `AVIF`, `HEIC`, and more.
+*   **💾 File Management**: Save disk space by replacing duplicates with **hardlinks** or safer copy-on-write **reflinks**. All deletions are safely moved to the system's recycle bin.
+
+*   **📁 Broad Format Support**: `JPG`, `PNG`, `WEBP`, `BMP`, `TGA`, `PSD`, `EXR`, `HDR`, `TIF`, `DDS`, `AVIF`, `HEIC`, and many more thanks to a powerful image loader backend.
 
 ## Tech Stack
 *   **GUI**: PySide6
 *   **AI Core**: PyTorch, Transformers, ONNX Runtime
-*   **Databases**: LanceDB, DuckDB
+*   **Databases**: LanceDB, DuckDB, Polars
 *   **Image Processing**: PyVips, OpenImageIO, Pillow, DirectXTex
 
 ## Requirements
-*   Python 3.13 ~
+*   Python >= 3.13
 
 ## Quick Start
 1.  Clone the repository.
