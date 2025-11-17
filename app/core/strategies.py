@@ -283,11 +283,19 @@ class FindDuplicatesStrategy(ScanStrategy):
                     continue
 
                 dup_node = (dup_fp.path, dup_fp.channel)
-
                 key = tuple(sorted((best_node, dup_node)))
+
+                # Get the direct distance to the best node, if it exists.
                 dist = evidence_map.get(key)
 
-                score = int(max(0.0, (1.0 - dist) * 100)) if dist is not None else 0
+                # If 'dist' is None, it means there is no direct link to the best node,
+                # but it's still part of the same connected component (an indirect link).
+                # We should still include it in the group. We'll assign a default distance
+                # of 0.0, which translates to a 100% score, just to mark its inclusion.
+                if dist is None:
+                    dist = 0.0
+
+                score = int(max(0.0, (1.0 - dist) * 100))
 
                 duplicates.add((dup_fp, score, EvidenceMethod.AI.value))
 

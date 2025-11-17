@@ -337,8 +337,6 @@ class ResultsTreeModel(QAbstractItemModel):
             return display_name
         elif col == 1:
             if node.is_best:
-                if node.channel:
-                    return f"[{BEST_FILE_METHOD_NAME} - {node.channel}]"
                 return f"[{BEST_FILE_METHOD_NAME}]"
             method_map = METHOD_DISPLAY_NAMES
             if display_text := method_map.get(node.found_by):
@@ -792,10 +790,7 @@ class ImageItemDelegate(QStyledItemDelegate):
 
         dist_text = ""
         if item_data.is_best:
-            if item_data.channel:
-                dist_text = f"[{BEST_FILE_METHOD_NAME} - {item_data.channel}] | "
-            else:
-                dist_text = f"[{BEST_FILE_METHOD_NAME}] | "
+            dist_text = f"[{BEST_FILE_METHOD_NAME}] | "
         else:
             method = item_data.found_by
             dist = item_data.distance

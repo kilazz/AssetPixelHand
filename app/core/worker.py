@@ -171,10 +171,23 @@ def _process_batch_from_paths_for_ai(
 
             pil_image = pil_image.convert("RGBA")
 
-            if config.compare_by_channel:
+            tags_to_check = config.channel_split_tags
+            should_split_this_file = config.compare_by_channel and (
+                not tags_to_check or any(tag in path.name.lower() for tag in tags_to_check)
+            )
+
+            if should_split_this_file:
                 channels_to_process = pil_image.split()
                 channel_names = ["R", "G", "B", "A"]
                 for i, channel_img in enumerate(channels_to_process):
+                    # If enabled, check if the channel is solid black or white
+                    if config.ignore_solid_channels:
+                        # getextrema() returns (min, max) pixel values.
+                        # If min == max, the channel is a solid color.
+                        min_val, max_val = channel_img.getextrema()
+                        if min_val == max_val and (min_val == 0 or min_val == 255):
+                            continue  # Skip this solid channel
+
                     # Convert single channel to RGB for the model
                     processed_image = Image.merge("RGB", (channel_img, channel_img, channel_img))
                     images.append(processed_image)

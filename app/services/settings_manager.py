@@ -110,6 +110,18 @@ class SettingsManager(QObject):
             self._settings.hashing.compare_by_channel = checked
             self._request_save()
 
+    @Slot(str)
+    def set_channel_split_tags(self, text: str):
+        if self._settings.hashing.channel_split_tags != text:
+            self._settings.hashing.channel_split_tags = text
+            self._request_save()
+
+    @Slot(bool)
+    def set_ignore_solid_channels(self, checked: bool):
+        if self._settings.hashing.ignore_solid_channels != checked:
+            self._settings.hashing.ignore_solid_channels = checked
+            self._request_save()
+
     @Slot(bool)
     def set_lancedb_in_memory(self, checked: bool):
         if self._settings.lancedb_in_memory != checked:

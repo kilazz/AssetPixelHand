@@ -416,8 +416,26 @@ class ScanOptionsPanel(QGroupBox):
             "Useful for finding textures with packed maps (e.g., metallic, roughness).\n"
             "Warning: Significantly increases scan time and memory usage."
         )
-        hashing_grid.addWidget(self.channel_check, 4, 0, 1, 3)
+        self.channel_tags_entry = QLineEdit()
+        self.channel_tags_entry.setPlaceholderText("e.g. diff, spec, ddna (comma-separated)")
 
+        channel_layout_container = QWidget()
+        channel_layout = QHBoxLayout(channel_layout_container)
+        channel_layout.setContentsMargins(0, 0, 0, 0)
+        channel_layout.addWidget(self.channel_check)
+        channel_layout.addWidget(self.channel_tags_entry)
+
+        hashing_grid.addWidget(channel_layout_container, 4, 0, 1, 3)
+
+        self.ignore_solid_check = QCheckBox("Ignore solid black/white channels")
+        self.ignore_solid_check.setToolTip(
+            "If enabled, channels that are completely black or white will not be compared.\nReduces noise from unused channels."
+        )
+        ignore_layout = QHBoxLayout()
+        ignore_layout.setContentsMargins(20, 0, 0, 0)  # Indent to show it's a sub-option
+        ignore_layout.addWidget(self.ignore_solid_check)
+
+        hashing_grid.addLayout(ignore_layout, 5, 0, 1, 3)
         layout.addLayout(hashing_grid)
 
         self.lancedb_in_memory_check = QCheckBox("Use in-memory database (fastest)")
@@ -460,6 +478,10 @@ class ScanOptionsPanel(QGroupBox):
         self.phash_threshold_spin.valueChanged.connect(self.settings_manager.set_phash_threshold)
         self.luminance_check.toggled.connect(self.settings_manager.set_compare_by_luminance)
         self.channel_check.toggled.connect(self.settings_manager.set_compare_by_channel)
+        self.channel_tags_entry.textChanged.connect(self.settings_manager.set_channel_split_tags)
+        self.channel_check.toggled.connect(self.channel_tags_entry.setEnabled)
+        self.channel_check.toggled.connect(self.ignore_solid_check.setEnabled)
+        self.ignore_solid_check.toggled.connect(self.settings_manager.set_ignore_solid_channels)
         self.lancedb_in_memory_check.toggled.connect(self.settings_manager.set_lancedb_in_memory)
         self.save_visuals_check.toggled.connect(self.settings_manager.set_save_visuals)
         self.visuals_tonemap_check.toggled.connect(self.settings_manager.set_visuals_tonemap)
@@ -522,6 +544,10 @@ class ScanOptionsPanel(QGroupBox):
         self.phash_threshold_spin.setValue(s.hashing.phash_threshold)
         self.luminance_check.setChecked(s.hashing.compare_by_luminance)
         self.channel_check.setChecked(s.hashing.compare_by_channel)
+        self.channel_tags_entry.setText(s.hashing.channel_split_tags)
+        self.channel_tags_entry.setEnabled(s.hashing.compare_by_channel)
+        self.ignore_solid_check.setChecked(s.hashing.ignore_solid_channels)
+        self.ignore_solid_check.setEnabled(s.hashing.compare_by_channel)
         self._update_hashing_options_state()
 
         self.lancedb_in_memory_check.setChecked(s.lancedb_in_memory)

@@ -242,6 +242,8 @@ class ScanConfig:
     visuals_columns: int
     tonemap_visuals: bool
     tonemap_view: str
+    ignore_solid_channels: bool = True
+    channel_split_tags: list[str] = field(default_factory=list)
     model_info: dict = field(default_factory=dict)
     sample_path: Path | None = None
     search_query: str | None = None
@@ -256,6 +258,8 @@ class HashingSettings:
     phash_threshold: int = 8
     compare_by_luminance: bool = False
     compare_by_channel: bool = False
+    channel_split_tags: str = ""
+    ignore_solid_channels: bool = True
 
 
 @dataclass
@@ -318,6 +322,8 @@ class AppSettings:
                     "phash_threshold": data.pop("phash_threshold", 8),
                     "compare_by_luminance": data.pop("compare_by_luminance", False),
                     "compare_by_channel": data.pop("compare_by_channel", False),
+                    "channel_split_tags": data.pop("channel_split_tags", ""),
+                    "ignore_solid_channels": data.pop("ignore_solid_channels", True),
                 }
             if "perf_num_workers" in data:
                 data["performance"] = {

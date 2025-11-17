@@ -53,8 +53,9 @@ class ScanConfigBuilder:
             excluded_folders=[p.strip() for p in self.settings.exclude.split(",") if p.strip()],
             model_name=onnx_name,
             model_dim=model_info["dim"],
-            model_info=model_info,
             selected_extensions=self.settings.selected_extensions,
+            perf=performance_config,
+            search_precision=self.settings.performance.search_precision,
             scan_mode=self.scan_mode,
             device=self.settings.performance.device,
             find_exact_duplicates=self.settings.hashing.find_exact,
@@ -70,10 +71,14 @@ class ScanConfigBuilder:
             visuals_columns=self.settings.visuals.columns,
             tonemap_visuals=self.settings.visuals.tonemap_enabled,
             tonemap_view=self.settings.viewer.tonemap_view,
-            search_precision=self.settings.performance.search_precision,
-            search_query=self.search_query if self.scan_mode == ScanMode.TEXT_SEARCH else None,
+            # Fields with default values
+            ignore_solid_channels=self.settings.hashing.ignore_solid_channels,
+            channel_split_tags=[
+                tag.strip().lower() for tag in self.settings.hashing.channel_split_tags.split(",") if tag.strip()
+            ],
+            model_info=model_info,
             sample_path=self.sample_path,
-            perf=performance_config,
+            search_query=self.search_query if self.scan_mode == ScanMode.TEXT_SEARCH else None,
         )
 
     def _validate_folder_path(self) -> Path:
