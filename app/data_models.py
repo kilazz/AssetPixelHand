@@ -64,6 +64,15 @@ FINGERPRINT_FIELDS = {
 }
 
 
+class EvidenceMethod(Enum):
+    XXHASH = "xxHash"
+    DHASH = "dHash"
+    PHASH = "pHash"
+    WHASH = "wHash"
+    AI = "AI"
+    UNKNOWN = "Unknown"
+
+
 class ScanMode(Enum):
     DUPLICATES = auto()
     TEXT_SEARCH = auto()

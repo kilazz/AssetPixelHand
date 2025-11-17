@@ -12,7 +12,6 @@ from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from enum import Enum
 from functools import partial
 from pathlib import Path
 from typing import Any, TypeVar
@@ -23,6 +22,7 @@ import numpy as np
 from app.constants import LANCEDB_AVAILABLE
 from app.data_models import (
     AnalysisItem,
+    EvidenceMethod,
     ImageFingerprint,
     ScanConfig,
     ScanState,
@@ -59,15 +59,6 @@ def _popcount(n: np.uint64) -> int:
             count += 1
         val >>= 1
     return count
-
-
-class EvidenceMethod(Enum):
-    XXHASH = "xxHash"
-    DHASH = "dHash"
-    PHASH = "pHash"
-    WHASH = "wHash"
-    AI = "AI"
-    UNKNOWN = "Unknown"
 
 
 @dataclass(frozen=True)

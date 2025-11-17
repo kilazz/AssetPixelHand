@@ -12,12 +12,14 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 import numpy as np
+import polars as pl
 import pyarrow as pa
 
 from app.constants import BEST_FILE_METHOD_NAME, DUCKDB_AVAILABLE, RESULTS_DB_FILE
 from app.data_models import (
     AnalysisItem,
     DuplicateResults,
+    EvidenceMethod,
     ImageFingerprint,
     ScanConfig,
     ScanMode,
@@ -100,9 +102,58 @@ class ScanStrategy(ABC):
                 _configure_db_connection(conn)
                 self._create_results_table(conn)
 
-                data = self._prepare_results_data(final_groups, search_context)
-                if data:
-                    arrow_table = pa.Table.from_pylist(data)
+                data_rows = self._prepare_results_data(final_groups, search_context)
+                if data_rows:
+                    from app.data_models import FINGERPRINT_FIELDS
+
+                    # 1. Transpose data from a list of rows to a dictionary of columns
+                    # Use the keys from the first row as the source of truth for column names
+                    all_keys = data_rows[0].keys()
+                    columns = {key: [row.get(key) for row in data_rows] for key in all_keys}
+
+                    # 2. Define the schema and create arrays with explicit types
+                    schema_fields = []
+                    arrays = []
+
+                    # This order MUST match the order of keys in the created dictionaries
+                    ordered_keys = [
+                        "group_id",
+                        "is_best",
+                        *FINGERPRINT_FIELDS.keys(),
+                        "distance",
+                        "search_context",
+                        "found_by",
+                    ]
+
+                    type_map = {
+                        "group_id": pa.int32(),
+                        "is_best": pa.bool_(),
+                        "distance": pa.int32(),
+                        "search_context": pa.string(),
+                        "found_by": pa.string(),
+                    }
+                    for name, types in FINGERPRINT_FIELDS.items():
+                        type_map[name] = types["pyarrow"]
+
+                    for key in ordered_keys:
+                        if key in columns:
+                            col_type = type_map.get(key)
+                            if not col_type:
+                                continue
+
+                            col_data = columns[key]
+
+                            # Manually cast data to the correct type before giving it to pyarrow
+                            if col_type == pa.bool_():
+                                col_data = [bool(x) if x is not None else None for x in col_data]
+
+                            schema_fields.append(pa.field(key, col_type))
+                            arrays.append(pa.array(col_data, type=col_type))
+
+                    # 3. Create the table from the schema and sanitized arrays
+                    schema = pa.schema(schema_fields)
+                    arrow_table = pa.Table.from_arrays(arrays, schema=schema)
+
                     conn.register("results_arrow", arrow_table)
                     conn.execute("INSERT INTO results SELECT * FROM results_arrow")
 
@@ -198,7 +249,7 @@ class FindDuplicatesStrategy(ScanStrategy):
         self.all_skipped_files.extend(context.all_skipped_files)
 
         if not stop_event.is_set():
-            # Unified result processing, regardless of scan mode
+
             def fp_resolver(node: tuple[Path, str | None]) -> ImageFingerprint | None:
                 path, channel = node
                 if fp_orig := context.all_image_fps.get(path):
@@ -218,7 +269,6 @@ class FindDuplicatesStrategy(ScanStrategy):
         if self.config.find_exact_duplicates:
             pipeline.append((ExactDuplicateStage(), 0.10))
 
-        # ItemGeneration is required for any perceptual or AI analysis
         needs_item_generation = (
             self.config.find_simple_duplicates
             or self.config.find_perceptual_duplicates
@@ -282,7 +332,6 @@ class SearchStrategy(ScanStrategy):
             stop_event=stop_event,
         )
 
-        # In search mode, we always generate composite items
         items = [AnalysisItem(path=path, analysis_type="Composite") for path in all_files]
         for item in items:
             if item.path not in self.scanner_core.all_image_fps and (meta := get_image_metadata(item.path)):
@@ -340,14 +389,16 @@ class SearchStrategy(ScanStrategy):
             self.config, self.state, self.signals, self.scanner_core.db, self.scanner_core.table
         )
 
-        hits = (
-            self.scanner_core.table.search(query_vector, radius=sim_engine.distance_threshold)
+        raw_hits = (
+            self.scanner_core.table.search(query_vector)
             .metric("cosine")
             .limit(1000)
             .nprobes(sim_engine.nprobes)
             .refine_factor(sim_engine.refine_factor)
             .to_polars()
         )
+
+        hits = raw_hits.filter(pl.col("_distance") < sim_engine.distance_threshold)
 
         results = [
             (ImageFingerprint.from_db_row(row_dict), row_dict["_distance"]) for row_dict in hits.iter_rows(named=True)
@@ -360,8 +411,6 @@ class SearchStrategy(ScanStrategy):
         return len(results), str(RESULTS_DB_FILE)
 
     def _save_search_results(self, results: list[tuple[ImageFingerprint, float]]):
-        from app.data_models import EvidenceMethod
-
         """Format and save search results to database."""
         dups = [(fp, int(max(0.0, (1.0 - d)) * 100), EvidenceMethod.AI.value) for fp, d in results]
         best_fp = self._create_search_context_fingerprint()
