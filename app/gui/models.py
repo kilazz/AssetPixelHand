@@ -4,7 +4,7 @@ and QListView. These components are responsible for managing and presenting data
 """
 
 import logging
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -139,33 +139,53 @@ class ResultsTreeModel(QAbstractItemModel):
                 if self.filter_text:
                     group_filter_clause = "WHERE group_id IN (SELECT group_id FROM results WHERE path ILIKE ?)"
                     params.append(f"%{self.filter_text}%")
-                group_query = f"SELECT group_id, COUNT(*), SUM(file_size), MAX(search_context) as search_context FROM results {group_filter_clause} GROUP BY group_id ORDER BY group_id"
-                paths_by_group = defaultdict(list)
-                best_file_filter_clause = group_filter_clause if group_filter_clause else "WHERE is_best = TRUE"
-                if "WHERE" in best_file_filter_clause and "is_best" not in best_file_filter_clause:
-                    best_file_filter_clause += " AND is_best = TRUE"
-                best_file_query = f"SELECT group_id, path FROM results {best_file_filter_clause}"
-                for group_id, path_str in conn.execute(best_file_query, params).fetchall():
-                    paths_by_group[group_id].append(Path(path_str))
-                    self.group_id_to_best_path[group_id] = path_str
-                for row in conn.execute(group_query, params).fetchall():
-                    group_id, count, total_size, search_context = row
-                    group_name = find_common_base_name(paths_by_group.get(group_id, []))
 
-                    if search_context:
-                        count -= 1
-                        if search_context.startswith("sample:"):
-                            group_name = f"Sample: {search_context.split(':', 1)[1]}"
-                        elif search_context.startswith("query:"):
-                            group_name = f"Query: '{search_context.split(':', 1)[1]}'"
-                        elif search_context.startswith("channel:"):
+                group_query = f"SELECT group_id, COUNT(*), SUM(file_size) FROM results {group_filter_clause} GROUP BY group_id ORDER BY group_id"
+                groups = conn.execute(group_query, params).fetchall()
+
+                for group_id, count, total_size in groups:
+                    # Robustly determine the group name
+                    best_file_row = conn.execute(
+                        "SELECT path, search_context, channel FROM results WHERE group_id = ? AND is_best = TRUE",
+                        [group_id],
+                    ).fetchone()
+
+                    group_name = "Group"
+                    if best_file_row:
+                        best_path_str, search_context, _ = best_file_row
+                        self.group_id_to_best_path[group_id] = best_path_str
+                        best_path = Path(best_path_str)
+                        group_name = best_path.stem
+
+                        # The most reliable way to name a channel group is to check the search_context
+                        if search_context and search_context.startswith("channel:"):
                             channel = search_context.split(":", 1)[1]
-                            base_name = paths_by_group.get(group_id, [Path("Unknown")])[0].name
-                            group_name = f"{base_name} ({channel})"
+                            group_name = f"{best_path.name} ({channel})"
+                        elif search_context:  # Handle text/sample search contexts
+                            if search_context.startswith("sample:"):
+                                group_name = f"Sample: {search_context.split(':', 1)[1]}"
+                            elif search_context.startswith("query:"):
+                                group_name = f"Query: '{search_context.split(':', 1)[1]}'"
+                            count -= 1  # Don't count the query/sample itself
+                        else:
+                            # Fallback for non-AI channel matching: check if all members have the same channel
+                            distinct_channels = conn.execute(
+                                "SELECT DISTINCT channel FROM results WHERE group_id = ?", [group_id]
+                            ).fetchall()
+                            if len(distinct_channels) == 1 and distinct_channels[0][0] is not None:
+                                channel = distinct_channels[0][0]
+                                group_name = f"{best_path.name} ({channel})"
+                            else:
+                                # If channels are mixed or null, find a common name
+                                all_paths_in_group = conn.execute(
+                                    "SELECT path FROM results WHERE group_id = ?", [group_id]
+                                ).fetchall()
+                                group_name = find_common_base_name([Path(p[0]) for p in all_paths_in_group])
 
                     self.groups_data[group_id] = GroupNode(
                         name=group_name, count=count, total_size=total_size, group_id=group_id
                     )
+
                 self.sorted_group_ids = list(self.groups_data.keys())
         except duckdb.Error as e:
             app_logger.error(f"Failed to read results from DuckDB: {e}", exc_info=True)

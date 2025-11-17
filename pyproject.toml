@@ -61,11 +61,38 @@ dev = [
 
 [tool.ruff]
 exclude = [
-    ".bzr", ".direnv", ".eggs", ".git", ".git-rewrite", ".hg",
-    ".ipynb_checkpoints", ".mypy_cache", ".nox", ".pants.d", ".pyenv",
-    ".pytest_cache", ".pytype", ".ruff_cache", ".svn", ".tox", ".venv",
-    ".vscode", "__pypackages__", "_build", "buck-out", "build", "dist",
-    "node_modules", "site-packages", "venv", "app_data", "_src_directxtex_decoder", "_src_pillow-simd"
+	"__pypackages__",
+	".direnv",
+	".eggs",
+	".git",
+	".git-rewrite",
+	".hg",
+	".mypy_cache",
+	".nox",
+	".pants.d",
+	".pyenv",
+	".pytype",
+	".svn",
+	".tox",
+	"_build",
+	"buck-out",
+	"build",
+	"dist",
+	"site-packages",
+    ".bzr",
+    ".ipynb_checkpoints",
+    ".pytest_cache",
+    ".vscode",
+    "node_modules",
+	".ruff_cache",
+	"_src_directxtex_decoder",
+	"app_data",
+	"venv",
+	".venv",
+	".venv-webgpu",
+	".venv-directml",
+	".venv-cuda",
+	".venv-cpu",
 ]
 
 line-length = 120

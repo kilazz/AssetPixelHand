@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass, field, fields
 from enum import Enum, auto
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pyarrow as pa
@@ -26,6 +26,21 @@ from app.constants import (
 
 if TYPE_CHECKING:
     pass
+
+
+# Type hint for the analysis type. "Composite" means the full, standard image.
+AnalysisType = Literal["Composite", "Luminance", "R", "G", "B", "A"]
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisItem:
+    """Represents a single item to be analyzed by the pipeline.
+    This decouples the pipeline from files, allowing it to process channels,
+    luminance versions, or other variations of a file as distinct items.
+    """
+
+    path: Path
+    analysis_type: AnalysisType
 
 
 # A centralized source of truth for all fingerprint-related fields, their types, and defaults.
@@ -87,6 +102,7 @@ class ImageFingerprint:
     xxhash: str | None = field(default=None)
     dhash: Any | None = field(default=None)
     phash: Any | None = field(default=None)
+    whash: Any | None = field(default=None)
     channel: str | None = field(default=None)
 
     def __hash__(self) -> int:
@@ -219,6 +235,7 @@ class PerformanceConfig:
 
 @dataclass
 class ScanConfig:
+    # --- All fields WITHOUT a default value MUST come first ---
     folder_path: Path
     similarity_threshold: int
     save_visuals: bool
@@ -231,17 +248,22 @@ class ScanConfig:
     search_precision: str
     scan_mode: ScanMode
     device: str
+    use_ai: bool
     find_exact_duplicates: bool
     find_simple_duplicates: bool
     dhash_threshold: int
     find_perceptual_duplicates: bool
     phash_threshold: int
+    find_structural_duplicates: bool
+    whash_threshold: int
     compare_by_luminance: bool
     compare_by_channel: bool
     lancedb_in_memory: bool
     visuals_columns: int
     tonemap_visuals: bool
     tonemap_view: str
+
+    # --- All fields WITH a default value MUST come after ---
     ignore_solid_channels: bool = True
     channel_split_tags: list[str] = field(default_factory=list)
     model_info: dict = field(default_factory=dict)
@@ -251,11 +273,14 @@ class ScanConfig:
 
 @dataclass
 class HashingSettings:
+    use_ai: bool = True
     find_exact: bool = True
     find_simple: bool = True
     dhash_threshold: int = 8
     find_perceptual: bool = True
     phash_threshold: int = 8
+    find_structural: bool = False
+    whash_threshold: int = 2
     compare_by_luminance: bool = False
     compare_by_channel: bool = False
     channel_split_tags: str = ""
@@ -315,6 +340,7 @@ class AppSettings:
             # Backward Compatibility
             if "find_exact_duplicates" in data:
                 data["hashing"] = {
+                    "use_ai": data.pop("use_ai", True),
                     "find_exact": data.pop("find_exact_duplicates", True),
                     "find_simple": data.pop("find_simple_duplicates", True),
                     "dhash_threshold": data.pop("dhash_threshold", 8),

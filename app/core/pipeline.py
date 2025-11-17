@@ -65,12 +65,16 @@ class PipelineManager(QObject):
     def run(self, context: "ScanContext") -> tuple[bool, list[str]]:
         """
         Starts and runs the AI fingerprinting pipeline using the provided context.
-        It processes only the files listed in `context.files_to_process` and
+        It processes the items listed in `context.items_to_process` and
         updates the `ImageFingerprint` objects within `context.all_image_fps`.
         """
-        files_to_process = context.files_to_process
+        items_to_process = context.items_to_process
+        if not items_to_process:
+            return True, []
+
+        unique_files_count = len(set(item.path for item in items_to_process))
         log_msg = (
-            f"Starting AI pipeline for {len(files_to_process)} unique files: "
+            f"Starting AI pipeline for {len(items_to_process)} items ({unique_files_count} unique files): "
             f"{self.num_workers} CPU workers, inference on {self.config.device}."
         )
         app_logger.info(log_msg)
@@ -81,16 +85,16 @@ class PipelineManager(QObject):
         try:
             input_size, buffer_shape, dtype = self._get_model_and_buffer_config()
 
-            free_buffers_q, tensor_q, results_q = self._setup_communication(len(files_to_process))
+            free_buffers_q, tensor_q, results_q = self._setup_communication(len(items_to_process))
             self.infer_proc = self._start_inference_process(tensor_q, results_q, free_buffers_q)
 
             all_skipped = self._run_preprocessing_pool(
-                files_to_process, input_size, buffer_shape, dtype, free_buffers_q, tensor_q, results_q, cache, context
+                items_to_process, input_size, buffer_shape, dtype, free_buffers_q, tensor_q, results_q, cache, context
             )
             return True, all_skipped
         except Exception as e:
             app_logger.critical(f"Pipeline failed critically: {e}", exc_info=True)
-            return False, [str(f) for f in files_to_process]
+            return False, [str(item.path) for item in items_to_process]
         finally:
             self._cleanup()
             cache.close()
@@ -114,7 +118,7 @@ class PipelineManager(QObject):
         buffer_shape = (self.config.perf.batch_size * batch_multiplier, 3, *input_size)
         return input_size, buffer_shape, dtype
 
-    def _setup_communication(self, num_files: int) -> tuple:
+    def _setup_communication(self, num_items: int) -> tuple:
         """Creates shared memory buffers and multiprocessing queues."""
         num_buffers = max(8, self.num_workers * 2)
         _, buffer_shape, dtype = self._get_model_and_buffer_config()
@@ -129,7 +133,7 @@ class PipelineManager(QObject):
         tensor_q = self.ctx.Queue(maxsize=num_buffers)
 
         queue_size_multiplier = 4 if self.config.compare_by_channel else 1
-        results_q = self.ctx.Queue(maxsize=(num_files * queue_size_multiplier) + 1)
+        results_q = self.ctx.Queue(maxsize=(num_items * queue_size_multiplier) + 1)
         return free_buffers_q, tensor_q, results_q
 
     def _start_inference_process(self, tensor_q, results_q, free_buffers_q) -> "multiprocessing.Process":
@@ -151,7 +155,7 @@ class PipelineManager(QObject):
         return infer_proc
 
     def _run_preprocessing_pool(
-        self, files_to_process, input_size, buffer_shape, dtype, free_buffers_q, tensor_q, results_q, cache, context
+        self, items_to_process, input_size, buffer_shape, dtype, free_buffers_q, tensor_q, results_q, cache, context
     ) -> list[str]:
         """Runs the main pipeline loop, processing data through the worker pool."""
         preproc_init_cfg = {
@@ -171,8 +175,8 @@ class PipelineManager(QObject):
             initargs=(preproc_init_cfg, free_buffers_q),
         ) as pool:
             data_generator = (
-                files_to_process[i : i + self.config.perf.batch_size]
-                for i in range(0, len(files_to_process), self.config.perf.batch_size)
+                items_to_process[i : i + self.config.perf.batch_size]
+                for i in range(0, len(items_to_process), self.config.perf.batch_size)
             )
             preproc_results_iterator = pool.imap_unordered(worker_func, data_generator)
             _, all_skipped = self._pipeline_loop(preproc_results_iterator, tensor_q, results_q, cache, context)
@@ -182,9 +186,12 @@ class PipelineManager(QObject):
         self, preproc_results, tensor_q, results_q, cache, context: "ScanContext"
     ) -> tuple[int, list[str]]:
         """The core loop that orchestrates the data flow between workers."""
-        total_files, processed_count, fps_to_cache, all_skipped = len(context.files_to_process), 0, [], []
+        processed_count, fps_to_cache, all_skipped = 0, [], []
         feeding_complete = False
         processed_paths = set()
+
+        # We track progress based on unique files, but process based on items
+        total_files = len(set(item.path for item in context.items_to_process))
 
         while processed_count < total_files:
             if self.stop_event.is_set() or not self.infer_proc.is_alive():

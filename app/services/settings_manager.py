@@ -69,6 +69,12 @@ class SettingsManager(QObject):
 
     # --- Slots for ScanOptionsPanel ---
     @Slot(bool)
+    def set_use_ai(self, checked: bool):
+        if self._settings.hashing.use_ai != checked:
+            self._settings.hashing.use_ai = checked
+            self._request_save()
+
+    @Slot(bool)
     def set_find_exact(self, checked: bool):
         if self._settings.hashing.find_exact != checked:
             self._settings.hashing.find_exact = checked
@@ -96,6 +102,18 @@ class SettingsManager(QObject):
     def set_phash_threshold(self, value: int):
         if self._settings.hashing.phash_threshold != value:
             self._settings.hashing.phash_threshold = value
+            self._request_save()
+
+    @Slot(bool)
+    def set_find_structural(self, checked: bool):
+        if self._settings.hashing.find_structural != checked:
+            self._settings.hashing.find_structural = checked
+            self._request_save()
+
+    @Slot(int)
+    def set_whash_threshold(self, value: int):
+        if self._settings.hashing.whash_threshold != value:
+            self._settings.hashing.whash_threshold = value
             self._request_save()
 
     @Slot(bool)
@@ -152,7 +170,7 @@ class SettingsManager(QObject):
             self._settings.visuals.tonemap_enabled = checked
             self._request_save()
 
-    # --- Slots for PerformancePanel & Low Priority Check ---
+    # --- Slots for PerformancePanel and Low Priority Check ---
     @Slot(bool)
     def set_low_priority(self, checked: bool):
         if self._settings.performance.low_priority != checked:

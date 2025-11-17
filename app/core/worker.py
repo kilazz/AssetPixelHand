@@ -27,7 +27,7 @@ from app.constants import (
 from app.image_io import load_image
 
 if TYPE_CHECKING:
-    from app.data_models import ScanConfig
+    from app.data_models import AnalysisItem, ScanConfig
 
 
 app_logger = logging.getLogger("AssetPixelHand.worker")
@@ -158,68 +158,72 @@ def init_preprocessor_worker(config: dict, queue: "multiprocessing.Queue"):
 
 
 def _process_batch_from_paths_for_ai(
-    paths: list[Path], input_size, config: "ScanConfig"
-) -> tuple[list[Image.Image], list[tuple[Path, str]], list[tuple[str, str]]]:
-    """Loads and preprocesses images specifically for AI inference."""
+    items: list["AnalysisItem"], input_size, config: "ScanConfig"
+) -> tuple[list[Image.Image], list[tuple[Path, str | None]], list[tuple[str, str]]]:
+    """Loads and preprocesses images for AI inference based on a list of AnalysisItems."""
     images, successful_paths_with_channels, skipped_tuples = [], [], []
-    for path in paths:
+    for item in items:
+        path = item.path
+        analysis_type = item.analysis_type
         try:
             pil_image = load_image(path)
             if not pil_image:
                 skipped_tuples.append((str(path), "Image loading failed"))
                 continue
 
-            pil_image = pil_image.convert("RGBA")
+            processed_image = None
+            channel_name: str | None = None
 
-            tags_to_check = config.channel_split_tags
-            should_split_this_file = config.compare_by_channel and (
-                not tags_to_check or any(tag in path.name.lower() for tag in tags_to_check)
-            )
+            if analysis_type in ("R", "G", "B", "A"):
+                pil_image = pil_image.convert("RGBA")
+                channels = pil_image.split()
+                channel_map = {"R": 0, "G": 1, "B": 2, "A": 3}
+                channel_index = channel_map[analysis_type]
 
-            if should_split_this_file:
-                channels_to_process = pil_image.split()
-                channel_names = ["R", "G", "B", "A"]
-                for i, channel_img in enumerate(channels_to_process):
-                    if config.ignore_solid_channels:
-                        min_val, max_val = channel_img.getextrema()
-                        if min_val == max_val and (min_val == 0 or min_val == 255):
-                            continue
+                if config.ignore_solid_channels:
+                    min_val, max_val = channels[channel_index].getextrema()
+                    if min_val == max_val and (min_val == 0 or min_val == 255):
+                        continue  # Skip solid channel
 
-                    processed_image = Image.merge("RGB", (channel_img, channel_img, channel_img))
-                    images.append(processed_image)
-                    successful_paths_with_channels.append((path, channel_names[i]))
-            else:
-                # Standard logic for composite images
+                channel_img = channels[channel_index]
+                processed_image = Image.merge("RGB", (channel_img, channel_img, channel_img))
+                channel_name = analysis_type
+
+            elif analysis_type == "Luminance":
+                processed_image = pil_image.convert("L").convert("RGB")
+                channel_name = None  # Luminance is not a channel, so no label
+
+            else:  # "Composite"
                 if pil_image.mode == "RGBA":
                     processed_image = Image.new("RGB", pil_image.size, (0, 0, 0))
                     processed_image.paste(pil_image, mask=pil_image.split()[3])
                 else:
                     processed_image = pil_image.convert("RGB")
+                channel_name = None  # Composite image has no specific channel label
 
-                if config.compare_by_luminance:
-                    processed_image = processed_image.convert("L").convert("RGB")
-
+            if processed_image:
                 images.append(processed_image)
-                successful_paths_with_channels.append((path, None))
+                successful_paths_with_channels.append((path, channel_name))
 
         except Exception as e:
-            app_logger.error(f"Error processing {path.name} in AI batch", exc_info=True)
+            app_logger.error(f"Error processing {path.name} ({analysis_type}) in AI batch", exc_info=True)
             skipped_tuples.append((str(path), f"{type(e).__name__}: {str(e).splitlines()[0]}"))
     return images, successful_paths_with_channels, skipped_tuples
 
 
 def worker_preprocess_for_ai(
-    paths: list[Path], input_size: tuple[int, int], buffer_shape, dtype, config: "ScanConfig"
+    items: list["AnalysisItem"], input_size: tuple[int, int], buffer_shape, dtype, config: "ScanConfig"
 ) -> tuple:
-    """CPU worker that loads, preprocesses images, and places the tensor into shared memory."""
+    """CPU worker that loads, preprocesses images based on AnalysisItems, and places the tensor into shared memory."""
     global g_free_buffers_q, g_preprocessor
     if g_free_buffers_q is None or g_preprocessor is None:
         raise RuntimeError("Preprocessor worker not initialized correctly.")
     try:
         images, successful_paths_with_channels, skipped_tuples = _process_batch_from_paths_for_ai(
-            paths, input_size, config
+            items, input_size, config
         )
         if not images:
+            # Still need to report skips even if no images were processed
             return None, [], skipped_tuples
 
         pixel_values = g_preprocessor(images=images, return_tensors="np").pixel_values
@@ -240,7 +244,9 @@ def worker_preprocess_for_ai(
         return meta_message, [], skipped_tuples
     except Exception as e:
         _log_worker_crash(e, "worker_preprocess_for_ai")
-        return None, [], [(str(p), f"Batch failed: {type(e).__name__}") for p in paths]
+        # Extract paths from the items for error reporting
+        paths_in_batch = [str(item.path) for item in items]
+        return None, [], [(p, f"Batch failed: {type(e).__name__}") for p in paths_in_batch]
 
 
 def inference_worker_loop(config: dict, tensor_q, results_q, free_buffers_q):
@@ -292,7 +298,6 @@ def inference_worker_loop(config: dict, tensor_q, results_q, free_buffers_q):
 
                 embeddings = normalize_vectors_numpy(embeddings)
 
-                # Return a dictionary mapping the (path, channel) tuple to its vector
                 batch_results = {pc: vec for pc, vec in zip(paths_with_channels, embeddings, strict=False)}
                 results_q.put((batch_results, skipped_tuples))
             elif skipped_tuples:
@@ -317,8 +322,7 @@ def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
     if g_inference_engine is None:
         return None
     try:
-        # For sample search, we don't split by channel, so a dummy config is fine.
-        from app.data_models import PerformanceConfig, ScanConfig, ScanMode
+        from app.data_models import AnalysisItem, PerformanceConfig, ScanConfig, ScanMode
 
         dummy_config = ScanConfig(
             folder_path=Path("."),
@@ -333,6 +337,7 @@ def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
             search_precision="",
             scan_mode=ScanMode.SAMPLE_SEARCH,
             device="",
+            use_ai=True,
             find_exact_duplicates=False,
             find_simple_duplicates=False,
             dhash_threshold=0,
@@ -346,7 +351,12 @@ def worker_get_single_vector(image_path: Path) -> np.ndarray | None:
             tonemap_view="",
         )
 
-        images, _, skipped = _process_batch_from_paths_for_ai([image_path], g_inference_engine.input_size, dummy_config)
+        # Wrap the path in an AnalysisItem
+        items_to_process = [AnalysisItem(path=image_path, analysis_type="Composite")]
+        images, _, skipped = _process_batch_from_paths_for_ai(
+            items_to_process, g_inference_engine.input_size, dummy_config
+        )
+
         if skipped:
             app_logger.warning(f"Failed to process single vector for {image_path}: {skipped[0][1]}")
             return None

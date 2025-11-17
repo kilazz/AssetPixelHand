@@ -10,18 +10,26 @@ import multiprocessing
 import threading
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import numba
 import numpy as np
 from numba import types
-from numba.typed import List  # Important import for typed lists
+from numba.typed import List
 
 from app.constants import LANCEDB_AVAILABLE
-from app.data_models import ImageFingerprint, ScanConfig, ScanState
+from app.data_models import (
+    AnalysisItem,
+    ImageFingerprint,
+    ScanConfig,
+    ScanState,
+)
+from app.image_io import get_image_metadata
 from app.services.signal_bus import SignalBus
 from app.utils import find_best_in_group
 
@@ -45,6 +53,9 @@ except ImportError:
     SCIPY_AVAILABLE = False
 
 app_logger = logging.getLogger("AssetPixelHand.scan_stages")
+
+# Generic TypeVar for our nodes, which can be a Path or a (Path, channel) tuple.
+NodeType = TypeVar("NodeType")
 
 
 # --- Numba JIT-compiled helpers for fast perceptual hash clustering ---
@@ -81,8 +92,10 @@ def _find_hash_edges_numba(hashes: np.ndarray, threshold: int) -> tuple[np.ndarr
         for j in range(i + 1, n):
             distance = _popcount(hashes[i] ^ hashes[j])
             if distance <= threshold:
-                rows_list[i].append(np.int64(i))
-                cols_list[i].append(np.int64(j))
+                i_as_int64 = np.int64(i)
+                j_as_int64 = np.int64(j)
+                rows_list[i_as_int64].append(i_as_int64)
+                cols_list[i_as_int64].append(j_as_int64)
 
     total_size = 0
     for sublist in rows_list:
@@ -109,6 +122,7 @@ class EvidenceMethod(Enum):
     XXHASH = "xxHash"
     DHASH = "dHash"
     PHASH = "pHash"
+    WHASH = "wHash"
     AI = "AI"
     UNKNOWN = "Unknown"
 
@@ -121,7 +135,8 @@ class HashingConfig:
 
 
 METHOD_PRIORITY = {
-    EvidenceMethod.XXHASH.value: 4,
+    EvidenceMethod.XXHASH.value: 5,
+    EvidenceMethod.WHASH.value: 4,
     EvidenceMethod.DHASH.value: 3,
     EvidenceMethod.PHASH.value: 2,
     EvidenceMethod.AI.value: 1,
@@ -150,41 +165,42 @@ class EvidenceRecord:
         return False
 
 
-class PrecisionCluster:
+class PrecisionCluster[NodeType]:
     __slots__ = ("_max_indirect_depth", "connection_graph", "evidence_matrix", "id", "members")
 
     def __init__(self, cluster_id: int, max_indirect_depth: int = 3):
         self.id = cluster_id
-        self.members: set[Path] = set()
-        self.evidence_matrix: dict[tuple[Path, Path], EvidenceRecord] = {}
-        self.connection_graph: dict[Path, set[Path]] = defaultdict(set)
+        self.members: set[NodeType] = set()
+        self.evidence_matrix: dict[tuple[NodeType, NodeType], EvidenceRecord] = {}
+        self.connection_graph: dict[NodeType, set[NodeType]] = defaultdict(set)
         self._max_indirect_depth = max_indirect_depth
 
-    def add_direct_evidence(self, path1: Path, path2: Path, method: str, confidence: float):
-        key = self._get_edge_key(path1, path2)
+    def add_direct_evidence(self, node1: NodeType, node2: NodeType, method: str, confidence: float):
+        key = self._get_edge_key(node1, node2)
         new_evidence = EvidenceRecord(method, confidence, True)
         existing = self.evidence_matrix.get(key)
         if existing and existing.is_better_than(new_evidence):
             return
         self.evidence_matrix[key] = new_evidence
-        self.connection_graph[path1].add(path2)
-        self.connection_graph[path2].add(path1)
-        self.members.update([path1, path2])
+        self.connection_graph[node1].add(node2)
+        self.connection_graph[node2].add(node1)
+        self.members.update([node1, node2])
 
     @staticmethod
-    def _get_edge_key(path1: Path, path2: Path) -> tuple[Path, Path]:
-        return tuple(sorted((path1, path2)))
+    def _get_edge_key(node1: NodeType, node2: NodeType) -> tuple[NodeType, NodeType]:
+        # Sorting requires nodes to be comparable, which tuples are.
+        return tuple(sorted((node1, node2)))
 
-    def get_best_evidence(self, path1: Path, path2: Path) -> EvidenceRecord | None:
-        direct_key = self._get_edge_key(path1, path2)
+    def get_best_evidence(self, node1: NodeType, node2: NodeType) -> EvidenceRecord | None:
+        direct_key = self._get_edge_key(node1, node2)
         if direct_key in self.evidence_matrix:
             return self.evidence_matrix[direct_key]
-        return self._find_indirect_evidence_bfs(path1, path2)
+        return self._find_indirect_evidence_bfs(node1, node2)
 
-    def _find_indirect_evidence_bfs(self, start: Path, end: Path) -> EvidenceRecord | None:
+    def _find_indirect_evidence_bfs(self, start: NodeType, end: NodeType) -> EvidenceRecord | None:
         if start not in self.connection_graph or end not in self.connection_graph:
             return None
-        queue: deque[tuple[Path, list[Path]]] = deque([(start, [])])
+        queue: deque[tuple[NodeType, list[NodeType]]] = deque([(start, [])])
         visited = {start}
         while queue:
             current_node, path = queue.popleft()
@@ -200,7 +216,7 @@ class PrecisionCluster:
                 queue.append((neighbor, new_path))
         return None
 
-    def _combine_path_evidence(self, path: list[Path]) -> EvidenceRecord | None:
+    def _combine_path_evidence(self, path: list[NodeType]) -> EvidenceRecord | None:
         if len(path) < 2:
             return None
         weakest_link: EvidenceRecord | None = None
@@ -226,51 +242,55 @@ class PrecisionCluster:
         return False
 
 
-class PrecisionClusterManager:
-    __slots__ = ("clusters", "max_cluster_size", "next_cluster_id", "path_to_cluster")
+class PrecisionClusterManager[NodeType]:
+    __slots__ = ("clusters", "max_cluster_size", "next_cluster_id", "node_to_cluster")
 
     def __init__(self, max_cluster_size: int = MAX_CLUSTER_SIZE):
-        self.clusters: dict[int, PrecisionCluster] = {}
-        self.path_to_cluster: dict[Path, int] = {}
+        self.clusters: dict[int, PrecisionCluster[NodeType]] = {}
+        self.node_to_cluster: dict[NodeType, int] = {}
         self.next_cluster_id = 0
         self.max_cluster_size = max_cluster_size
 
-    def add_evidence(self, path1: Path, path2: Path, method: str, confidence: float):
-        cluster1_id = self.path_to_cluster.get(path1)
-        cluster2_id = self.path_to_cluster.get(path2)
+    def add_evidence(self, node1: NodeType, node2: NodeType, method: str, confidence: float):
+        cluster1_id = self.node_to_cluster.get(node1)
+        cluster2_id = self.node_to_cluster.get(node2)
         if cluster1_id is None and cluster2_id is None:
-            self._create_new_cluster_with_evidence(path1, path2, method, confidence)
+            self._create_new_cluster_with_evidence(node1, node2, method, confidence)
         elif cluster1_id is not None and cluster2_id is None:
-            self._add_to_existing_cluster(cluster1_id, path1, path2, method, confidence)
+            self._add_to_existing_cluster(cluster1_id, node1, node2, method, confidence)
         elif cluster2_id is not None and cluster1_id is None:
-            self._add_to_existing_cluster(cluster2_id, path1, path2, method, confidence)
+            self._add_to_existing_cluster(cluster2_id, node1, node2, method, confidence)
         elif cluster1_id != cluster2_id:
-            self._merge_or_link_clusters(cluster1_id, cluster2_id, path1, path2, method, confidence)
+            self._merge_or_link_clusters(cluster1_id, cluster2_id, node1, node2, method, confidence)
         elif cluster1_id is not None:
-            self.clusters[cluster1_id].add_direct_evidence(path1, path2, method, confidence)
+            self.clusters[cluster1_id].add_direct_evidence(node1, node2, method, confidence)
 
-    def _create_new_cluster_with_evidence(self, path1: Path, path2: Path, method: str, confidence: float):
+    def _create_new_cluster_with_evidence(self, node1: NodeType, node2: NodeType, method: str, confidence: float):
         new_id = self.next_cluster_id
         self.clusters[new_id] = PrecisionCluster(new_id)
-        self.clusters[new_id].add_direct_evidence(path1, path2, method, confidence)
-        self.path_to_cluster[path1] = new_id
-        self.path_to_cluster[path2] = new_id
+        self.clusters[new_id].add_direct_evidence(node1, node2, method, confidence)
+        self.node_to_cluster[node1] = new_id
+        self.node_to_cluster[node2] = new_id
         self.next_cluster_id += 1
 
-    def _add_to_existing_cluster(self, cluster_id: int, path1: Path, path2: Path, method: str, confidence: float):
-        self.clusters[cluster_id].add_direct_evidence(path1, path2, method, confidence)
-        new_path = path2 if path1 in self.path_to_cluster else path1
-        self.path_to_cluster[new_path] = cluster_id
+    def _add_to_existing_cluster(
+        self, cluster_id: int, node1: NodeType, node2: NodeType, method: str, confidence: float
+    ):
+        self.clusters[cluster_id].add_direct_evidence(node1, node2, method, confidence)
+        new_node = node2 if node1 in self.node_to_cluster else node1
+        self.node_to_cluster[new_node] = cluster_id
 
-    def _merge_or_link_clusters(self, id1: int, id2: int, path1: Path, path2: Path, method: str, confidence: float):
+    def _merge_or_link_clusters(
+        self, id1: int, id2: int, node1: NodeType, node2: NodeType, method: str, confidence: float
+    ):
         if self._should_merge(id1, id2):
             final_id = self._merge_clusters(id1, id2)
-            self.clusters[final_id].add_direct_evidence(path1, path2, method, confidence)
+            self.clusters[final_id].add_direct_evidence(node1, node2, method, confidence)
         else:
             size1 = len(self.clusters[id1].members)
             size2 = len(self.clusters[id2].members)
             larger_id = id1 if size1 >= size2 else id2
-            self.clusters[larger_id].add_direct_evidence(path1, path2, method, confidence)
+            self.clusters[larger_id].add_direct_evidence(node1, node2, method, confidence)
 
     def _should_merge(self, id1: int, id2: int) -> bool:
         return (len(self.clusters[id1].members) + len(self.clusters[id2].members)) <= self.max_cluster_size
@@ -280,7 +300,7 @@ class PrecisionClusterManager:
             id1, id2 = id2, id1
         cluster1, cluster2 = self.clusters[id1], self.clusters[id2]
         for member in cluster2.members:
-            self.path_to_cluster[member] = id1
+            self.node_to_cluster[member] = id1
         cluster1.members.update(cluster2.members)
         cluster1.evidence_matrix.update(cluster2.evidence_matrix)
         for member, connections in cluster2.connection_graph.items():
@@ -288,28 +308,41 @@ class PrecisionClusterManager:
         del self.clusters[id2]
         return id1
 
-    def get_final_groups(self, all_fingerprints: dict[Path, ImageFingerprint]) -> dict:
+    def get_final_groups(self, fp_resolver: Callable[[NodeType], ImageFingerprint | None]) -> dict:
         final_groups: dict = {}
         for cluster in self.clusters.values():
             if len(cluster.members) < 2:
                 continue
-            fingerprints = [all_fingerprints[path] for path in cluster.members if path in all_fingerprints]
+            fingerprints = [fp for node in cluster.members if (fp := fp_resolver(node))]
             if not fingerprints:
                 continue
             best_fp = find_best_in_group(fingerprints)
-            duplicates = self._find_duplicates_in_cluster(cluster, best_fp, fingerprints)
+            duplicates = self._find_duplicates_in_cluster(cluster, best_fp, fingerprints, fp_resolver)
             if duplicates:
                 final_groups[best_fp] = duplicates
         return final_groups
 
     def _find_duplicates_in_cluster(
-        self, cluster: PrecisionCluster, best_fp: ImageFingerprint, fingerprints: list[ImageFingerprint]
+        self,
+        cluster: PrecisionCluster[NodeType],
+        best_fp: ImageFingerprint,
+        fingerprints: list[ImageFingerprint],
+        fp_resolver: Callable[[NodeType], ImageFingerprint | None],
     ) -> set[tuple[ImageFingerprint, int, str]]:
         duplicates: set[tuple[ImageFingerprint, int, str]] = set()
+        best_node = next((node for node in cluster.members if (fp := fp_resolver(node)) and fp == best_fp), None)
+        if not best_node:
+            return set()
+
         for fp in fingerprints:
-            if fp.path == best_fp.path:
+            if fp == best_fp:
                 continue
-            evidence = cluster.get_best_evidence(best_fp.path, fp.path)
+            dup_node = next(
+                (node for node in cluster.members if (node_fp := fp_resolver(node)) and node_fp == fp), None
+            )
+            if not dup_node:
+                continue
+            evidence = cluster.get_best_evidence(best_node, dup_node)
             if evidence:
                 score = self._evidence_to_score(evidence)
                 duplicates.add((fp, score, evidence.method))
@@ -329,11 +362,13 @@ class ScanContext:
     signals: SignalBus
     stop_event: threading.Event
     scanner_core: Any
+    lancedb_db: Any
+    lancedb_table: Any
     all_image_fps: dict[Path, ImageFingerprint] = field(default_factory=dict)
     files_to_process: list[Path] = field(default_factory=list)
-    cluster_manager: PrecisionClusterManager = field(default_factory=PrecisionClusterManager)
+    items_to_process: list[AnalysisItem] = field(default_factory=list)
+    cluster_manager: "PrecisionClusterManager" = field(default_factory=lambda: PrecisionClusterManager())
     all_skipped_files: list[str] = field(default_factory=list)
-    ai_links: list[tuple] = field(default_factory=list)
 
 
 class ScanStage(ABC):
@@ -350,7 +385,7 @@ class ScanStage(ABC):
 class FileDiscoveryStage(ScanStage):
     @property
     def name(self) -> str:
-        return "Phase 1/6: Finding image files..."
+        return "Phase 1/7: Finding image files..."
 
     def run(self, context: ScanContext) -> bool:
         finder = FileFinder(
@@ -367,10 +402,17 @@ class FileDiscoveryStage(ScanStage):
 class ExactDuplicateStage(ScanStage):
     @property
     def name(self) -> str:
-        return "Phase 2/6: Finding exact duplicates (xxHash)..."
+        return "Phase 2/7: Finding exact duplicates (xxHash)..."
 
     def run(self, context: ScanContext) -> bool:
         if not context.files_to_process or not context.config.find_exact_duplicates:
+            # Still need to populate fingerprints if this is the only pre-AI stage
+            for path in context.files_to_process:
+                if path not in context.all_image_fps:
+                    if meta := get_image_metadata(path):
+                        context.all_image_fps[path] = ImageFingerprint(path=path, hashes=np.array([]), **meta)
+                    else:
+                        app_logger.warning(f"Could not get metadata for {path.name}, it will be skipped.")
             return True
 
         total_files = len(context.files_to_process)
@@ -397,98 +439,195 @@ class ExactDuplicateStage(ScanStage):
         for paths in hash_map.values():
             if not paths:
                 continue
-
             rep_path = paths[0]
             representatives.append(rep_path)
-
             if len(paths) > 1:
                 for other_path in paths[1:]:
-                    context.cluster_manager.add_evidence(rep_path, other_path, EvidenceMethod.XXHASH.value, 0.0)
+                    context.cluster_manager.add_evidence(
+                        (rep_path, None), (other_path, None), EvidenceMethod.XXHASH.value, 0.0
+                    )
 
         context.files_to_process = representatives
         app_logger.info(f"ExactDuplicateStage: {len(context.files_to_process)} unique files remain for next stage.")
         return not context.stop_event.is_set()
 
 
+class ItemGenerationStage(ScanStage):
+    @property
+    def name(self) -> str:
+        return "Phase 3/7: Preparing items for analysis..."
+
+    def run(self, context: ScanContext) -> bool:
+        items = []
+        cfg = context.config
+        files_to_continue = []
+
+        for path in context.files_to_process:
+            if path not in context.all_image_fps:
+                if meta := get_image_metadata(path):
+                    context.all_image_fps[path] = ImageFingerprint(path=path, hashes=np.array([]), **meta)
+                else:
+                    app_logger.warning(f"Could not get metadata for {path.name}, skipping analysis.")
+                    context.all_skipped_files.append(str(path))
+                    continue
+
+            files_to_continue.append(path)
+            if cfg.compare_by_channel and (
+                not cfg.channel_split_tags or any(tag in path.name.lower() for tag in cfg.channel_split_tags)
+            ):
+                items.extend(
+                    [
+                        AnalysisItem(path=path, analysis_type="R"),
+                        AnalysisItem(path=path, analysis_type="G"),
+                        AnalysisItem(path=path, analysis_type="B"),
+                        AnalysisItem(path=path, analysis_type="A"),
+                    ]
+                )
+            elif cfg.compare_by_luminance:
+                items.append(AnalysisItem(path=path, analysis_type="Luminance"))
+            else:
+                items.append(AnalysisItem(path=path, analysis_type="Composite"))
+
+        context.items_to_process = items
+        context.files_to_process = files_to_continue
+        app_logger.info(
+            f"ItemGenerationStage: Generated {len(items)} items from {len(context.files_to_process)} files."
+        )
+        return not context.stop_event.is_set()
+
+
 class PerceptualDuplicateStage(ScanStage):
     @property
     def name(self) -> str:
-        return "Phase 3/6: Finding near-identical duplicates (pHash/dHash)..."
+        return "Phase 4/7: Finding near-identical items..."
 
     def run(self, context: ScanContext) -> bool:
-        if not context.files_to_process or not (
-            context.config.find_simple_duplicates or context.config.find_perceptual_duplicates
-        ):
+        should_run = (
+            context.config.find_simple_duplicates
+            or context.config.find_perceptual_duplicates
+            or context.config.find_structural_duplicates
+        )
+        if not context.items_to_process or not should_run:
             return True
 
-        total_files = len(context.files_to_process)
-        context.state.update_progress(0, total_files, "Calculating perceptual hashes...")
+        total_items = len(context.items_to_process)
+        context.state.update_progress(0, total_items, "Calculating perceptual hashes...")
 
         ctx = multiprocessing.get_context("spawn")
         with ctx.Pool(processes=context.config.perf.num_workers) as pool:
-            for i, result in enumerate(
-                pool.imap_unordered(worker_calculate_perceptual_hashes, context.files_to_process, chunksize=50), 1
-            ):
-                if context.stop_event.is_set():
-                    pool.terminate()
-                    return False
-                if (i % 100) == 0:
-                    context.state.update_progress(i, total_files)
-                if result and result["path"] in context.all_image_fps:
-                    fp = context.all_image_fps[result["path"]]
-                    fp.dhash = result["dhash"]
-                    fp.phash = result["phash"]
-                    fp.resolution = result["precise_meta"]["resolution"]
-                    fp.format_details = result["precise_meta"]["format_details"]
-                    fp.has_alpha = result["precise_meta"]["has_alpha"]
+            worker_func = partial(
+                worker_calculate_perceptual_hashes, ignore_solid_channels=context.config.ignore_solid_channels
+            )
+            results_iterator = pool.imap_unordered(worker_func, context.items_to_process, chunksize=20)
+            self._process_hash_results(context, results_iterator, total_items)
 
-        if context.config.find_simple_duplicates:
-            self._run_phash_clustering(context, "dhash", EvidenceMethod.DHASH, context.config.dhash_threshold)
-        if context.config.find_perceptual_duplicates:
-            self._run_phash_clustering(context, "phash", EvidenceMethod.PHASH, context.config.phash_threshold)
+        self._filter_items_for_ai(context)
 
-        app_logger.info(f"PerceptualDuplicateStage: {len(context.files_to_process)} unique files remain for AI stage.")
+        app_logger.info("PerceptualDuplicateStage: Finished finding near-identical items.")
         return not context.stop_event.is_set()
 
-    def _run_phash_clustering(self, context: ScanContext, hash_key: str, method: EvidenceMethod, threshold: int):
-        hashes_to_process = [
-            (getattr(fp, hash_key), fp.path)
-            for path in context.files_to_process
-            if (fp := context.all_image_fps.get(path)) and getattr(fp, hash_key) is not None
-        ]
-
-        if not hashes_to_process:
-            return
-
-        hashes, paths = zip(*hashes_to_process, strict=True)
-        components = self._find_hash_components_fast(paths, hashes, threshold)
-
-        final_reps = []
-        processed_paths = set()
-        for group in components.values():
-            if not group:
+    def _process_hash_results(self, context: ScanContext, results_iterator, total_items: int):
+        item_hashes = {}
+        for i, result in enumerate(results_iterator, 1):
+            if context.stop_event.is_set():
+                return
+            if i % 50 == 0:
+                context.state.update_progress(i, total_items)
+            if not result:
                 continue
 
-            processed_paths.update(group)
-            if len(group) > 1:
-                group_fps = [context.all_image_fps[p] for p in group]
-                best = find_best_in_group(group_fps)
-                final_reps.append(best.path)
-                for path in group:
-                    if path != best.path:
-                        context.cluster_manager.add_evidence(best.path, path, method.value, 0.0)
-            else:
-                final_reps.append(group[0])
+            item_key = AnalysisItem(path=result["path"], analysis_type=result["analysis_type"])
+            item_hashes[item_key] = result
+            if fp := context.all_image_fps.get(result["path"]):
+                fp.dhash = result.get("dhash")
+                fp.phash = result.get("phash")
+                fp.whash = result.get("whash")
+                fp.resolution = result["precise_meta"]["resolution"]
+                fp.format_details = result["precise_meta"]["format_details"]
+                fp.has_alpha = result["precise_meta"]["has_alpha"]
 
-        final_reps.extend([p for p in context.files_to_process if p not in processed_paths])
-        context.files_to_process = final_reps
+        if context.config.find_simple_duplicates:
+            self._run_phash_clustering(
+                context, item_hashes, "dhash", EvidenceMethod.DHASH, context.config.dhash_threshold
+            )
+        if context.config.find_perceptual_duplicates:
+            self._run_phash_clustering(
+                context, item_hashes, "phash", EvidenceMethod.PHASH, context.config.phash_threshold
+            )
+        if context.config.find_structural_duplicates:
+            self._run_phash_clustering(
+                context, item_hashes, "whash", EvidenceMethod.WHASH, context.config.whash_threshold
+            )
+
+    def _run_phash_clustering(
+        self, context: ScanContext, all_hashes: dict, hash_key: str, method: EvidenceMethod, threshold: int
+    ):
+        items_with_hashes = [
+            (item, hashes[hash_key]) for item, hashes in all_hashes.items() if hashes.get(hash_key) is not None
+        ]
+        if not items_with_hashes:
+            return
+
+        items, hashes = zip(*items_with_hashes, strict=True)
+        components = self._find_hash_components_fast(items, hashes, threshold)
+
+        for group_items in components.values():
+            if len(group_items) > 1:
+                for i in range(len(group_items)):
+                    for j in range(i + 1, len(group_items)):
+                        item1, item2 = group_items[i], group_items[j]
+                        node1 = (item1.path, item1.analysis_type if item1.analysis_type != "Composite" else None)
+                        node2 = (item2.path, item2.analysis_type if item2.analysis_type != "Composite" else None)
+                        context.cluster_manager.add_evidence(node1, node2, method.value, 0.0)
+
+    def _filter_items_for_ai(self, context: ScanContext):
+        """
+        Reduces the list of items to be processed by AI by selecting only one
+        representative from each near-identical cluster found by perceptual hashes.
+        """
+        if not context.config.use_ai:
+            return
+
+        item_map = {
+            (item.path, item.analysis_type if item.analysis_type != "Composite" else None): item
+            for item in context.items_to_process
+        }
+
+        items_to_remove = set()
+        for cluster in context.cluster_manager.clusters.values():
+            is_phash_cluster = any(
+                ev.priority > METHOD_PRIORITY[EvidenceMethod.AI.value] for ev in cluster.evidence_matrix.values()
+            )
+            if not is_phash_cluster or len(cluster.members) < 2:
+                continue
+
+            cluster_items = [item_map[node] for node in cluster.members if node in item_map]
+            if not cluster_items:
+                continue
+
+            cluster_fps = [context.all_image_fps[item.path] for item in cluster_items]
+            best_fp = find_best_in_group(cluster_fps)
+
+            best_item_found = False
+            for item in cluster_items:
+                if context.all_image_fps[item.path] == best_fp and not best_item_found:
+                    best_item_found = True
+                else:
+                    items_to_remove.add(item)
+
+        if items_to_remove:
+            context.items_to_process = [item for item in context.items_to_process if item not in items_to_remove]
+            app_logger.info(
+                f"Perceptual hash filter removed {len(items_to_remove)} near-duplicate items. "
+                f"{len(context.items_to_process)} items remain for AI analysis."
+            )
 
     def _find_hash_components_fast(
-        self, paths: tuple[Path, ...], hashes: tuple[Any, ...], threshold: int
-    ) -> dict[int, list[Path]]:
-        n = len(paths)
+        self, items: tuple[AnalysisItem, ...], hashes: tuple[Any, ...], threshold: int
+    ) -> dict[int, list[AnalysisItem]]:
+        n = len(items)
         if not hashes or n < 2:
-            return {i: [p] for i, p in enumerate(paths)}
+            return {i: [item] for i, item in enumerate(items)}
 
         uint64_hashes = np.array(
             [int("".join(row.astype(int).astype(str)), 2) for row in (h.hash.flatten() for h in hashes)],
@@ -497,65 +636,42 @@ class PerceptualDuplicateStage(ScanStage):
         rows, cols = _find_hash_edges_numba(uint64_hashes, threshold)
 
         if not rows.size:
-            return {i: [Path(p)] for i, p in enumerate(paths)}
+            return {i: [item] for i, item in enumerate(items)}
 
         if not SCIPY_AVAILABLE:
             app_logger.warning("Scipy not available, pHash/dHash clustering will be incomplete.")
             components = defaultdict(list)
             for i, r in enumerate(rows):
                 c = cols[i]
-                if not any(r in v or c in v for v in components.values()):
-                    components[r].extend([paths[r], paths[c]])
+                if not any(items[r] in v or items[c] in v for v in components.values()):
+                    components[r].extend([items[r], items[c]])
             return components
 
         graph = csr_matrix((np.ones(len(rows), dtype=bool), (rows, cols)), shape=(n, n))
         _, labels = connected_components(graph, directed=False, return_labels=True)
-
         components = defaultdict(list)
         for i, label in enumerate(labels):
-            components[label].append(paths[i])
-
+            components[label].append(items[i])
         return components
-
-    def _find_hash_components_lancedb(self, *args, **kwargs):
-        raise NotImplementedError()
 
 
 class FingerprintGenerationStage(ScanStage):
     @property
     def name(self) -> str:
-        return "Phase 4/6: Creating AI fingerprints..."
+        return "Phase 5/7: Creating AI fingerprints..."
 
     def run(self, context: ScanContext) -> bool:
-        if not context.files_to_process:
-            context.signals.log_message.emit("No new unique images found for AI processing.", "info")
+        if not context.config.use_ai:
             return True
-
-        from app.image_io import get_image_metadata
-
-        files_to_process_now = []
-        for path in context.files_to_process:
-            if path not in context.all_image_fps:
-                meta = get_image_metadata(path)
-                if meta:
-                    context.all_image_fps[path] = ImageFingerprint(path=path, hashes=np.array([]), **meta)
-                    files_to_process_now.append(path)
-                else:
-                    context.all_skipped_files.append(str(path))
-                    app_logger.warning(f"Could not create initial fingerprint for {path.name}, skipping from AI stage.")
-            else:
-                files_to_process_now.append(path)
-
-        context.files_to_process = files_to_process_now
-        if not context.files_to_process:
-            context.signals.log_message.emit("All remaining files failed metadata extraction.", "warning")
+        if not context.items_to_process:
+            context.signals.log_message.emit("No new unique items found for AI processing.", "info")
             return True
 
         pipeline_manager = PipelineManager(
             config=context.config,
             state=context.state,
             signals=context.signals,
-            lancedb_table=context.scanner_core.table,
+            lancedb_table=context.lancedb_table,
             stop_event=context.stop_event,
         )
         success, skipped = pipeline_manager.run(context)
@@ -566,11 +682,13 @@ class FingerprintGenerationStage(ScanStage):
 class DatabaseIndexStage(ScanStage):
     @property
     def name(self) -> str:
-        return "Phase 5/6: Optimizing database for fast search..."
+        return "Phase 6/7: Optimizing database for fast search..."
 
     def run(self, context: ScanContext) -> bool:
+        if not context.config.use_ai:
+            return True
         try:
-            table = context.scanner_core.table
+            table = context.lancedb_table
             num_rows = table.to_lance().count_rows()
             if num_rows < 5000:
                 app_logger.info(f"Skipping index creation for a small dataset ({num_rows} items).")
@@ -594,24 +712,20 @@ class DatabaseIndexStage(ScanStage):
 class AILinkingStage(ScanStage):
     @property
     def name(self) -> str:
-        return "Phase 6/6: Finding similar images (AI)..."
+        return "Phase 7/7: Finding similar images (AI)..."
 
     def run(self, context: ScanContext) -> bool:
+        if not context.config.use_ai:
+            return True
+
         sim_engine = LanceDBSimilarityEngine(
-            context.config, context.state, context.signals, context.scanner_core.db, context.scanner_core.table
+            context.config, context.state, context.signals, context.lancedb_db, context.lancedb_table
         )
-
-        # In channel mode, collect all raw links into the context attribute
-        if context.config.compare_by_channel:
-            for link_tuple in sim_engine.find_similar_pairs(context.stop_event):
-                if context.stop_event.is_set():
-                    return False
-                context.ai_links.append(link_tuple)
-        # Use the standard ClusterManager for normal duplicate finding mode
-        else:
-            for path1, _ch1, path2, _ch2, dist in sim_engine.find_similar_pairs(context.stop_event):
-                if context.stop_event.is_set():
-                    return False
-                context.cluster_manager.add_evidence(Path(path1), Path(path2), EvidenceMethod.AI.value, dist)
-
+        for path1, ch1, path2, ch2, dist in sim_engine.find_similar_pairs(context.stop_event):
+            if context.stop_event.is_set():
+                return False
+            # Normalize channel from "RGB" (used by worker) to None (used by cluster manager)
+            node1 = (Path(path1), ch1 if ch1 != "RGB" else None)
+            node2 = (Path(path2), ch2 if ch2 != "RGB" else None)
+            context.cluster_manager.add_evidence(node1, node2, EvidenceMethod.AI.value, dist)
         return not context.stop_event.is_set()

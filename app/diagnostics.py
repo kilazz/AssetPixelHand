@@ -75,14 +75,14 @@ def check_library_imports() -> bool:
     """Checks if all critical and optional libraries can be imported."""
     print_header("3. Library Import Check")
     libraries = {
-        "Core GUI & System": {"PySide6.QtCore": "PySide6", "send2trash": "send2trash"},
-        "AI & Deep Learning": {
+        "Core GUI and System": {"PySide6.QtCore": "PySide6", "send2trash": "send2trash"},
+        "AI and Deep Learning": {
             "torch": "torch",
             "transformers": "transformers",
             "onnxruntime": "onnxruntime",
             "sentencepiece": "sentencepiece",
         },
-        "Data Handling & Vector DB": {
+        "Data Handling and Vector DB": {
             "numpy": "numpy",
             "duckdb": "duckdb",
             "lancedb": "lancedb",
@@ -90,7 +90,7 @@ def check_library_imports() -> bool:
             "polars": "polars",
         },
         "Image Hashing": {"PIL": "Pillow", "imagehash": "ImageHash", "xxhash": "xxhash"},
-        "Scientific & Math": {"scipy": "scipy"},
+        "Scientific and Math": {"scipy": "scipy"},
         "Advanced Image I/O (Optional but Recommended)": {
             "OpenImageIO": "OpenImageIO",
             "pyvips": "pyvips",

@@ -200,7 +200,10 @@ class OptionsPanel(QGroupBox):
         self.model_combo.currentTextChanged.connect(self.settings_manager.set_model_key)
         self.browse_folder_button.clicked.connect(self._browse_for_folder)
         self.browse_sample_button.clicked.connect(self._browse_for_sample)
+
         self.clear_sample_button.clicked.connect(self._clear_sample)
+        self.clear_sample_button.clicked.connect(self._update_scan_context)
+
         self.search_entry.textChanged.connect(self._update_scan_context)
         self.scan_button.clicked.connect(self.on_scan_button_clicked)
         self.clear_scan_cache_button.clicked.connect(self.clear_scan_cache_requested.emit)
@@ -237,36 +240,43 @@ class OptionsPanel(QGroupBox):
 
     @Slot()
     def _update_scan_context(self):
+        is_ai_on = self.settings_manager.settings.hashing.use_ai
+
         model_info = self.get_selected_model_info()
         supports_text = model_info.get("supports_text_search", True)
         supports_image = model_info.get("supports_image_search", True)
 
-        self.search_entry.setDisabled(not supports_text or bool(self._sample_path))
-        self.search_entry.setPlaceholderText(
-            "Text search not supported by this model" if not supports_text else "Enter text to search..."
-        )
-        self.browse_sample_button.setEnabled(supports_image)
+        self.search_entry.setDisabled(not is_ai_on or not supports_text or bool(self._sample_path))
+        if not is_ai_on:
+            self.search_entry.setPlaceholderText("AI is disabled")
+        elif not supports_text:
+            self.search_entry.setPlaceholderText("Text search not supported by this model")
+        else:
+            self.search_entry.setPlaceholderText("Enter text to search...")
 
-        if not supports_image:
+        self.browse_sample_button.setEnabled(is_ai_on and supports_image)
+
+        if not (is_ai_on and supports_image):
             self._clear_sample()
 
-        if self._sample_path and supports_image:
+        if is_ai_on and self._sample_path and supports_image:
             self.current_scan_mode = ScanMode.SAMPLE_SEARCH
             self.scan_button_text = "Search by Sample"
-        elif self.search_entry.text().strip() and supports_text:
+        elif is_ai_on and self.search_entry.text().strip() and supports_text:
             self.current_scan_mode = ScanMode.TEXT_SEARCH
             self.scan_button_text = "Search by Text"
         else:
             self.current_scan_mode = ScanMode.DUPLICATES
             self.scan_button_text = "Scan for Duplicates"
 
-        is_duplicate_mode = self.current_scan_mode == ScanMode.DUPLICATES
-        self.threshold_spinbox.setEnabled(is_duplicate_mode)
+        is_ai_search = self.current_scan_mode in (ScanMode.TEXT_SEARCH, ScanMode.SAMPLE_SEARCH)
+        self.threshold_spinbox.setEnabled(not is_ai_search and is_ai_on)
+
         label = self.form_layout.labelForField(self.threshold_spinbox)
         if label:
-            label.setText("Similarity:" if is_duplicate_mode else "Similarity (N/A):")
+            label.setText("Similarity:" if not is_ai_search else "Similarity (N/A):")
 
-        if not is_duplicate_mode:
+        if is_ai_search or not is_ai_on:
             self.threshold_spinbox.setValue(0)
 
         self.scan_button.setText(self.scan_button_text)
@@ -281,16 +291,12 @@ class OptionsPanel(QGroupBox):
         """Opens a folder selection dialog with a fallback to the non-native version."""
         path = ""
         try:
-            # Attempt 1: Use the standard native Windows dialog
-            app_logger.debug("Attempting to open native folder dialog...")
             path = QFileDialog.getExistingDirectory(self, "Select Folder", self.folder_path_entry.text())
         except Exception as e:
-            # Attempt 2: If the native dialog fails (e.g., due to MS Store Python), use Qt's built-in dialog.
             app_logger.warning(f"Native folder dialog failed: {e}. Falling back to non-native dialog.")
             path = QFileDialog.getExistingDirectory(
                 self, "Select Folder", self.folder_path_entry.text(), options=QFileDialog.Option.DontUseNativeDialog
             )
-
         if path:
             self.folder_path_entry.setText(path)
 
@@ -298,8 +304,6 @@ class OptionsPanel(QGroupBox):
         """Opens a file selection dialog with a fallback to the non-native version."""
         path_str, _ = "", ""
         try:
-            # Attempt 1: Use the standard native Windows dialog
-            app_logger.debug("Attempting to open native file dialog...")
             path_str, _ = QFileDialog.getOpenFileName(
                 self,
                 "Select Sample Image",
@@ -307,7 +311,6 @@ class OptionsPanel(QGroupBox):
                 f"Images ({' '.join(['*' + e for e in ALL_SUPPORTED_EXTENSIONS])})",
             )
         except Exception as e:
-            # Attempt 2: Fallback to Qt's built-in dialog.
             app_logger.warning(f"Native file dialog failed: {e}. Falling back to non-native dialog.")
             path_str, _ = QFileDialog.getOpenFileName(
                 self,
@@ -316,7 +319,6 @@ class OptionsPanel(QGroupBox):
                 f"Images ({' '.join(['*' + e for e in ALL_SUPPORTED_EXTENSIONS])})",
                 options=QFileDialog.Option.DontUseNativeDialog,
             )
-
         if path_str:
             self._sample_path = Path(path_str)
             self.search_entry.clear()
@@ -325,9 +327,9 @@ class OptionsPanel(QGroupBox):
 
     @Slot()
     def _clear_sample(self):
+        """Only clears the sample data, does not trigger a context update."""
         self._sample_path = None
         self.sample_path_label.setText("Sample: None")
-        self._update_scan_context()
 
     def set_scan_button_state(self, is_scanning: bool):
         if is_scanning:
@@ -368,7 +370,7 @@ class ScanOptionsPanel(QGroupBox):
     """Panel for secondary scan options and output settings."""
 
     def __init__(self, settings_manager: SettingsManager):
-        super().__init__("Scan & Output Options")
+        super().__init__("Scan and Output Options")
         self.settings_manager = settings_manager
         self._init_ui()
         self.load_settings(settings_manager.settings)
@@ -377,71 +379,87 @@ class ScanOptionsPanel(QGroupBox):
     def _init_ui(self):
         layout = QVBoxLayout(self)
 
-        hashing_grid = QGridLayout()
+        self.use_ai_check = QCheckBox("Use AI for similarity search")
+        self.use_ai_check.setToolTip(
+            "Enables neural network to find visually similar (but not identical) images.\nDisabling this makes scanning much faster but only finds exact or near-identical duplicates."
+        )
+        layout.addWidget(self.use_ai_check)
+
+        self.hashing_options_group = QGroupBox("Duplicate Finding Methods")
+        hashing_grid = QGridLayout(self.hashing_options_group)
         hashing_grid.setColumnStretch(1, 1)
 
-        self.exact_duplicates_check = QCheckBox("First find exact duplicates (xxHash)")
+        self.exact_duplicates_check = QCheckBox("Find exact duplicates (xxHash)")
+        hashing_grid.addWidget(self.exact_duplicates_check, 0, 0, 1, 3)
 
-        self.simple_duplicates_check = QCheckBox("Also find simple duplicates (dHash)")
+        self.simple_duplicates_check = QCheckBox("Find simple duplicates (dHash)")
         self.simple_duplicates_check.setToolTip(
             "Finds resized or re-formatted images. Threshold controls sensitivity (lower is stricter)."
         )
         self.dhash_threshold_spin = QSpinBox()
         self.dhash_threshold_spin.setRange(0, 64)
         self.dhash_threshold_spin.setToolTip("dHash Threshold (Hamming distance). Default: 8")
+        hashing_grid.addWidget(self.simple_duplicates_check, 1, 0, 1, 2)
+        hashing_grid.addWidget(self.dhash_threshold_spin, 1, 2)
 
-        self.perceptual_duplicates_check = QCheckBox("Also find near-identical images (pHash)")
+        self.perceptual_duplicates_check = QCheckBox("Find near-identical images (pHash)")
         self.perceptual_duplicates_check.setToolTip(
             "Finds visually identical images. Threshold controls sensitivity (lower is stricter)."
         )
         self.phash_threshold_spin = QSpinBox()
         self.phash_threshold_spin.setRange(0, 64)
         self.phash_threshold_spin.setToolTip("pHash Threshold (Hamming distance). Default: 8")
-
-        hashing_grid.addWidget(self.exact_duplicates_check, 0, 0, 1, 3)
-        hashing_grid.addWidget(self.simple_duplicates_check, 1, 0, 1, 2)
-        hashing_grid.addWidget(self.dhash_threshold_spin, 1, 2)
         hashing_grid.addWidget(self.perceptual_duplicates_check, 2, 0, 1, 2)
         hashing_grid.addWidget(self.phash_threshold_spin, 2, 2)
 
+        self.structural_duplicates_check = QCheckBox("Find structural duplicates (wHash)")
+        self.structural_duplicates_check.setToolTip(
+            "More robust than pHash/dHash. Good for finding structural similarities."
+        )
+        self.whash_threshold_spin = QSpinBox()
+        self.whash_threshold_spin.setRange(0, 64)
+        self.whash_threshold_spin.setToolTip("wHash Threshold (Hamming distance). Default: 2")
+        hashing_grid.addWidget(self.structural_duplicates_check, 3, 0, 1, 2)
+        hashing_grid.addWidget(self.whash_threshold_spin, 3, 2)
+
+        self.image_prep_group = QGroupBox("Image Preparation Options")
+        prep_layout = QVBoxLayout(self.image_prep_group)
+
         self.luminance_check = QCheckBox("Compare by luminance only (Grayscale)")
         self.luminance_check.setToolTip(
-            "Analyzes image structure without color. Ideal for finding reskinned assets or textures with packed channels."
+            "Analyzes image structure without color. Works for both AI and Perceptual Hashing."
         )
-        hashing_grid.addWidget(self.luminance_check, 3, 0, 1, 3)
+        prep_layout.addWidget(self.luminance_check)
 
         self.channel_check = QCheckBox("Compare by individual channels (R,G,B,A)")
         self.channel_check.setToolTip(
-            "Splits each image into its channels and compares them individually.\n"
-            "Useful for finding textures with packed maps (e.g., metallic, roughness).\n"
-            "Warning: Significantly increases scan time and memory usage."
+            "Splits images into channels before comparison. Works for both AI and Perceptual Hashing."
         )
         self.channel_tags_entry = QLineEdit()
-        self.channel_tags_entry.setPlaceholderText("e.g. diff, spec, ddna (comma-separated)")
-
-        channel_layout_container = QWidget()
-        channel_layout = QHBoxLayout(channel_layout_container)
-        channel_layout.setContentsMargins(0, 0, 0, 0)
-        channel_layout.addWidget(self.channel_check)
-        channel_layout.addWidget(self.channel_tags_entry)
-
-        hashing_grid.addWidget(channel_layout_container, 4, 0, 1, 3)
+        self.channel_tags_entry.setPlaceholderText("e.g. diff (comma-separated)")
+        channel_layout_container = QHBoxLayout()
+        channel_layout_container.setContentsMargins(0, 0, 0, 0)
+        channel_layout_container.addWidget(self.channel_check)
+        channel_layout_container.addWidget(self.channel_tags_entry)
+        prep_layout.addLayout(channel_layout_container)
 
         self.ignore_solid_check = QCheckBox("Ignore solid black/white channels")
         self.ignore_solid_check.setToolTip(
-            "If enabled, channels that are completely black or white will not be compared.\nReduces noise from unused channels."
+            "If enabled, channels that are completely black or white will not be compared."
         )
         ignore_layout = QHBoxLayout()
-        ignore_layout.setContentsMargins(20, 0, 0, 0)  # Indent to show it's a sub-option
+        ignore_layout.setContentsMargins(20, 0, 0, 0)
         ignore_layout.addWidget(self.ignore_solid_check)
+        prep_layout.addLayout(ignore_layout)
 
-        hashing_grid.addLayout(ignore_layout, 5, 0, 1, 3)
-        layout.addLayout(hashing_grid)
+        layout.addWidget(self.hashing_options_group)
+        layout.addWidget(self.image_prep_group)
 
         self.lancedb_in_memory_check = QCheckBox("Use in-memory database (fastest)")
         self.lancedb_in_memory_check.setToolTip(
             "Stores caches and vector index in RAM. Fastest, but not persistent across runs."
         )
+        layout.addWidget(self.lancedb_in_memory_check)
 
         visuals_layout = QHBoxLayout()
         self.save_visuals_check = QCheckBox("Save visuals")
@@ -466,46 +484,70 @@ class ScanOptionsPanel(QGroupBox):
         visuals_layout.addWidget(QLabel("Max:"))
         visuals_layout.addWidget(self.max_visuals_entry)
         visuals_layout.addWidget(self.open_visuals_folder_button)
-
-        layout.addWidget(self.lancedb_in_memory_check)
         layout.addLayout(visuals_layout)
 
     def _connect_signals(self):
+        self.use_ai_check.toggled.connect(self.settings_manager.set_use_ai)
         self.exact_duplicates_check.toggled.connect(self.settings_manager.set_find_exact)
         self.simple_duplicates_check.toggled.connect(self.settings_manager.set_find_simple)
-        self.dhash_threshold_spin.valueChanged.connect(self.settings_manager.set_dhash_threshold)
         self.perceptual_duplicates_check.toggled.connect(self.settings_manager.set_find_perceptual)
+        self.structural_duplicates_check.toggled.connect(self.settings_manager.set_find_structural)
+
+        self.use_ai_check.toggled.connect(self._update_dependent_ui_state)
+        self.simple_duplicates_check.toggled.connect(self._update_dependent_ui_state)
+        self.perceptual_duplicates_check.toggled.connect(self._update_dependent_ui_state)
+        self.structural_duplicates_check.toggled.connect(self._update_dependent_ui_state)
+
+        self.dhash_threshold_spin.valueChanged.connect(self.settings_manager.set_dhash_threshold)
         self.phash_threshold_spin.valueChanged.connect(self.settings_manager.set_phash_threshold)
+        self.whash_threshold_spin.valueChanged.connect(self.settings_manager.set_whash_threshold)
+
         self.luminance_check.toggled.connect(self.settings_manager.set_compare_by_luminance)
         self.channel_check.toggled.connect(self.settings_manager.set_compare_by_channel)
         self.channel_tags_entry.textChanged.connect(self.settings_manager.set_channel_split_tags)
-        self.channel_check.toggled.connect(self.channel_tags_entry.setEnabled)
-        self.channel_check.toggled.connect(self.ignore_solid_check.setEnabled)
         self.ignore_solid_check.toggled.connect(self.settings_manager.set_ignore_solid_channels)
+
+        self.channel_check.toggled.connect(self._update_dependent_ui_state)
+
         self.lancedb_in_memory_check.toggled.connect(self.settings_manager.set_lancedb_in_memory)
         self.save_visuals_check.toggled.connect(self.settings_manager.set_save_visuals)
         self.visuals_tonemap_check.toggled.connect(self.settings_manager.set_visuals_tonemap)
         self.max_visuals_entry.textChanged.connect(self.settings_manager.set_max_visuals)
         self.visuals_columns_spinbox.valueChanged.connect(self.settings_manager.set_visuals_columns)
-        self.exact_duplicates_check.toggled.connect(self._update_hashing_options_state)
-        self.simple_duplicates_check.toggled.connect(self._update_hashing_options_state)
-        self.perceptual_duplicates_check.toggled.connect(self._update_hashing_options_state)
         self.save_visuals_check.toggled.connect(self.toggle_visuals_option)
         self.open_visuals_folder_button.clicked.connect(self._open_visuals_folder)
-        self._update_hashing_options_state()
 
     @Slot()
-    def _update_hashing_options_state(self):
-        exact_enabled = self.exact_duplicates_check.isChecked()
-        self.simple_duplicates_check.setEnabled(exact_enabled)
-        self.perceptual_duplicates_check.setEnabled(exact_enabled)
+    def _update_dependent_ui_state(self):
+        is_ai_on = self.use_ai_check.isChecked()
+        is_simple_on = self.simple_duplicates_check.isChecked()
+        is_perceptual_on = self.perceptual_duplicates_check.isChecked()
+        is_structural_on = self.structural_duplicates_check.isChecked()
 
-        self.dhash_threshold_spin.setEnabled(exact_enabled and self.simple_duplicates_check.isChecked())
-        self.phash_threshold_spin.setEnabled(exact_enabled and self.perceptual_duplicates_check.isChecked())
+        is_phash_any_on = is_simple_on or is_perceptual_on or is_structural_on
 
-        if not exact_enabled:
-            self.simple_duplicates_check.setChecked(False)
-            self.perceptual_duplicates_check.setChecked(False)
+        is_prep_enabled = is_ai_on or is_phash_any_on
+        self.image_prep_group.setEnabled(is_prep_enabled)
+
+        is_channel_check_on = self.channel_check.isChecked()
+        self.channel_tags_entry.setEnabled(is_prep_enabled and is_channel_check_on)
+        self.ignore_solid_check.setEnabled(is_prep_enabled and is_channel_check_on)
+
+        self.dhash_threshold_spin.setEnabled(is_simple_on)
+        self.phash_threshold_spin.setEnabled(is_perceptual_on)
+        self.whash_threshold_spin.setEnabled(is_structural_on)
+
+        main_window = self.window()
+        if not main_window:
+            return
+
+        main_window.performance_panel.setEnabled(is_ai_on)
+
+        options_panel = main_window.options_panel
+        options_panel.model_combo.setEnabled(is_ai_on)
+        options_panel.threshold_spinbox.setEnabled(is_ai_on)
+
+        options_panel._update_scan_context()
 
     def toggle_visuals_option(self, is_checked):
         for i in range(self.layout().count()):
@@ -526,7 +568,6 @@ class ScanOptionsPanel(QGroupBox):
                         widget.setVisible(is_checked)
                 break
 
-    @Slot()
     def _open_visuals_folder(self):
         if not VISUALS_DIR.exists():
             QMessageBox.information(self, "Folder Not Found", "The visualizations folder does not exist yet.")
@@ -537,26 +578,28 @@ class ScanOptionsPanel(QGroupBox):
             QMessageBox.warning(self, "Error", f"Could not open folder: {e}")
 
     def load_settings(self, s: AppSettings):
+        self.use_ai_check.setChecked(s.hashing.use_ai)
         self.exact_duplicates_check.setChecked(s.hashing.find_exact)
         self.simple_duplicates_check.setChecked(s.hashing.find_simple)
         self.perceptual_duplicates_check.setChecked(s.hashing.find_perceptual)
+        self.structural_duplicates_check.setChecked(s.hashing.find_structural)
         self.dhash_threshold_spin.setValue(s.hashing.dhash_threshold)
         self.phash_threshold_spin.setValue(s.hashing.phash_threshold)
+        self.whash_threshold_spin.setValue(s.hashing.whash_threshold)
         self.luminance_check.setChecked(s.hashing.compare_by_luminance)
         self.channel_check.setChecked(s.hashing.compare_by_channel)
         self.channel_tags_entry.setText(s.hashing.channel_split_tags)
-        self.channel_tags_entry.setEnabled(s.hashing.compare_by_channel)
         self.ignore_solid_check.setChecked(s.hashing.ignore_solid_channels)
-        self.ignore_solid_check.setEnabled(s.hashing.compare_by_channel)
-        self._update_hashing_options_state()
 
         self.lancedb_in_memory_check.setChecked(s.lancedb_in_memory)
-
         self.save_visuals_check.setChecked(s.visuals.save)
         self.visuals_tonemap_check.setChecked(s.visuals.tonemap_enabled)
         self.max_visuals_entry.setText(s.visuals.max_count)
         self.visuals_columns_spinbox.setValue(s.visuals.columns)
         self.toggle_visuals_option(s.visuals.save)
+
+        # This call is deferred to main_window after all panels are created.
+        # self._update_dependent_ui_state()
 
 
 class PerformancePanel(QGroupBox):
@@ -566,7 +609,7 @@ class PerformancePanel(QGroupBox):
     device_changed = Signal(bool)
 
     def __init__(self, settings_manager: SettingsManager):
-        super().__init__("Performance & AI Model")
+        super().__init__("Performance and AI Model")
         self.settings_manager = settings_manager
         self._init_ui()
         self._detect_and_setup_devices()
@@ -1585,7 +1628,6 @@ class ImageViewerPanel(QGroupBox):
         if len(images) != 2:
             return
 
-        # Count how many channels are currently selected by the user
         active_channels = [ch for ch, is_active in self.channel_states.items() if is_active]
         num_active_channels = len(active_channels)
 
@@ -1593,19 +1635,12 @@ class ImageViewerPanel(QGroupBox):
             if pil_image.mode != "RGBA":
                 pil_image = pil_image.convert("RGBA")
 
-            # SCENARIO 1: Single channel selected (Analysis Mode)
-            # Display the selected channel as a grayscale image.
             if num_active_channels == 1:
                 channel_name = active_channels[0]
                 channel = pil_image.getchannel(channel_name)
-                # Create a new RGB image where all three channels are the selected one.
                 grayscale_img = Image.merge("RGB", (channel, channel, channel))
-                # Add a fully opaque alpha channel to make it visible.
                 grayscale_img.putalpha(Image.new("L", grayscale_img.size, 255))
                 return QPixmap.fromImage(ImageQt(grayscale_img))
-
-            # SCENARIO 2: Multiple channels selected (Standard Composite View)
-            # Show a colored image with the selected channels enabled/disabled.
             else:
                 r, g, b, a = pil_image.split()
                 if not self.channel_states["R"]:
@@ -1616,13 +1651,11 @@ class ImageViewerPanel(QGroupBox):
                     b = b.point(lambda _: 0)
                 if not self.channel_states["A"]:
                     a = a.point(lambda _: 255)
-
                 processed_pil = Image.merge("RGBA", (r, g, b, a))
                 return QPixmap.fromImage(ImageQt(processed_pil))
 
         current_mode = CompareMode(self.compare_type_combo.currentText())
         if current_mode == CompareMode.DIFF:
-            # The diff logic already handles channels correctly
             self.diff_view.setPixmap(self._calculate_diff_pixmap())
             return
 
@@ -1642,7 +1675,6 @@ class ImageViewerPanel(QGroupBox):
         for i, name in enumerate(["R", "G", "B", "A"]):
             try:
                 extrema = img.getchannel(i).getextrema()
-                # A channel is active if its min and max values are different.
                 activity[name] = extrema[0] != extrema[1]
             except Exception:
                 activity[name] = False

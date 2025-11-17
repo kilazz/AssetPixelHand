@@ -3,12 +3,12 @@
 Each strategy encapsulates the full algorithm for a specific scan mode.
 """
 
+import copy
 import logging
 import multiprocessing
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +16,7 @@ import pyarrow as pa
 
 from app.constants import BEST_FILE_METHOD_NAME, DUCKDB_AVAILABLE, RESULTS_DB_FILE
 from app.data_models import (
+    AnalysisItem,
     DuplicateResults,
     ImageFingerprint,
     ScanConfig,
@@ -24,7 +25,6 @@ from app.data_models import (
 )
 from app.image_io import get_image_metadata
 from app.services.signal_bus import SignalBus
-from app.utils import find_best_in_group
 
 from .engines import LanceDBSimilarityEngine
 from .helpers import FileFinder
@@ -32,12 +32,13 @@ from .pipeline import PipelineManager
 from .scan_stages import (
     AILinkingStage,
     DatabaseIndexStage,
-    EvidenceMethod,
     ExactDuplicateStage,
     FileDiscoveryStage,
     FingerprintGenerationStage,
+    ItemGenerationStage,
     PerceptualDuplicateStage,
     ScanContext,
+    ScanStage,
 )
 
 if DUCKDB_AVAILABLE:
@@ -49,11 +50,10 @@ app_logger = logging.getLogger("AssetPixelHand.strategies")
 class ScanStrategy(ABC):
     """Abstract base class for a scanning strategy."""
 
-    def __init__(self, config: ScanConfig, state: ScanState, signals: SignalBus, table, scanner_core):
+    def __init__(self, config: ScanConfig, state: ScanState, signals: SignalBus, scanner_core):
         self.config = config
         self.state = state
         self.signals = signals
-        self.table = table
         self.scanner_core = scanner_core
         self.all_skipped_files: list[str] = []
 
@@ -173,136 +173,84 @@ class ScanStrategy(ABC):
 class FindDuplicatesStrategy(ScanStrategy):
     """Strategy for finding duplicate images using a granular pipeline of stages."""
 
-    def __init__(self, *args):
-        super().__init__(*args)
-        self.pipeline = [
-            (FileDiscoveryStage(), 0.05),
-            (ExactDuplicateStage(), 0.15),
-            (PerceptualDuplicateStage(), 0.20),
-            (FingerprintGenerationStage(), 0.45),
-            (DatabaseIndexStage(), 0.0),
-            (AILinkingStage(), 0.15),
-        ]
-
     def execute(self, stop_event: threading.Event, start_time: float):
-        """Executes the duplicate finding strategy by running the pipeline."""
+        """Executes the duplicate finding strategy by running the selected pipeline."""
         context = ScanContext(
             config=self.config,
             state=self.state,
             signals=self.signals,
             stop_event=stop_event,
             scanner_core=self.scanner_core,
+            lancedb_db=self.scanner_core.db,
+            lancedb_table=self.scanner_core.table,
         )
 
-        for stage, weight in self.pipeline:
+        pipeline_to_run = self._build_pipeline()
+
+        for stage, weight in pipeline_to_run:
             if stop_event.is_set():
                 break
 
             context.state.set_phase(stage.name, weight)
-            should_continue = stage.run(context)
-
-            if not should_continue:
+            if not stage.run(context):
                 break
 
         self.all_skipped_files.extend(context.all_skipped_files)
 
         if not stop_event.is_set():
-            if context.config.compare_by_channel:
-                final_groups = self._process_channel_results(context)
-            else:
-                final_groups = context.cluster_manager.get_final_groups(context.all_image_fps)
+            # Unified result processing, regardless of scan mode
+            def fp_resolver(node: tuple[Path, str | None]) -> ImageFingerprint | None:
+                path, channel = node
+                if fp_orig := context.all_image_fps.get(path):
+                    fp_copy = copy.copy(fp_orig)
+                    fp_copy.channel = channel
+                    return fp_copy
+                return None
+
+            final_groups = context.cluster_manager.get_final_groups(fp_resolver)
             self._report_and_cleanup(final_groups, start_time)
         else:
             self._report_and_cleanup({}, start_time)
 
-    def _process_channel_results(self, context: ScanContext) -> DuplicateResults:
-        """
-        Processes results for channel-comparison mode by finding connected components
-        of similar channels from the raw AI links.
-        """
-        import copy
+    def _build_pipeline(self) -> list[tuple[ScanStage, float]]:
+        """Dynamically constructs the pipeline of scan stages based on config."""
+        pipeline = [(FileDiscoveryStage(), 0.05)]
+        if self.config.find_exact_duplicates:
+            pipeline.append((ExactDuplicateStage(), 0.10))
 
-        app_logger.info("Processing channel-comparison results from raw AI links using connected components.")
+        # ItemGeneration is required for any perceptual or AI analysis
+        needs_item_generation = (
+            self.config.find_simple_duplicates
+            or self.config.find_perceptual_duplicates
+            or self.config.find_structural_duplicates
+            or self.config.use_ai
+        )
 
-        raw_links = context.ai_links
-        if not raw_links:
-            return {}
+        if needs_item_generation:
+            pipeline.append((ItemGenerationStage(), 0.05))
 
-        nodes = set()
-        edges = []
-        evidence_map = {}
-        all_fps = context.all_image_fps
+        if any(
+            [
+                self.config.find_simple_duplicates,
+                self.config.find_perceptual_duplicates,
+                self.config.find_structural_duplicates,
+            ]
+        ):
+            pipeline.append((PerceptualDuplicateStage(), 0.20))
 
-        for p1_str, ch1, p2_str, ch2, dist in raw_links:
-            node1, node2 = (Path(p1_str), ch1), (Path(p2_str), ch2)
-            nodes.add(node1)
-            nodes.add(node2)
-            edges.append((node1, node2))
-            evidence_map[tuple(sorted((node1, node2)))] = dist
-
-        adj = defaultdict(list)
-        for u, v in edges:
-            adj[u].append(v)
-            adj[v].append(u)
-
-        visited = set()
-        components = []
-        for node in nodes:
-            if node not in visited:
-                component = []
-                stack = [node]
-                visited.add(node)
-                while stack:
-                    curr = stack.pop()
-                    component.append(curr)
-                    for neighbor in adj[curr]:
-                        if neighbor not in visited:
-                            visited.add(neighbor)
-                            stack.append(neighbor)
-                if len(component) > 1:
-                    components.append(component)
-
-        final_groups = {}
-        for component in components:
-            pseudo_fps = []
-            for path, channel in component:
-                if real_fp := all_fps.get(path):
-                    pseudo_fp = copy.copy(real_fp)
-                    pseudo_fp.channel = channel
-                    pseudo_fps.append(pseudo_fp)
-
-            if not pseudo_fps:
-                continue
-
-            best_fp = find_best_in_group(pseudo_fps)
-            best_node = (best_fp.path, best_fp.channel)
-
-            duplicates = set()
-            for dup_fp in pseudo_fps:
-                if dup_fp.path == best_fp.path and dup_fp.channel == best_fp.channel:
-                    continue
-
-                dup_node = (dup_fp.path, dup_fp.channel)
-                key = tuple(sorted((best_node, dup_node)))
-
-                # Get the direct distance to the best node, if it exists.
-                dist = evidence_map.get(key)
-
-                # If 'dist' is None, it means there is no direct link to the best node,
-                # but it's still part of the same connected component (an indirect link).
-                # We should still include it in the group. We'll assign a default distance
-                # of 0.0, which translates to a 100% score, just to mark its inclusion.
-                if dist is None:
-                    dist = 0.0
-
-                score = int(max(0.0, (1.0 - dist) * 100))
-
-                duplicates.add((dup_fp, score, EvidenceMethod.AI.value))
-
-            if duplicates:
-                final_groups[best_fp] = duplicates
-
-        return final_groups
+        if self.config.use_ai:
+            pipeline.extend(
+                [
+                    (FingerprintGenerationStage(), 0.40),
+                    (DatabaseIndexStage(), 0.05),
+                    (AILinkingStage(), 0.15),
+                ]
+            )
+        else:
+            self.signals.log_message.emit(
+                "Running in 'No AI' mode. Only exact and near-identical duplicates will be found.", "info"
+            )
+        return pipeline
 
     def _report_and_cleanup(self, final_groups: DuplicateResults, start_time: float):
         num_found = sum(len(d) for d in final_groups.values())
@@ -330,9 +278,17 @@ class SearchStrategy(ScanStrategy):
             config=self.config,
             state=self.state,
             signals=self.signals,
-            lancedb_table=self.table,
+            lancedb_table=self.scanner_core.table,
             stop_event=stop_event,
         )
+
+        # In search mode, we always generate composite items
+        items = [AnalysisItem(path=path, analysis_type="Composite") for path in all_files]
+        for item in items:
+            if item.path not in self.scanner_core.all_image_fps and (meta := get_image_metadata(item.path)):
+                self.scanner_core.all_image_fps[item.path] = ImageFingerprint(
+                    path=item.path, hashes=np.array([]), **meta
+                )
 
         search_context = ScanContext(
             config=self.config,
@@ -340,7 +296,10 @@ class SearchStrategy(ScanStrategy):
             signals=self.signals,
             stop_event=stop_event,
             scanner_core=self.scanner_core,
-            files_to_process=all_files,
+            lancedb_db=self.scanner_core.db,
+            lancedb_table=self.scanner_core.table,
+            items_to_process=items,
+            all_image_fps=self.scanner_core.all_image_fps,
         )
 
         success, skipped = pipeline_manager.run(search_context)
@@ -377,13 +336,14 @@ class SearchStrategy(ScanStrategy):
             self.signals.scan_error.emit("Could not generate a vector for the search query.")
             return None, None
 
-        sim_engine = LanceDBSimilarityEngine(self.config, self.state, self.signals, self.scanner_core.db, self.table)
+        sim_engine = LanceDBSimilarityEngine(
+            self.config, self.state, self.signals, self.scanner_core.db, self.scanner_core.table
+        )
 
-        # Use radius search here as well for consistency and correctness
         hits = (
-            self.table.search(query_vector, radius=sim_engine.distance_threshold)
+            self.scanner_core.table.search(query_vector, radius=sim_engine.distance_threshold)
             .metric("cosine")
-            .limit(1000)  # Keep limit as a safety cap
+            .limit(1000)
             .nprobes(sim_engine.nprobes)
             .refine_factor(sim_engine.refine_factor)
             .to_polars()
@@ -400,6 +360,8 @@ class SearchStrategy(ScanStrategy):
         return len(results), str(RESULTS_DB_FILE)
 
     def _save_search_results(self, results: list[tuple[ImageFingerprint, float]]):
+        from app.data_models import EvidenceMethod
+
         """Format and save search results to database."""
         dups = [(fp, int(max(0.0, (1.0 - d)) * 100), EvidenceMethod.AI.value) for fp, d in results]
         best_fp = self._create_search_context_fingerprint()

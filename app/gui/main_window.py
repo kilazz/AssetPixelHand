@@ -76,6 +76,8 @@ class App(QMainWindow):
         self._create_menu_bar()
         self._connect_signals()
 
+        self.scan_options_panel._update_dependent_ui_state()
+
         self.options_panel._update_scan_context()
         self._log_system_status()
         self._apply_initial_theme()
@@ -255,7 +257,8 @@ class App(QMainWindow):
             return
 
         if (
-            DEEP_LEARNING_AVAILABLE
+            config.use_ai
+            and DEEP_LEARNING_AVAILABLE
             and not is_onnx_model_cached(config.model_name)
             and not self._run_model_conversion(config)
         ):
@@ -305,6 +308,11 @@ class App(QMainWindow):
             self.viewer_panel,
         ]:
             panel.setEnabled(not is_scanning)
+
+        # After setting the main state, re-apply the dependency logic
+        if not is_scanning:
+            self.scan_options_panel._update_dependent_ui_state()
+
         self.options_panel.set_scan_button_state(is_scanning)
         QApplication.processEvents()
 

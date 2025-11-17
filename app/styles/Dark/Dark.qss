@@ -1,4 +1,4 @@
-/* --- PALETTE & VARIABLES ---
+/* --- PALETTE and VARIABLES ---
  * Main Palette:
  *   - Darkest (Inputs, Popups): #1e1f22
  *   - Darker (Main BG, Views):  #2b2d31
@@ -6,12 +6,12 @@
  *   - Mid-Gray (Borders):       #202225
  *   - Gray (Button BG):         #4e5058
  *
- * Text & Accents:
+ * Text and Accents:
  *   - Text Primary:             #dcddde
  *   - Text Secondary:           #949ba4
  *   - Text Disabled:            #7c808a
  *
- * Brand & Actions:
+ * Brand and Actions:
  *   - Primary Action (Blue):    #5865f2
  *   - Success (Green):          #248046
  *   - Destructive (Red):        #da373c

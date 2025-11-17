@@ -36,12 +36,14 @@ class ScannerCore(QObject):
         self.table: lancedb.table.Table | None = None
         self.scan_has_finished = False
         self.all_skipped_files: list[str] = []
+        self.all_image_fps = {}  # Add this to hold fingerprints in search mode
 
     def run(self, stop_event: threading.Event):
         """Main entry point for the scanner logic, executed in a separate thread."""
         self.scan_has_finished = False
         start_time = time.time()
         self.all_skipped_files.clear()
+        self.all_image_fps.clear()
 
         try:
             setup_caches(self.config)
@@ -57,7 +59,7 @@ class ScannerCore(QObject):
             strategy_class = strategy_map.get(self.config.scan_mode)
 
             if strategy_class:
-                strategy = strategy_class(self.config, self.state, APP_SIGNAL_BUS, self.table, self)
+                strategy = strategy_class(self.config, self.state, APP_SIGNAL_BUS, self)
                 strategy.execute(stop_event, start_time)
             else:
                 APP_SIGNAL_BUS.log_message.emit(f"Unknown scan mode: {self.config.scan_mode}", "error")
@@ -95,13 +97,14 @@ class ScannerCore(QObject):
                 pa.field("id", pa.string()),
                 pa.field("vector", pa.list_(pa.float32(), self.config.model_dim)),
             ]
-            # Add all other fields as defined in our single source of truth
             for name, types in FINGERPRINT_FIELDS.items():
                 schema_fields.append(pa.field(name, types["pyarrow"]))
 
             schema = pa.schema(schema_fields)
 
             table_name = DB_TABLE_NAME
+            # Always ensure a clean table for each scan.
+            # This is the most robust approach.
             if table_name in self.db.table_names():
                 self.db.drop_table(table_name)
 

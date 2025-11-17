@@ -20,7 +20,7 @@ except NameError:
 
 sys.path.insert(0, str(SCRIPT_DIR.resolve()))
 
-# --- Core Application Directories & Environment Setup ---
+# --- Core Application Directories and Environment Setup ---
 APP_DATA_DIR = SCRIPT_DIR / "app_data"
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 MODELS_DIR = APP_DATA_DIR / "models"
@@ -187,7 +187,7 @@ def _load_models_config() -> dict:
 SUPPORTED_MODELS = _load_models_config()
 
 
-# --- UI Configuration & Enums ---
+# --- UI Configuration and Enums ---
 class UIConfig:
     class Colors:
         SUCCESS = "#4CAF50"
@@ -241,10 +241,11 @@ class TonemapMode(Enum):
     ENABLED = "enabled"
 
 
-# --- Data Model & UI Constants ---
+# --- Data Model and UI Constants ---
 METHOD_DISPLAY_NAMES = {
     "xxHash": "Exact Match",
     "dHash": "Simple Match",
     "pHash": "Near-Identical",
+    "wHash": "Structural Match",
 }
 NODE_TYPE_GROUP = "group"
