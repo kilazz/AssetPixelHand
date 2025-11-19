@@ -79,7 +79,6 @@ except (ImportError, NameError):
     PILLOW_AVAILABLE = False
 
 # --- Library Optimizations ---
-
 if PYVIPS_AVAILABLE:
     try:
         import pyvips

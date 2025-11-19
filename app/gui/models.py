@@ -1,9 +1,6 @@
 # app/gui/models.py
 """
 Contains Qt Item Models and Delegates for displaying data.
-Python 3.13+:
-- Implements Task Cancellation for Image Loaders to ensure smooth scrolling.
-- Optimizes data fetching from DuckDB.
 """
 
 import logging

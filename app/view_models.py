@@ -1,5 +1,7 @@
 # app/view_models.py
-"""Contains View-Model classes that manage UI state and logic, separating it from the view widgets."""
+"""
+Contains View-Model classes that manage UI state and logic, separating it from the view widgets.
+"""
 
 from collections import OrderedDict
 from pathlib import Path

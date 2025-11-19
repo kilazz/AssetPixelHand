@@ -1,5 +1,6 @@
 # app/services/file_operation_manager.py
-"""Contains the FileOperationManager class, responsible for handling all
+"""
+Contains the FileOperationManager class, responsible for handling all
 background file system operations like deleting or linking files.
 """
 

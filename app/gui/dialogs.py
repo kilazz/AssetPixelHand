@@ -1,5 +1,6 @@
 # app/gui/dialogs.py
-"""Contains all QDialog-based classes for the application, providing modal windows
+"""
+Contains all QDialog-based classes for the application, providing modal windows
 for user interaction, progress display, and specific settings.
 """
 

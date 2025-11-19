@@ -1,5 +1,7 @@
 # app/services/signal_bus.py
-"""Defines the application-wide signal bus for decoupled communication."""
+"""
+Defines the application-wide signal bus for decoupled communication.
+"""
 
 from PySide6.QtCore import QObject, Signal
 

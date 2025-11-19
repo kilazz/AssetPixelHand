@@ -1,5 +1,6 @@
 # app/utils.py
-"""General utility functions for file system operations, data handling, and
+"""
+General utility functions for file system operations, data handling, and
 application-specific helpers.
 """
 

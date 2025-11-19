@@ -1,7 +1,6 @@
 # app/core/strategies.py
 """
 Contains different strategies for the scanning process.
-Python 3.13+ (Threading).
 """
 
 import copy

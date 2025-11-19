@@ -1,5 +1,6 @@
 # app/core/scanner.py
-"""Main orchestrator for the scanning process. This module contains the core logic
+"""
+Main orchestrator for the scanning process. This module contains the core logic
 for controlling the scanner's lifecycle via a dedicated thread.
 """
 

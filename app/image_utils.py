@@ -1,5 +1,7 @@
 # app/image_utils.py
-"""Contains shared image processing utility functions to avoid circular dependencies."""
+"""
+Contains shared image processing utility functions to avoid circular dependencies.
+"""
 
 import logging
 

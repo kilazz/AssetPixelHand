@@ -2,9 +2,6 @@
 """
 Contains adapters to provide a unified interface for different model architectures
 (CLIP, SigLIP, DINOv2) specifically for the purpose of ONNX export.
-
-Designed with LAZY IMPORTS: This file does NOT import torch or transformers
-at the module level. They are imported only within methods or passed as arguments.
 """
 
 from abc import ABC, abstractmethod

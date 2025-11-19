@@ -1,11 +1,6 @@
 # app/core/scan_stages.py
 """
 Contains individual, encapsulated stages for the duplicate finding process.
-- REMOVED Numba dependency (Fixes JIT compilation lag).
-- Uses native int.bit_count() for blazing fast Hamming distance.
-- Skips heavy Indexing for datasets < 50k.
-- Uses Strings instead of Path objects for Clustering keys.
-- "Star Topology" logic for high precision grouping.
 """
 
 import logging

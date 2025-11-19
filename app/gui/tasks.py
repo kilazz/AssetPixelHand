@@ -1,9 +1,6 @@
 # app/gui/tasks.py
 """
 Contains QRunnable tasks for performing background operations without freezing the GUI.
-Python 3.13+ Architecture:
-- Aggressive task cancellation for ImageLoader (UI responsiveness).
-- Lazy imports for heavy AI libraries (Reliability/Startup Speed).
 """
 
 import inspect

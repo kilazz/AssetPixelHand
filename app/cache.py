@@ -1,5 +1,7 @@
 # app/cache.py
-"""Manages file and fingerprint caching to avoid reprocessing unchanged files."""
+"""
+Manages file and fingerprint caching to avoid reprocessing unchanged files.
+"""
 
 import abc
 import hashlib

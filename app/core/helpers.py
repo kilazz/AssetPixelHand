@@ -1,5 +1,6 @@
 # app/core/helpers.py
-"""Contains helper classes and components used by the scanning strategies,
+"""
+Contains helper classes and components used by the scanning strategies,
 such as the FileFinder and the task for generating result visualizations.
 """
 

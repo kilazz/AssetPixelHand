@@ -1,5 +1,6 @@
 # app/gui/widgets.py
-"""Contains small, reusable custom QWidget subclasses used throughout the GUI.
+"""
+Contains small, reusable custom QWidget subclasses used throughout the GUI.
 These widgets encapsulate specific functionalities like displaying images with
 transparency, comparing images, or emitting signals on resize.
 """

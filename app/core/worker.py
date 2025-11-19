@@ -1,11 +1,6 @@
 # app/core/worker.py
 """
 Contains worker functions for parallel computation (Preprocessing and Inference).
-Python 3.13+ (No-GIL Threading).
-OPTIMIZED:
-- Encapsulates global state in ModelManager (Singleton).
-- Explicit resource management to prevent VRAM/RAM leaks during model switching.
-- Aggressive pre-shrinking and resizing during image loading.
 """
 
 import gc
@@ -21,7 +16,6 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-# --- PERFORMANCE OPTIMIZATION: PRE-LOAD HEAVY LIBS ---
 # Attempt to pre-load libraries to avoid import lock contention in threads
 try:
     import torch  # noqa: F401
@@ -29,7 +23,6 @@ try:
     from transformers import AutoProcessor  # noqa: F401
 except ImportError:
     pass
-# -----------------------------------------------------
 
 from app.constants import (
     APP_DATA_DIR,
@@ -227,8 +220,6 @@ def get_model_input_size() -> tuple[int, int]:
 
 
 # --- Optimized Processing Logic ---
-
-
 def _read_and_process_batch_for_ai(
     items: list["AnalysisItem"], input_size: tuple[int, int], simple_config: dict
 ) -> tuple[list[Image.Image], list[tuple[str, str | None]], list[tuple[str, str]]]:

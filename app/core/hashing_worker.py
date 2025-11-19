@@ -1,7 +1,6 @@
 # app/core/hashing_worker.py
 """
 Contains lightweight, standalone worker functions for hashing and metadata extraction.
-OPTIMIZED: Aggressive resizing before channel splitting to speed up hashing.
 """
 
 import traceback

@@ -1,8 +1,6 @@
 # app/core/pipeline.py
 """
 Contains the PipelineManager, which orchestrates the scanning pipeline.
-Python 3.13+: Uses threading with Sentinel Pattern.
-Batch buffering for Vector DB writes to prevent I/O bottlenecks.
 """
 
 import contextlib
