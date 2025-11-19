@@ -6,7 +6,6 @@ Includes logic for automatic cache cleanup on model change.
 """
 
 import logging
-import tracemalloc
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThreadPool, Slot
@@ -333,17 +332,7 @@ class App(QMainWindow):
 
     @Slot(object, int, object, float, list)
     def on_scan_complete(self, payload, num_found, mode, duration, skipped):
-        try:
-            snapshot = tracemalloc.take_snapshot()
-            top_stats = snapshot.statistics("lineno")
-            print("\n" + "=" * 80)
-            print("TOP 20 MEMORY ALLOCATIONS (tracemalloc report)")
-            print("=" * 80)
-            for stat in top_stats[:20]:
-                print(stat)
-            print("=" * 80 + "\n")
-        except Exception:
-            pass
+        # Tracemalloc block removed for performance optimization
 
         if not mode:
             app_logger.warning("Scan was cancelled by the user.")

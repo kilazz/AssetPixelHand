@@ -7,7 +7,6 @@ import multiprocessing
 import os
 import sys
 import traceback
-import tracemalloc
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -75,9 +74,6 @@ def run_application():
 
     # Set the global exception hook to our custom logger.
     sys.excepthook = log_global_crash
-
-    # Start tracing memory allocations (useful for debugging leaks)
-    tracemalloc.start(25)
 
     app = QApplication(sys.argv)
 
