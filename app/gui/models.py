@@ -1,6 +1,9 @@
 # app/gui/models.py
-"""Contains Qt Item Models and Delegates for displaying data in views like QTreeView
-and QListView. These components are responsible for managing and presenting data to the user.
+"""
+Contains Qt Item Models and Delegates for displaying data.
+Python 3.13+:
+- Implements Task Cancellation for Image Loaders to ensure smooth scrolling.
+- Optimizes data fetching from DuckDB.
 """
 
 import logging
@@ -29,13 +32,12 @@ from app.constants import (
     UIConfig,
 )
 from app.data_models import GroupNode, ResultNode, ScanMode
+from app.gui.tasks import GroupFetcherTask, ImageLoader
+from app.gui.widgets import AlphaBackgroundWidget
 from app.utils import find_common_base_name
 
 if TYPE_CHECKING:
     from app.view_models import ImageComparerState
-
-from .tasks import GroupFetcherTask, ImageLoader
-from .widgets import AlphaBackgroundWidget
 
 if DUCKDB_AVAILABLE:
     import duckdb
@@ -47,16 +49,12 @@ SortRole = Qt.ItemDataRole.UserRole + 1
 
 
 def _format_metadata_string(node: ResultNode) -> str:
-    """A centralized helper function to create the detailed metadata string."""
+    """Helper to create the detailed metadata string for the UI."""
     res = f"{node.resolution_w}x{node.resolution_h}"
     size_mb = node.file_size / (1024**2)
     size_str = f"{size_mb:.2f} MB"
     bit_depth_str = f"{node.bit_depth}-bit"
 
-    # The backend provides clean, separated data. The GUI just assembles it.
-    active_channels = node.format_details
-
-    # --- Build the final string piece by piece ---
     parts = [
         res,
         size_str,
@@ -64,12 +62,11 @@ def _format_metadata_string(node: ResultNode) -> str:
         node.compression_format,
         node.color_space,
         bit_depth_str,
-        active_channels,
+        node.format_details,
         node.texture_type,
         f"Mips: {node.mipmap_count}",
     ]
 
-    # Filter out any empty or None values and join them
     return " | ".join(filter(None, parts))
 
 
@@ -86,13 +83,15 @@ class ResultsTreeModel(QAbstractItemModel):
         self.sorted_group_ids: list[int] = []
         self.check_states: dict[str, Qt.CheckState] = {}
         self.filter_text = ""
+        # Fast lookups
         self.path_to_group_id: dict[str, int] = {}
         self.group_id_to_best_path: dict[int, str] = {}
         self.running_tasks: dict[int, GroupFetcherTask] = {}
 
     def clear(self):
         self.beginResetModel()
-        self.db_path, self.mode = None, ""
+        self.db_path = None
+        self.mode = ""
         self.groups_data.clear()
         self.sorted_group_ids.clear()
         self.check_states.clear()
@@ -132,19 +131,25 @@ class ResultsTreeModel(QAbstractItemModel):
         self.sorted_group_ids.clear()
         self.path_to_group_id.clear()
         self.group_id_to_best_path.clear()
+
         try:
             with duckdb.connect(database=str(self.db_path), read_only=True) as conn:
                 group_filter_clause = ""
                 params = []
                 if self.filter_text:
+                    # Filter groups where ANY file matches the text
                     group_filter_clause = "WHERE group_id IN (SELECT group_id FROM results WHERE path ILIKE ?)"
                     params.append(f"%{self.filter_text}%")
 
-                group_query = f"SELECT group_id, COUNT(*), SUM(file_size) FROM results {group_filter_clause} GROUP BY group_id ORDER BY group_id"
+                group_query = (
+                    f"SELECT group_id, COUNT(*), SUM(file_size) "
+                    f"FROM results {group_filter_clause} "
+                    f"GROUP BY group_id ORDER BY group_id"
+                )
                 groups = conn.execute(group_query, params).fetchall()
 
                 for group_id, count, total_size in groups:
-                    # Robustly determine the group name
+                    # Determine group name from the "Best" file
                     best_file_row = conn.execute(
                         "SELECT path, search_context, channel FROM results WHERE group_id = ? AND is_best = TRUE",
                         [group_id],
@@ -157,30 +162,27 @@ class ResultsTreeModel(QAbstractItemModel):
                         best_path = Path(best_path_str)
                         group_name = best_path.stem
 
-                        # The most reliable way to name a channel group is to check the search_context
                         if search_context and search_context.startswith("channel:"):
                             channel = search_context.split(":", 1)[1]
                             group_name = f"{best_path.name} ({channel})"
-                        elif search_context:  # Handle text/sample search contexts
+                        elif search_context:
                             if search_context.startswith("sample:"):
                                 group_name = f"Sample: {search_context.split(':', 1)[1]}"
                             elif search_context.startswith("query:"):
                                 group_name = f"Query: '{search_context.split(':', 1)[1]}'"
-                            count -= 1  # Don't count the query/sample itself
+                            count -= 1
                         else:
-                            # Fallback for non-AI channel matching: check if all members have the same channel
+                            # Heuristic naming if no explicit context
                             distinct_channels = conn.execute(
                                 "SELECT DISTINCT channel FROM results WHERE group_id = ?", [group_id]
                             ).fetchall()
                             if len(distinct_channels) == 1 and distinct_channels[0][0] is not None:
-                                channel = distinct_channels[0][0]
-                                group_name = f"{best_path.name} ({channel})"
+                                group_name = f"{best_path.name} ({distinct_channels[0][0]})"
                             else:
-                                # If channels are mixed or null, find a common name
-                                all_paths_in_group = conn.execute(
+                                all_paths = conn.execute(
                                     "SELECT path FROM results WHERE group_id = ?", [group_id]
                                 ).fetchall()
-                                group_name = find_common_base_name([Path(p[0]) for p in all_paths_in_group])
+                                group_name = find_common_base_name([Path(p[0]) for p in all_paths])
 
                     self.groups_data[group_id] = GroupNode(
                         name=group_name, count=count, total_size=total_size, group_id=group_id
@@ -245,6 +247,7 @@ class ResultsTreeModel(QAbstractItemModel):
         node: GroupNode = parent.internalPointer()
         group_id = node.group_id
 
+        # Launch background task to fetch children
         task = GroupFetcherTask(self.db_path, group_id, self.mode, parent)
         task.signals.finished.connect(self._on_fetch_finished)
         task.signals.error.connect(self._on_fetch_error)
@@ -266,6 +269,7 @@ class ResultsTreeModel(QAbstractItemModel):
 
         children = [ResultNode.from_dict(c) for c in children_dicts]
 
+        # Populate fast lookup
         for child in children:
             self.path_to_group_id[child.path] = group_id
             if child.is_best:
@@ -277,12 +281,12 @@ class ResultsTreeModel(QAbstractItemModel):
         self.endInsertRows()
 
         del self.running_tasks[group_id]
-
         self.fetch_completed.emit(parent_index)
 
     @Slot(str)
     def _on_fetch_error(self, error_message: str):
         app_logger.error(f"Background fetch error: {error_message}")
+        # Clean up task tracking
         for group_id, task in list(self.running_tasks.items()):
             if task.signals.error is self.sender():
                 del self.running_tasks[group_id]
@@ -340,13 +344,14 @@ class ResultsTreeModel(QAbstractItemModel):
 
     def _get_display_data(self, index, node: GroupNode | ResultNode):
         if isinstance(node, GroupNode):
+            if index.column() != 0:
+                return ""
             is_search = self.mode in [ScanMode.TEXT_SEARCH, ScanMode.SAMPLE_SEARCH]
-            display_text = (
+            return (
                 f"{node.name} ({node.count} results)" if is_search else f"Group: {node.name} ({node.count} duplicates)"
             )
-            return display_text if index.column() == 0 else ""
 
-        # Here, node is a ResultNode
+        # ResultNode
         path = Path(node.path)
         col = index.column()
 
@@ -391,7 +396,7 @@ class ResultsTreeModel(QAbstractItemModel):
                     last_child_idx = self.index(len(node.children) - 1, 0, index)
                     self.dataChanged.emit(first_child_idx, last_child_idx, [Qt.ItemDataRole.CheckStateRole])
             else:
-
+                # Lazy fetch if user checks an unexpanded group
                 def apply_state_after_fetch(parent_index: QModelIndex):
                     if parent_index == index:
                         self.setData(index, value, role)
@@ -399,7 +404,7 @@ class ResultsTreeModel(QAbstractItemModel):
 
                 self.fetch_completed.connect(apply_state_after_fetch)
                 self.fetchMore(index)
-        else:  # ResultNode
+        else:
             self.check_states[node.path] = new_check_state
             parent_index = self.parent(index)
             if parent_index.isValid():
@@ -423,7 +428,6 @@ class ResultsTreeModel(QAbstractItemModel):
 
     @Slot(int)
     def remove_group_by_id(self, group_id: int):
-        """Finds and removes a group row from the model by its ID."""
         if group_id in self.sorted_group_ids:
             row = self.sorted_group_ids.index(group_id)
             self.beginRemoveRows(QModelIndex(), row, row)
@@ -503,6 +507,7 @@ class ResultsTreeModel(QAbstractItemModel):
     def remove_deleted_paths(self, deleted_paths: list[Path]):
         deleted_set = {str(p) for p in deleted_paths}
         groups_to_remove = []
+
         for gid, data in self.groups_data.items():
             if data.fetched:
                 data.children = [f for f in data.children if f.path not in deleted_set]
@@ -517,11 +522,13 @@ class ResultsTreeModel(QAbstractItemModel):
                 and not any(f.is_best for f in data.children)
                 and data.children
             ):
+                # Promote new best if best was deleted
                 data.children[0].is_best = True
 
         for gid in groups_to_remove:
             if gid in self.groups_data:
                 del self.groups_data[gid]
+
         self.sorted_group_ids = [gid for gid in self.sorted_group_ids if gid not in groups_to_remove]
 
         paths_to_clear = list(self.check_states.keys())
@@ -531,7 +538,10 @@ class ResultsTreeModel(QAbstractItemModel):
 
 
 class ImagePreviewModel(QAbstractListModel):
-    """Data model for the image preview list."""
+    """
+    Data model for the image preview list.
+    Implements ACTIVE TASK CANCELLATION to prevent scroll lag.
+    """
 
     def __init__(self, thread_pool: QThreadPool, parent=None):
         super().__init__(parent)
@@ -541,7 +551,10 @@ class ImagePreviewModel(QAbstractListModel):
         self.pixmap_cache: OrderedDict[str, QPixmap] = OrderedDict()
         self.CACHE_SIZE_LIMIT = 200
         self.thread_pool = thread_pool
+
         self.loading_paths = set()
+        self.active_tasks = {}  # key: cache_key -> ImageLoader
+
         self.tonemap_mode = "none"
         self.target_size = 250
         self.error_paths = {}
@@ -558,13 +571,23 @@ class ImagePreviewModel(QAbstractListModel):
             self.clear_cache()
 
     def clear_cache(self):
+        self.cancel_all_tasks()
         self.beginResetModel()
         self.pixmap_cache.clear()
         self.loading_paths.clear()
         self.error_paths.clear()
         self.endResetModel()
 
+    def cancel_all_tasks(self):
+        """Cancels all currently running image loaders."""
+        for task in self.active_tasks.values():
+            task.cancel()
+        self.active_tasks.clear()
+        # We don't clear loading_paths here immediately, they are cleared in callbacks
+        # or reset in clear_cache()
+
     def set_items_from_list(self, items: list[ResultNode]):
+        self.cancel_all_tasks()
         self.beginResetModel()
         self.db_path = None
         self.group_id = -1
@@ -576,6 +599,7 @@ class ImagePreviewModel(QAbstractListModel):
         self.endResetModel()
 
     def set_group(self, db_path: Path, group_id: int):
+        self.cancel_all_tasks()
         self.beginResetModel()
         self.db_path = db_path
         self.group_id = group_id
@@ -584,10 +608,11 @@ class ImagePreviewModel(QAbstractListModel):
         self.loading_paths.clear()
         self.error_paths.clear()
         self.group_base_channel = None
+
         if DUCKDB_AVAILABLE and self.group_id != -1:
             try:
                 with duckdb.connect(database=str(self.db_path), read_only=True) as conn:
-                    # Determine the group's context (e.g., which channel it's based on)
+                    # Context check
                     group_context_query = "SELECT search_context FROM results WHERE group_id = ? AND is_best = TRUE"
                     context_result = conn.execute(group_context_query, [self.group_id]).fetchone()
                     if context_result and context_result[0] and context_result[0].startswith("channel:"):
@@ -597,6 +622,7 @@ class ImagePreviewModel(QAbstractListModel):
                         "SELECT MAX(search_context) IS NOT NULL FROM results WHERE group_id = ?",
                         [self.group_id],
                     ).fetchone()[0]
+
                     query = "SELECT * FROM results WHERE group_id = ?"
                     if is_search and not self.group_base_channel:
                         query += " AND is_best = FALSE"
@@ -607,8 +633,6 @@ class ImagePreviewModel(QAbstractListModel):
                         row_dict = dict(zip(cols, row_tuple, strict=False))
                         if Path(row_dict["path"]).exists():
                             self.items.append(ResultNode.from_dict(row_dict))
-                        else:
-                            app_logger.info(f"Stale file reference found and removed from viewer: {row_dict['path']}")
             except duckdb.Error as e:
                 app_logger.error(f"Failed to load group {self.group_id}: {e}")
         self.endResetModel()
@@ -623,20 +647,25 @@ class ImagePreviewModel(QAbstractListModel):
 
         item = self.items[index.row()]
         path_str = item.path
-
         channel_to_load = item.channel
 
+        # Composite key for caching (Path + Channel + Tonemap + Size)
+        # Actually, cache key is generated inside loader, but we need a unique key for UI tracking
+        # The simple key (path + channel) is enough for the view model to track active loads for this row
         cache_key = f"{path_str}_{channel_to_load or 'full'}"
 
         if role == Qt.ItemDataRole.UserRole:
             return item
         if role == Qt.ItemDataRole.ToolTipRole:
             return f"{path_str}\nChannel: {channel_to_load or 'Full'}"
+
         if role == Qt.ItemDataRole.DecorationRole:
             if cache_key in self.pixmap_cache:
                 return self.pixmap_cache[cache_key]
+
             if cache_key not in self.loading_paths:
                 self.loading_paths.add(cache_key)
+
                 loader = ImageLoader(
                     path_str=path_str,
                     mtime=item.mtime,
@@ -648,39 +677,46 @@ class ImagePreviewModel(QAbstractListModel):
                     on_error_slot="_on_image_error",
                     channel_to_load=channel_to_load,
                 )
+
+                # Track the task for cancellation
+                self.active_tasks[cache_key] = loader
                 self.thread_pool.start(loader)
             return None
         return None
 
     @Slot(str, QImage)
     def _on_image_loaded(self, path_str: str, q_img: QImage):
-        # We need to find which cache_key this belongs to
-        key_to_remove = None
-        for key in self.loading_paths:
-            if key.startswith(path_str):
-                key_to_remove = key
-                break
+        # Find key (lazy match since we don't pass the full key back from loader for simplicity)
+        # We could pass it, but path_str is unique enough per file
+        # Need to handle channel distinction if multiple channels of same file are loaded simultaneously?
+        # For safety, we iterate loading_paths.
 
-        if key_to_remove:
-            self.loading_paths.remove(key_to_remove)
+        keys_to_remove = [k for k in self.loading_paths if k.startswith(path_str)]
+
+        for key in keys_to_remove:
+            self.loading_paths.remove(key)
+            if key in self.active_tasks:
+                del self.active_tasks[key]
+
             if not q_img.isNull():
                 pixmap = QPixmap.fromImage(q_img)
-                self.pixmap_cache[key_to_remove] = pixmap
+                self.pixmap_cache[key] = pixmap
                 if len(self.pixmap_cache) > self.CACHE_SIZE_LIMIT:
                     self.pixmap_cache.popitem(last=False)
-                self._emit_data_changed_for_path(path_str)
+
+        if keys_to_remove:
+            self._emit_data_changed_for_path(path_str)
 
     @Slot(str, str)
     def _on_image_error(self, path_str: str, error_msg: str):
-        key_to_remove = None
-        for key in self.loading_paths:
-            if key.startswith(path_str):
-                key_to_remove = key
-                break
+        keys_to_remove = [k for k in self.loading_paths if k.startswith(path_str)]
+        for key in keys_to_remove:
+            self.loading_paths.remove(key)
+            if key in self.active_tasks:
+                del self.active_tasks[key]
+            self.error_paths[key] = error_msg
 
-        if key_to_remove:
-            self.loading_paths.remove(key_to_remove)
-            self.error_paths[key_to_remove] = error_msg
+        if keys_to_remove:
             self._emit_data_changed_for_path(path_str)
 
     def _emit_data_changed_for_path(self, path_str: str):
@@ -688,7 +724,8 @@ class ImagePreviewModel(QAbstractListModel):
             if item.path == path_str:
                 index = self.index(i, 0)
                 self.dataChanged.emit(index, index, [Qt.ItemDataRole.DecorationRole])
-                return
+                # Continue searching? A file might appear multiple times if channels differ?
+                # ResultNode structure usually means 1 row per item.
 
     def get_row_for_path(self, path: Path) -> int | None:
         path_str = str(path)
@@ -756,10 +793,9 @@ class ImageItemDelegate(QStyledItemDelegate):
             )
         pixmap = index.data(Qt.ItemDataRole.DecorationRole)
 
-        # Check for error using a combination of path and channel
         item_data = index.data(Qt.ItemDataRole.UserRole)
         channel = item_data.channel if item_data else None
-        cache_key = f"{item_data.path}_{channel}"
+        cache_key = f"{item_data.path}_{channel or 'full'}"
         error_msg = self.parent().model.error_paths.get(cache_key)
 
         if pixmap and not pixmap.isNull():
@@ -845,7 +881,6 @@ class ResultsProxyModel(QSortFilterProxyModel):
             self.invalidateFilter()
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
-        """Filters rows based on the minimum similarity score slider."""
         if self._min_similarity == 0:
             return True
 
@@ -860,14 +895,12 @@ class ResultsProxyModel(QSortFilterProxyModel):
         if not node or isinstance(node, GroupNode):
             return True
 
-        # node is a ResultNode here
         if node.is_best or node.found_by in METHOD_DISPLAY_NAMES:
             return True
 
         return node.distance >= self._min_similarity
 
     def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
-        """Overrides the default sorting behavior to use our custom SortRole."""
         left_data = self.sourceModel().data(left, SortRole)
         right_data = self.sourceModel().data(right, SortRole)
 

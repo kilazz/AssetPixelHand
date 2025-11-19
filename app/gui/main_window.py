@@ -1,8 +1,8 @@
 # app/gui/main_window.py
-"""This module contains the main application window class, App(QMainWindow), which
-assembles all UI components and manages the overall application state and logic.
-It acts as the central coordinator, delegating business logic to specialized
-controllers and managers.
+"""
+The main application window class.
+Orchestrates UI components, scan logic, and file operations.
+Includes logic for automatic cache cleanup on model change.
 """
 
 import logging
@@ -58,7 +58,7 @@ app_logger = logging.getLogger("AssetPixelHand.gui.main")
 
 
 class App(QMainWindow):
-    """The main application window, inheriting from QMainWindow."""
+    """The main application window."""
 
     def __init__(self):
         super().__init__()
@@ -78,7 +78,6 @@ class App(QMainWindow):
         self._connect_signals()
 
         self.scan_options_panel._update_dependent_ui_state()
-
         self.options_panel._update_scan_context()
         self._log_system_status()
         self._apply_initial_theme()
@@ -198,7 +197,6 @@ class App(QMainWindow):
             self.settings_manager.save()
 
     def _connect_signals(self):
-        # Connect to the Signal Bus
         APP_SIGNAL_BUS.scan_finished.connect(self.on_scan_complete)
         APP_SIGNAL_BUS.scan_error.connect(self.on_scan_error)
         APP_SIGNAL_BUS.file_operation_started.connect(self._on_file_op_started)
@@ -208,7 +206,6 @@ class App(QMainWindow):
         APP_SIGNAL_BUS.unlock_ui.connect(lambda: self.set_ui_scan_state(is_scanning=False))
         APP_SIGNAL_BUS.status_message_updated.connect(self.statusBar().showMessage)
 
-        # Connect UI Panels to this window or each other (Mediator role)
         self.options_panel.scan_requested.connect(self._start_scan)
         self.options_panel.clear_scan_cache_requested.connect(self._clear_scan_cache)
         self.options_panel.clear_models_cache_requested.connect(self._clear_models_cache)
@@ -252,10 +249,28 @@ class App(QMainWindow):
         if self.controller.is_running():
             return
 
-        self.settings_manager.save()
-
         if not (config := self._get_config()):
             return
+
+        # 1. Get the stored last model name
+        last_used_model = self.settings_manager.settings.hashing.last_model_name
+        current_model = config.model_name
+
+        # 2. Check if changed -> Clear Cache
+        if last_used_model and last_used_model != current_model:
+            APP_SIGNAL_BUS.log_message.emit(
+                f"Model changed from '{last_used_model}' to '{current_model}'. Auto-clearing cache...", "warning"
+            )
+            thumbnail_cache.close()
+            clear_scan_cache()
+            # Reset UI
+            self.results_panel.clear_results()
+            self.viewer_panel.clear_viewer()
+
+        # 3. Update settings AFTER check
+        if self.settings_manager.settings.hashing.last_model_name != current_model:
+            self.settings_manager.settings.hashing.last_model_name = current_model
+            self.settings_manager.save()
 
         if (
             config.use_ai
@@ -310,7 +325,6 @@ class App(QMainWindow):
         ]:
             panel.setEnabled(not is_scanning)
 
-        # After setting the main state, re-apply the dependency logic
         if not is_scanning:
             self.scan_options_panel._update_dependent_ui_state()
 
@@ -319,16 +333,17 @@ class App(QMainWindow):
 
     @Slot(object, int, object, float, list)
     def on_scan_complete(self, payload, num_found, mode, duration, skipped):
-        # Take a snapshot of memory allocations and print the top 20.
-        snapshot = tracemalloc.take_snapshot()
-        top_stats = snapshot.statistics("lineno")
-
-        print("\n" + "=" * 80)
-        print("TOP 20 MEMORY ALLOCATIONS (tracemalloc report)")
-        print("=" * 80)
-        for stat in top_stats[:20]:
-            print(stat)
-        print("=" * 80 + "\n")
+        try:
+            snapshot = tracemalloc.take_snapshot()
+            top_stats = snapshot.statistics("lineno")
+            print("\n" + "=" * 80)
+            print("TOP 20 MEMORY ALLOCATIONS (tracemalloc report)")
+            print("=" * 80)
+            for stat in top_stats[:20]:
+                print(stat)
+            print("=" * 80 + "\n")
+        except Exception:
+            pass
 
         if not mode:
             app_logger.warning("Scan was cancelled by the user.")

@@ -1,11 +1,11 @@
 # app/core/strategies.py
-"""Contains different strategies for the scanning process, following the Strategy design pattern.
-Each strategy encapsulates the full algorithm for a specific scan mode.
+"""
+Contains different strategies for the scanning process.
+Python 3.13+ (Threading).
 """
 
 import copy
 import logging
-import multiprocessing
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -28,7 +28,6 @@ from app.data_models import (
 from app.image_io import get_image_metadata
 from app.services.signal_bus import SignalBus
 
-from .engines import LanceDBSimilarityEngine
 from .helpers import FileFinder
 from .pipeline import PipelineManager
 from .scan_stages import (
@@ -106,16 +105,12 @@ class ScanStrategy(ABC):
                 if data_rows:
                     from app.data_models import FINGERPRINT_FIELDS
 
-                    # 1. Transpose data from a list of rows to a dictionary of columns
-                    # Use the keys from the first row as the source of truth for column names
                     all_keys = data_rows[0].keys()
                     columns = {key: [row.get(key) for row in data_rows] for key in all_keys}
 
-                    # 2. Define the schema and create arrays with explicit types
                     schema_fields = []
                     arrays = []
 
-                    # This order MUST match the order of keys in the created dictionaries
                     ordered_keys = [
                         "group_id",
                         "is_best",
@@ -142,15 +137,12 @@ class ScanStrategy(ABC):
                                 continue
 
                             col_data = columns[key]
-
-                            # Manually cast data to the correct type before giving it to pyarrow
                             if col_type == pa.bool_():
                                 col_data = [bool(x) if x is not None else None for x in col_data]
 
                             schema_fields.append(pa.field(key, col_type))
                             arrays.append(pa.array(col_data, type=col_type))
 
-                    # 3. Create the table from the schema and sanitized arrays
                     schema = pa.schema(schema_fields)
                     arrow_table = pa.Table.from_arrays(arrays, schema=schema)
 
@@ -241,7 +233,6 @@ class FindDuplicatesStrategy(ScanStrategy):
         for stage, weight in pipeline_to_run:
             if stop_event.is_set():
                 break
-
             context.state.set_phase(stage.name, weight)
             if not stage.run(context):
                 break
@@ -249,15 +240,22 @@ class FindDuplicatesStrategy(ScanStrategy):
         self.all_skipped_files.extend(context.all_skipped_files)
 
         if not stop_event.is_set():
+            # 1. Pre-build a string-keyed map.
+            # context.all_image_fps keys are Path objects.
+            # We convert them to str ONCE here to avoid doing it millions of times later.
+            self.state.set_phase("Optimizing lookup tables...", 0.01)
+            str_map = {str(k): v for k, v in context.all_image_fps.items()}
 
-            def fp_resolver(node: tuple[Path, str | None]) -> ImageFingerprint | None:
-                path, channel = node
-                if fp_orig := context.all_image_fps.get(path):
+            def fp_resolver(node: tuple[str, str | None]) -> ImageFingerprint | None:
+                path_str, channel = node
+                # Fast String lookup (No Path instantiation needed)
+                if fp_orig := str_map.get(path_str):
                     fp_copy = copy.copy(fp_orig)
                     fp_copy.channel = channel
                     return fp_copy
                 return None
 
+            self.state.set_phase("Finalizing groups...", 0.05)
             final_groups = context.cluster_manager.get_final_groups(fp_resolver)
             self._report_and_cleanup(final_groups, start_time)
         else:
@@ -297,9 +295,7 @@ class FindDuplicatesStrategy(ScanStrategy):
                 ]
             )
         else:
-            self.signals.log_message.emit(
-                "Running in 'No AI' mode. Only exact and near-identical duplicates will be found.", "info"
-            )
+            self.signals.log_message.emit("Running in 'No AI' mode.", "info")
         return pipeline
 
     def _report_and_cleanup(self, final_groups: DuplicateResults, start_time: float):
@@ -320,7 +316,9 @@ class SearchStrategy(ScanStrategy):
     def execute(self, stop_event: threading.Event, start_time: float):
         """Execute the search strategy."""
         all_files = self._find_files_as_list(stop_event)
-        if self._should_abort(stop_event, all_files, start_time):
+        if self.scanner_core._check_stop_or_empty(
+            stop_event, all_files, self.config.scan_mode, {"db_path": None, "groups_data": None}, start_time
+        ):
             return
 
         self.state.set_phase("Phase 2/2: Creating AI fingerprints...", 0.8)
@@ -371,11 +369,6 @@ class SearchStrategy(ScanStrategy):
             self.all_skipped_files,
         )
 
-    def _should_abort(self, stop_event: threading.Event, files: list[Path], start_time: float) -> bool:
-        return self.scanner_core._check_stop_or_empty(
-            stop_event, files, self.config.scan_mode, {"db_path": None, "groups_data": None}, start_time
-        )
-
     def _perform_similarity_search(self) -> tuple[int | None, str | None]:
         """Perform similarity search and save results."""
         self.state.set_phase("Searching for similar images...", 0.1)
@@ -385,20 +378,21 @@ class SearchStrategy(ScanStrategy):
             self.signals.scan_error.emit("Could not generate a vector for the search query.")
             return None, None
 
-        sim_engine = LanceDBSimilarityEngine(
-            self.config, self.state, self.signals, self.scanner_core.db, self.scanner_core.table
-        )
-
+        # Search Logic using Polars
         raw_hits = (
             self.scanner_core.table.search(query_vector)
             .metric("cosine")
             .limit(1000)
-            .nprobes(sim_engine.nprobes)
-            .refine_factor(sim_engine.refine_factor)
+            .nprobes(20)
+            .refine_factor(10)
             .to_polars()
         )
 
-        hits = raw_hits.filter(pl.col("_distance") < sim_engine.distance_threshold)
+        # Correct Threshold Logic:
+        # Distance = 1.0 - Similarity
+        dist_threshold = 1.0 - (self.config.similarity_threshold / 100.0)
+
+        hits = raw_hits.filter(pl.col("_distance") < dist_threshold)
 
         results = [
             (ImageFingerprint.from_db_row(row_dict), row_dict["_distance"]) for row_dict in hits.iter_rows(named=True)
@@ -450,20 +444,18 @@ class SearchStrategy(ScanStrategy):
         return ""
 
     def _get_query_vector(self) -> np.ndarray | None:
-        """Generate query vector from text or sample image."""
+        """Generate query vector from text or sample image using the worker directly."""
         from .worker import init_worker, worker_get_single_vector, worker_get_text_vector
 
-        ctx = multiprocessing.get_context("spawn")
-        pool_config = {"model_name": self.config.model_name, "device": self.config.device}
+        pool_config = {"model_name": self.config.model_name, "device": self.config.device, "threads_per_worker": 1}
+        init_worker(pool_config)
 
-        with ctx.Pool(1, initializer=init_worker, initargs=(pool_config,)) as pool:
-            if self.config.scan_mode == ScanMode.TEXT_SEARCH and self.config.search_query:
-                self.signals.log_message.emit(f"Generating vector for query: '{self.config.search_query}'", "info")
-                vec_list = pool.map(worker_get_text_vector, [self.config.search_query])
-            elif self.config.scan_mode == ScanMode.SAMPLE_SEARCH and self.config.sample_path:
-                self.signals.log_message.emit(f"Generating vector for sample: {self.config.sample_path.name}", "info")
-                vec_list = pool.map(worker_get_single_vector, [self.config.sample_path])
-            else:
-                return None
+        if self.config.scan_mode == ScanMode.TEXT_SEARCH and self.config.search_query:
+            self.signals.log_message.emit(f"Generating vector for query: '{self.config.search_query}'", "info")
+            return worker_get_text_vector(self.config.search_query)
 
-            return vec_list[0] if vec_list else None
+        elif self.config.scan_mode == ScanMode.SAMPLE_SEARCH and self.config.sample_path:
+            self.signals.log_message.emit(f"Generating vector for sample: {self.config.sample_path.name}", "info")
+            return worker_get_single_vector(str(self.config.sample_path))
+
+        return None

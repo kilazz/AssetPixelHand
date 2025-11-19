@@ -1,22 +1,35 @@
 # app/core/worker.py
-"""Contains code designed to be executed in separate worker processes for parallel computation.
-This includes AI model inference and image preprocessing tasks, ensuring the main GUI
-thread remains responsive.
+"""
+Contains worker functions for parallel computation (Preprocessing and Inference).
+Python 3.13+ (No-GIL Threading).
+OPTIMIZED:
+- Encapsulates global state in ModelManager (Singleton).
+- Explicit resource management to prevent VRAM/RAM leaks during model switching.
+- Aggressive pre-shrinking and resizing during image loading.
 """
 
+import gc
 import logging
-import multiprocessing
 import os
+import threading
 import time
 import traceback
-from multiprocessing import shared_memory
 from pathlib import Path
-from queue import Empty
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import onnxruntime as ort
 from PIL import Image
+
+# --- PERFORMANCE OPTIMIZATION: PRE-LOAD HEAVY LIBS ---
+# Attempt to pre-load libraries to avoid import lock contention in threads
+try:
+    import torch  # noqa: F401
+    import transformers  # noqa: F401
+    from transformers import AutoProcessor  # noqa: F401
+except ImportError:
+    pass
+# -----------------------------------------------------
 
 from app.constants import (
     APP_DATA_DIR,
@@ -24,20 +37,17 @@ from app.constants import (
     FP16_MODEL_SUFFIX,
     MODELS_DIR,
 )
-from app.image_io import load_image
+from app.image_io import get_image_metadata, load_image
 
 if TYPE_CHECKING:
     from app.data_models import AnalysisItem
 
 
 app_logger = logging.getLogger("AssetPixelHand.worker")
-g_inference_engine = None
-g_preprocessor = None
-g_free_buffers_q = None
 
 
 def normalize_vectors_numpy(embeddings: np.ndarray) -> np.ndarray:
-    """Normalizes a batch of vectors in-place using NumPy."""
+    """Normalizes a batch of vectors in-place using NumPy (L2 Norm)."""
     if embeddings.dtype != np.float32:
         embeddings = embeddings.astype(np.float32)
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
@@ -46,67 +56,58 @@ def normalize_vectors_numpy(embeddings: np.ndarray) -> np.ndarray:
 
 
 class InferenceEngine:
-    """A heavyweight class that loads ONNX models for actual inference."""
+    """Wrapper around ONNX Runtime for running AI models."""
 
-    def __init__(self, model_name: str, device: str = "CPUExecutionProvider", threads_per_worker: int = 2):
+    def __init__(self, model_name: str, device: str = "CPUExecutionProvider", threads_per_worker: int = 1):
         if not DEEP_LEARNING_AVAILABLE:
             raise ImportError("Required deep learning libraries not found.")
+
         from transformers import AutoProcessor
 
         model_dir = MODELS_DIR / model_name
         self.processor = AutoProcessor.from_pretrained(model_dir)
         self.is_fp16 = FP16_MODEL_SUFFIX in model_name.lower()
-        self.text_session, self.text_input_names = None, set()
+
+        # Extract input size from config
         image_proc = getattr(self.processor, "image_processor", self.processor)
         size_cfg = getattr(image_proc, "size", {}) or getattr(image_proc, "crop_size", {})
         self.input_size = (size_cfg["height"], size_cfg["width"]) if "height" in size_cfg else (224, 224)
+
+        self.text_session = None
+        self.text_input_names = set()
+
         self._load_onnx_model(model_dir, device, threads_per_worker)
 
     def _load_onnx_model(self, model_dir: Path, device: str, threads_per_worker: int):
-        """Loads the ONNX models, using the specified execution provider with a fallback to CPU."""
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        requested_provider_id = device
         available_providers = ort.get_available_providers()
+        if device not in available_providers:
+            app_logger.warning(f"Requested provider '{device}' not found. Fallback to CPU.")
+            device = "CPUExecutionProvider"
 
-        if requested_provider_id not in available_providers:
-            app_logger.warning(
-                f"Provider '{requested_provider_id}' was requested but is not available. "
-                f"Available: {available_providers}. Falling back to CPUExecutionProvider."
-            )
-            provider_id = "CPUExecutionProvider"
-        else:
-            provider_id = requested_provider_id
+        providers = [device]
+        if device != "CPUExecutionProvider":
+            providers.append("CPUExecutionProvider")
 
-        providers = [provider_id]
-
-        if provider_id == "DmlExecutionProvider" and self.is_fp16 and hasattr(opts, "enable_float16_for_dml"):
+        if device == "DmlExecutionProvider" and self.is_fp16 and hasattr(opts, "enable_float16_for_dml"):
             opts.enable_float16_for_dml = True
 
-        if provider_id == "WebGPUExecutionProvider":
-            app_logger.info("Attempting to use experimental WebGPUExecutionProvider.")
-
-        if provider_id == "CPUExecutionProvider":
-            opts.inter_op_num_threads = 1
+        if device == "CPUExecutionProvider":
             opts.intra_op_num_threads = threads_per_worker
-        else:
-            providers.append("CPUExecutionProvider")
 
         onnx_file = model_dir / "visual.onnx"
         self.visual_session = ort.InferenceSession(str(onnx_file), opts, providers=providers)
 
-        if (text_model_path := model_dir / "text.onnx").exists():
+        text_model_path = model_dir / "text.onnx"
+        if text_model_path.exists():
             self.text_session = ort.InferenceSession(str(text_model_path), opts, providers=providers)
             self.text_input_names = {i.name for i in self.text_session.get_inputs()}
 
-        final_provider = self.visual_session.get_providers()[0]
-        log_message = f"Worker PID {os.getpid()}: ONNX models loaded. Requested: '{requested_provider_id}', Used: '{final_provider}'"
-        thread_info = f" ({threads_per_worker} threads/worker)" if "CPU" in final_provider else ""
-        app_logger.info(log_message + thread_info)
+        app_logger.info(f"ONNX Engine loaded. Model: {model_dir.name}, Device: {device}, FP16: {self.is_fp16}")
 
     def get_text_features(self, text: str) -> np.ndarray:
-        """Computes a feature vector for a given text string."""
         if not self.text_session:
             raise RuntimeError("Text model not loaded.")
         inputs = self.processor.tokenizer(
@@ -120,56 +121,147 @@ class InferenceEngine:
         onnx_inputs = {"input_ids": inputs["input_ids"]}
         if "attention_mask" in self.text_input_names:
             onnx_inputs["attention_mask"] = inputs["attention_mask"]
-
         outputs = self.text_session.run(None, onnx_inputs)
-        if not outputs or len(outputs) == 0:
-            app_logger.error("ONNX text model returned empty output")
-            return np.array([])
-
         return normalize_vectors_numpy(outputs[0]).flatten()
 
 
+class ModelManager:
+    """
+    Singleton to manage the lifecycle of AI models and Preprocessors.
+    Encapsulates state to prevent memory leaks and ensure clean switching.
+    """
+
+    _instance = None
+    _lock = threading.Lock()
+
+    def __init__(self):
+        self.inference_engine: InferenceEngine | None = None
+        self.preprocessor: Any | None = None
+        self.current_model_name: str | None = None
+
+    @classmethod
+    def instance(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    def load_model(self, config: dict):
+        requested_model = config["model_name"]
+
+        # If model is already loaded and matching, do nothing
+        if self.inference_engine and self.current_model_name == requested_model:
+            return
+
+        app_logger.info(f"ModelManager: Switching model {self.current_model_name} -> {requested_model}")
+
+        # Clean up old resources first
+        self.release_resources()
+
+        try:
+            # Load new Inference Engine
+            self.inference_engine = InferenceEngine(
+                model_name=requested_model,
+                device=config.get("device", "CPUExecutionProvider"),
+                threads_per_worker=config.get("threads_per_worker", 1),
+            )
+
+            # Load Preprocessor (kept separate for CPU threads)
+            from transformers import AutoProcessor
+
+            model_dir = MODELS_DIR / requested_model
+            self.preprocessor = AutoProcessor.from_pretrained(model_dir)
+
+            self.current_model_name = requested_model
+        except Exception as e:
+            app_logger.error(f"Failed to load model {requested_model}: {e}")
+            self.release_resources()  # Cleanup on failure
+            raise e
+
+    def release_resources(self):
+        """Explicitly release ONNX sessions and memory."""
+        if self.inference_engine:
+            # Break references to C++ objects
+            self.inference_engine.visual_session = None
+            self.inference_engine.text_session = None
+            self.inference_engine = None
+
+        self.preprocessor = None
+        self.current_model_name = None
+
+        # Force Garbage Collection to clear VRAM/RAM held by PyTorch/ONNX tensors
+        gc.collect()
+
+    def get_input_size(self) -> tuple[int, int]:
+        if self.preprocessor:
+            image_proc = getattr(self.preprocessor, "image_processor", self.preprocessor)
+            size_cfg = getattr(image_proc, "size", {}) or getattr(image_proc, "crop_size", {})
+            return (size_cfg["height"], size_cfg["width"]) if "height" in size_cfg else (224, 224)
+        return (224, 224)
+
+
+# --- Helper Functions (API) ---
+
+
+def cleanup_worker():
+    """Forces cleanup of global models."""
+    ModelManager.instance().release_resources()
+
+
 def init_worker(config: dict):
-    """Initializes a full worker, creating the global inference engine."""
-    global g_inference_engine
+    """Initializes the ModelManager with the provided config."""
     try:
-        threads = config.get("threads_per_worker", 2)
-        g_inference_engine = InferenceEngine(
-            model_name=config["model_name"],
-            device=config.get("device", "CPUExecutionProvider"),
-            threads_per_worker=threads,
-        )
+        ModelManager.instance().load_model(config)
     except Exception as e:
         _log_worker_crash(e, "init_worker")
 
 
-def init_preprocessor_worker(config: dict, queue: "multiprocessing.Queue"):
-    """Initializes a CPU-only preprocessing worker."""
-    global g_preprocessor, g_free_buffers_q
-    g_free_buffers_q = queue
-    try:
-        from transformers import AutoProcessor
+def init_preprocessor_worker(config: dict):
+    """Ensures preprocessor is ready (proxies to init_worker)."""
+    init_worker(config)
 
-        model_dir = MODELS_DIR / config["model_name"]
-        g_preprocessor = AutoProcessor.from_pretrained(model_dir)
-        app_logger.debug(f"Preprocessor worker PID {os.getpid()} initialized.")
-    except Exception as e:
-        _log_worker_crash(e, "init_preprocessor_worker")
+
+def get_model_input_size() -> tuple[int, int]:
+    return ModelManager.instance().get_input_size()
+
+
+# --- Optimized Processing Logic ---
 
 
 def _read_and_process_batch_for_ai(
     items: list["AnalysisItem"], input_size: tuple[int, int], simple_config: dict
 ) -> tuple[list[Image.Image], list[tuple[str, str | None]], list[tuple[str, str]]]:
-    """Loads and preprocesses images for AI inference from a list of AnalysisItem objects."""
-    images, successful_paths_with_channels, skipped_tuples = [], [], []
+    """
+    Reads images from disk, resizes them efficiently, and prepares them for the AI model.
+    Handles channel splitting and luminance conversion.
+    """
+    images = []
+    successful_paths_with_channels = []
+    skipped_tuples = []
     ignore_solid_channels = simple_config.get("ignore_solid_channels", True)
+
+    target_w, target_h = input_size
 
     for item in items:
         path = Path(item.path)
         analysis_type = item.analysis_type
+
         try:
-            # File is read here, inside the worker process
-            pil_image = load_image(path)
+            # 1. Pre-calc shrink factor
+            # Loading a 4K image just to resize to 224x224 is wasteful.
+            # We use loaders that support shrink-on-load (like PyVips or Pillow draft)
+            meta = get_image_metadata(path)
+            shrink = 1
+            if meta:
+                orig_w, orig_h = meta["resolution"]
+                if orig_w > target_w * 2 or orig_h > target_h * 2:
+                    ratio = min(orig_w / target_w, orig_h / target_h)
+                    shrink = max(1, int(ratio))
+
+            # 2. Load Image
+            pil_image = load_image(path, shrink=shrink)
+
             if not pil_image:
                 skipped_tuples.append((str(path), "Image loading failed"))
                 continue
@@ -177,192 +269,167 @@ def _read_and_process_batch_for_ai(
             processed_image = None
             channel_name: str | None = None
 
+            # Handle Channels
             if analysis_type in ("R", "G", "B", "A"):
                 pil_image = pil_image.convert("RGBA")
                 channels = pil_image.split()
                 channel_map = {"R": 0, "G": 1, "B": 2, "A": 3}
-                channel_index = channel_map[analysis_type]
+                idx = channel_map[analysis_type]
 
-                if ignore_solid_channels and channel_index < len(channels):
-                    min_val, max_val = channels[channel_index].getextrema()
-                    if min_val == max_val and (min_val == 0 or min_val == 255):
-                        continue
-
-                channel_img = channels[channel_index]
-                processed_image = Image.merge("RGB", (channel_img, channel_img, channel_img))
-                channel_name = analysis_type
+                if idx < len(channels):
+                    channel_img = channels[idx]
+                    if ignore_solid_channels:
+                        min_val, max_val = channel_img.getextrema()
+                        # Skip if channel is purely black (0) or white (255)
+                        if min_val == max_val and (min_val == 0 or min_val == 255):
+                            continue
+                    # Reconstruct as RGB for the model (R,R,R)
+                    processed_image = Image.merge("RGB", (channel_img, channel_img, channel_img))
+                    channel_name = analysis_type
 
             elif analysis_type == "Luminance":
                 processed_image = pil_image.convert("L").convert("RGB")
                 channel_name = None
 
-            else:  # "Composite"
+            else:  # Composite
                 if pil_image.mode == "RGBA":
+                    # Paste onto black background to handle transparency
                     processed_image = Image.new("RGB", pil_image.size, (0, 0, 0))
                     processed_image.paste(pil_image, mask=pil_image.split()[3])
                 else:
                     processed_image = pil_image.convert("RGB")
                 channel_name = None
 
+            # 3. Final Resize
             if processed_image:
+                if processed_image.size != input_size:
+                    processed_image = processed_image.resize(input_size, Image.Resampling.BILINEAR)
+
                 images.append(processed_image)
                 successful_paths_with_channels.append((str(path), channel_name))
-        except OSError as e:
-            skipped_tuples.append((str(path), f"Read error: {e}"))
+
         except Exception as e:
-            app_logger.error(f"Error processing {path} ({analysis_type}) in AI batch", exc_info=True)
-            skipped_tuples.append((str(path), f"{type(e).__name__}: {str(e).splitlines()[0]}"))
+            skipped_tuples.append((str(path), f"{type(e).__name__}: {e!s}"))
 
     return images, successful_paths_with_channels, skipped_tuples
 
 
-def worker_preprocess_for_ai(
+def worker_preprocess_threaded(
     items: list["AnalysisItem"],
     input_size: tuple[int, int],
-    buffer_shape: tuple,
     dtype: np.dtype,
     simple_config: dict,
-) -> tuple | None:
-    """CPU worker that loads from path, preprocesses images, and places the tensor into shared memory."""
-    global g_free_buffers_q, g_preprocessor
-    if g_free_buffers_q is None or g_preprocessor is None:
-        return None
-    try:
-        images, successful_paths_with_channels, skipped_tuples = _read_and_process_batch_for_ai(
-            items, input_size, simple_config
-        )
-        if not images:
-            return None, [], skipped_tuples
-
-        pixel_values = g_preprocessor(images=images, return_tensors="np").pixel_values
-
-        shm_name = g_free_buffers_q.get()
-        existing_shm = shared_memory.SharedMemory(name=shm_name)
-        shared_array = np.ndarray(buffer_shape, dtype=dtype, buffer=existing_shm.buf)
-        current_batch_size = pixel_values.shape[0]
-        shared_array[:current_batch_size] = pixel_values.astype(dtype)
-
-        meta_message = {
-            "shm_name": shm_name,
-            "shape": (current_batch_size, *buffer_shape[1:]),
-            "dtype": dtype,
-            "paths_with_channels": successful_paths_with_channels,
-        }
-        existing_shm.close()
-        return meta_message, [], skipped_tuples
-    except Exception as e:
-        _log_worker_crash(e, "worker_preprocess_for_ai")
-        paths_in_batch = [item.path for item in items]
-        return None, [], [(p, f"Batch failed: {type(e).__name__}") for p in paths_in_batch]
-
-
-def inference_worker_loop(config: dict, tensor_q, results_q, free_buffers_q):
-    """The main loop for the dedicated inference process (GPU or CPU)."""
-    init_worker(config)
-    if g_inference_engine is None:
-        results_q.put(None)
+    output_queue: Any,
+):
+    """
+    Executed by Preprocessor Threads.
+    Reads images -> Transforms -> Puts NumPy tensors into queue.
+    """
+    manager = ModelManager.instance()
+    if not manager.preprocessor:
+        # If preprocessor is missing, abort batch
+        output_queue.put((None, [], [(str(i.path), "Model not initialized") for i in items]))
         return
 
-    io_binding = g_inference_engine.visual_session.io_binding()
+    images, successful_paths_with_channels, skipped_tuples = _read_and_process_batch_for_ai(
+        items, input_size, simple_config
+    )
+
+    if not images:
+        output_queue.put((None, [], skipped_tuples))
+        return
+
     try:
-        while True:
-            try:
-                item = tensor_q.get(timeout=1.0)
-            except Empty:
-                continue
+        # HuggingFace Processor runs here (CPU bound)
+        batch_dict = manager.preprocessor(images=images, return_tensors="np")
+        pixel_values = batch_dict.pixel_values.astype(dtype)
+        output_queue.put((pixel_values, successful_paths_with_channels, skipped_tuples))
+    except Exception as e:
+        _log_worker_crash(e, "worker_preprocess_threaded")
+        all_skips = [(str(i.path), f"Batch Preproc Error: {e}") for i in items]
+        output_queue.put((None, [], all_skips))
 
-            if item is None:
-                results_q.put(None)
-                break
 
-            meta_message, _, skipped_tuples = item
-            pixel_values, paths_with_channels = None, []
-            if meta_message:
-                shm_name, shape, dtype, paths_with_channels = (
-                    meta_message["shm_name"],
-                    meta_message["shape"],
-                    meta_message["dtype"],
-                    meta_message["paths_with_channels"],
-                )
-                existing_shm = shared_memory.SharedMemory(name=shm_name)
-                # Use the shared array directly without copying
-                shared_array = np.ndarray(shape, dtype=dtype, buffer=existing_shm.buf)
-                pixel_values = shared_array
+def run_inference_direct(pixel_values: np.ndarray, paths_with_channels: list) -> tuple[dict, list]:
+    """
+    Executed by Inference Thread.
+    Takes NumPy tensors -> Runs ONNX -> Returns embeddings.
+    """
+    engine = ModelManager.instance().inference_engine
+    if engine is None:
+        return {}, [(p, "Inference Engine not initialized") for p, _ in paths_with_channels]
 
-                io_binding.bind_cpu_input("pixel_values", pixel_values)
-                io_binding.bind_output("image_embeds")
-                g_inference_engine.visual_session.run_with_iobinding(io_binding)
-                embeddings = io_binding.get_outputs()[0].numpy()
+    try:
+        io_binding = engine.visual_session.io_binding()
+        io_binding.bind_cpu_input("pixel_values", pixel_values)
+        io_binding.bind_output("image_embeds")
 
-                existing_shm.close()
-                free_buffers_q.put(shm_name)
+        engine.visual_session.run_with_iobinding(io_binding)
+        embeddings = io_binding.get_outputs()[0].numpy()
 
-                if embeddings is None or embeddings.size == 0:
-                    app_logger.error("Inference worker: model returned empty output")
-                    for p, _ in paths_with_channels:
-                        skipped_tuples.append((p, "Inference returned empty"))
-                    results_q.put(({}, skipped_tuples))
-                    continue
+        if embeddings is None or embeddings.size == 0:
+            return {}, [(p, "Model returned empty") for p, _ in paths_with_channels]
 
-                embeddings = normalize_vectors_numpy(embeddings)
+        embeddings = normalize_vectors_numpy(embeddings)
 
-                batch_results = {tuple(pc): vec for pc, vec in zip(paths_with_channels, embeddings, strict=False)}
-                results_q.put((batch_results, skipped_tuples))
-            elif skipped_tuples:
-                results_q.put(({}, skipped_tuples))
+        batch_results = {tuple(pc): vec for pc, vec in zip(paths_with_channels, embeddings, strict=False)}
+        return batch_results, []
 
     except Exception as e:
-        _log_worker_crash(e, "inference_worker_loop")
-        results_q.put(None)
-
-
-def _log_worker_crash(e: Exception, context: str):
-    """Logs any unhandled exceptions from a worker process to a crash file."""
-    pid = os.getpid()
-    crash_log_dir = APP_DATA_DIR / "crash_logs"
-    crash_log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = crash_log_dir / f"crash_log_WORKER_{pid}_{int(time.time())}.txt"
-    with open(log_file, "w", encoding="utf-8") as f:
-        f.write(f"Worker PID {pid} crashed in '{context}': {e}\n\n{traceback.format_exc()}")
+        _log_worker_crash(e, "run_inference_direct")
+        return {}, [(p, f"Inference Error: {e}") for p, _ in paths_with_channels]
 
 
 def worker_get_single_vector(image_path_str: str) -> np.ndarray | None:
-    """Worker function to get a single vector, used for sample search."""
-    if g_inference_engine is None:
+    """Used for Search-by-Image."""
+    manager = ModelManager.instance()
+    engine = manager.inference_engine
+    preproc = manager.preprocessor
+
+    if engine is None or preproc is None:
         return None
     try:
-        image_path = Path(image_path_str)
         from app.data_models import AnalysisItem
 
-        simple_config = {"ignore_solid_channels": True}
+        items = [AnalysisItem(path=Path(image_path_str), analysis_type="Composite")]
 
-        items = [AnalysisItem(path=image_path_str, analysis_type="Composite")]
-        images, _, skipped = _read_and_process_batch_for_ai(items, g_inference_engine.input_size, simple_config)
+        images, _, _ = _read_and_process_batch_for_ai(items, engine.input_size, {"ignore_solid_channels": True})
 
-        if skipped:
-            app_logger.warning(f"Failed to process single vector for {image_path}: {skipped[0][1]}")
-            return None
         if images:
-            io_binding = g_inference_engine.visual_session.io_binding()
-            pixel_values = g_inference_engine.processor(images=images, return_tensors="np").pixel_values
-            io_binding.bind_cpu_input(
-                "pixel_values", pixel_values.astype(np.float16 if g_inference_engine.is_fp16 else np.float32)
-            )
+            pixel_values = preproc(images=images, return_tensors="np").pixel_values
+            if engine.is_fp16:
+                pixel_values = pixel_values.astype(np.float16)
+
+            io_binding = engine.visual_session.io_binding()
+            io_binding.bind_cpu_input("pixel_values", pixel_values)
             io_binding.bind_output("image_embeds")
-            g_inference_engine.visual_session.run_with_iobinding(io_binding)
-            embedding = io_binding.get_outputs()[0].numpy()
-            return normalize_vectors_numpy(embedding).flatten()
+            engine.visual_session.run_with_iobinding(io_binding)
+
+            return normalize_vectors_numpy(io_binding.get_outputs()[0].numpy()).flatten()
     except Exception as e:
         _log_worker_crash(e, "worker_get_single_vector")
     return None
 
 
 def worker_get_text_vector(text: str) -> np.ndarray | None:
-    """Worker function to get a single vector for a text query."""
-    if g_inference_engine is None:
+    """Used for Search-by-Text."""
+    engine = ModelManager.instance().inference_engine
+    if engine is None:
         return None
     try:
-        return g_inference_engine.get_text_features(text)
+        return engine.get_text_features(text)
     except Exception as e:
         _log_worker_crash(e, "worker_get_text_vector")
     return None
+
+
+def _log_worker_crash(e: Exception, context: str):
+    """Logs exceptions to a file for debugging threaded workers."""
+    pid = os.getpid()
+    tid = threading.get_ident()
+    crash_log_dir = APP_DATA_DIR / "crash_logs"
+    crash_log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = crash_log_dir / f"worker_error_{pid}_{tid}_{int(time.time())}.txt"
+    with open(log_file, "w", encoding="utf-8") as f:
+        f.write(f"Context: {context}\nError: {e}\n\n{traceback.format_exc()}")
+    app_logger.error(f"Worker Error in {context}: {e}")

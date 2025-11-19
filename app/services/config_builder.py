@@ -1,5 +1,6 @@
 # app/services/config_builder.py
-"""Contains the ScanConfigBuilder class, responsible for constructing a valid
+"""
+Contains the ScanConfigBuilder class, responsible for constructing a valid
 ScanConfig object from the application's settings and current scan context.
 """
 
@@ -47,6 +48,21 @@ class ScanConfigBuilder:
         model_info, onnx_name = self._get_model_details()
         performance_config = self._build_performance_config()
 
+        # --- Build Active Channels List ---
+        channels = []
+        if self.settings.hashing.channel_r:
+            channels.append("R")
+        if self.settings.hashing.channel_g:
+            channels.append("G")
+        if self.settings.hashing.channel_b:
+            channels.append("B")
+        if self.settings.hashing.channel_a:
+            channels.append("A")
+
+        # Fallback: If mode is enabled but nothing selected, compare all.
+        if not channels:
+            channels = ["R", "G", "B", "A"]
+
         return ScanConfig(
             folder_path=folder_path,
             similarity_threshold=int(self.settings.threshold),
@@ -76,6 +92,7 @@ class ScanConfigBuilder:
             tonemap_view=self.settings.viewer.tonemap_view,
             # Fields with default values
             ignore_solid_channels=self.settings.hashing.ignore_solid_channels,
+            active_channels=channels,
             channel_split_tags=[
                 tag.strip().lower() for tag in self.settings.hashing.channel_split_tags.split(",") if tag.strip()
             ],

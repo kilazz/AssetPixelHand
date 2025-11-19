@@ -1,29 +1,25 @@
 # app/core/pipeline.py
 """
-Contains the PipelineManager, which encapsulates the entire logic for running
-the multi-process fingerprinting pipeline for both CPU and GPU.
+Contains the PipelineManager, which orchestrates the scanning pipeline.
+Python 3.13+: Uses threading with Sentinel Pattern.
+Batch buffering for Vector DB writes to prevent I/O bottlenecks.
 """
 
+import contextlib
 import copy
+import gc
 import logging
-import multiprocessing
-import os
+import queue
 import threading
-from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
-from multiprocessing import shared_memory
-from pathlib import Path
-from queue import Empty
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pyarrow as pa
 from PySide6.QtCore import QObject
-from transformers import AutoProcessor
 
 from app.cache import CacheManager
-from app.constants import DB_WRITE_BATCH_SIZE, FP16_MODEL_SUFFIX, LANCEDB_AVAILABLE, MODELS_DIR
+from app.constants import DB_WRITE_BATCH_SIZE, FP16_MODEL_SUFFIX, LANCEDB_AVAILABLE
 from app.data_models import ImageFingerprint
 from app.services.signal_bus import SignalBus
 
@@ -31,7 +27,7 @@ from . import worker
 
 if TYPE_CHECKING:
     from app.core.scan_stages import ScanContext
-    from app.data_models import AnalysisItem, ScanConfig, ScanState
+    from app.data_models import ScanConfig, ScanState
 
 if LANCEDB_AVAILABLE:
     import lancedb
@@ -40,8 +36,6 @@ app_logger = logging.getLogger("AssetPixelHand.pipeline")
 
 
 class PipelineManager(QObject):
-    """Manages the setup, execution, and teardown of the fingerprinting pipeline."""
-
     def __init__(
         self,
         config: "ScanConfig",
@@ -57,275 +51,285 @@ class PipelineManager(QObject):
         self.lancedb_table = lancedb_table
         self.stop_event = stop_event
 
-        self.db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LanceDBAdd")
-        self.ctx = multiprocessing.get_context("spawn")
-        self.num_workers = self.config.perf.num_workers
-        self.shared_mem_buffers = []
-        self.infer_proc = None
+        self._internal_stop_event = threading.Event()
+
+        # Executors
+        # DB Writer: Single thread to ensure sequential writes without locking issues
+        self.db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="DBWriter")
+
+        # Preprocessor: Multiple threads for CPU-bound image resizing/normalization
+        self.preproc_executor = ThreadPoolExecutor(
+            max_workers=self.config.perf.num_workers, thread_name_prefix="Preprocessor"
+        )
+
+        # Queues:
+        # tensor_queue: Buffers images ready for the GPU/ONNX Runtime
+        # results_queue: Buffers vectors ready for the Database
+        self.tensor_queue = queue.Queue(maxsize=self.config.perf.num_workers * 4 + 32)
+        self.results_queue = queue.Queue()
 
     def run(self, context: "ScanContext") -> tuple[bool, list[str]]:
-        """
-        Starts and runs the AI fingerprinting pipeline using the provided context.
-        It processes the items listed in `context.items_to_process` and
-        updates the `ImageFingerprint` objects within `context.all_image_fps`.
-        """
         items_to_process = context.items_to_process
         if not items_to_process:
             return True, []
 
         unique_files_count = len({item.path for item in items_to_process})
-        log_msg = (
-            f"Starting AI pipeline for {len(items_to_process)} items ({unique_files_count} unique files): "
-            f"{self.num_workers} CPU workers, inference on {self.config.device}."
+        app_logger.info(
+            f"Starting Pipeline. Items: {len(items_to_process)} "
+            f"({unique_files_count} unique files). Device: {self.config.device}."
         )
-        app_logger.info(log_msg)
 
         cache = CacheManager(self.config.folder_path, self.config.model_name, in_memory=self.config.lancedb_in_memory)
         all_skipped = []
 
         try:
-            input_size, buffer_shape, dtype = self._get_model_and_buffer_config()
-
-            free_buffers_q, tensor_q, results_q = self._setup_communication(len(items_to_process))
-            self.infer_proc = self._start_inference_process(tensor_q, results_q, free_buffers_q)
-
-            all_skipped = self._run_preprocessing_pool(
-                items_to_process, input_size, buffer_shape, dtype, free_buffers_q, tensor_q, results_q, cache, context
+            # 1. Init Global Workers (via Singleton Manager in worker.py)
+            worker.init_worker(
+                {"model_name": self.config.model_name, "device": self.config.device, "threads_per_worker": 1}
             )
+            worker.init_preprocessor_worker({"model_name": self.config.model_name})
+
+            input_size = worker.get_model_input_size()
+            is_fp16 = FP16_MODEL_SUFFIX in self.config.model_name.lower()
+            dtype = np.float16 if is_fp16 else np.float32
+
+            # 2. Start Inference Thread (Consumes tensors -> Produces vectors)
+            inference_thread = threading.Thread(target=self._inference_loop, daemon=True, name="InferenceThread")
+            inference_thread.start()
+
+            # 3. Start Preprocessing Monitor (Producers tensors -> Fills tensor_queue)
+            monitor_thread = threading.Thread(
+                target=self._monitor_preprocessing,
+                args=(items_to_process, input_size, dtype),
+                daemon=True,
+                name="MonitorThread",
+            )
+            monitor_thread.start()
+
+            # 4. Collect Results (Main Thread blocks here, flushing buffers to DB)
+            all_skipped = self._collect_results(cache, context)
+
+            # Clean shutdown
+            inference_thread.join(timeout=1.0)
+            monitor_thread.join(timeout=1.0)
+
             return True, all_skipped
+
         except Exception as e:
-            app_logger.critical(f"Pipeline failed critically: {e}", exc_info=True)
+            app_logger.critical(f"Pipeline failed: {e}", exc_info=True)
             return False, [str(item.path) for item in items_to_process]
         finally:
-            self._cleanup()
-            cache.close()
-            self.db_executor.shutdown(wait=True)
+            self._cleanup(cache)
 
-    def _get_model_and_buffer_config(self) -> tuple[tuple[int, int], tuple, Any]:
-        """Determines model input size and required buffer configuration."""
-        try:
-            proc = AutoProcessor.from_pretrained(MODELS_DIR / self.config.model_name)
-            image_proc = getattr(proc, "image_processor", proc)
-            size_cfg = getattr(image_proc, "size", {}) or getattr(image_proc, "crop_size", {})
-            input_size = (size_cfg["height"], size_cfg["width"]) if "height" in size_cfg else (224, 224)
-        except Exception as e:
-            input_size = (224, 224)
-            app_logger.warning(f"Could not determine model input size, defaulting to {input_size}. Error: {e}")
-
-        is_fp16 = FP16_MODEL_SUFFIX in self.config.model_name.lower()
-        dtype = np.float16 if is_fp16 else np.float32
-
-        batch_multiplier = 4 if self.config.compare_by_channel else 1
-        buffer_shape = (self.config.perf.batch_size * batch_multiplier, 3, *input_size)
-        return input_size, buffer_shape, dtype
-
-    def _setup_communication(self, num_items: int) -> tuple:
-        """Creates shared memory buffers and multiprocessing queues."""
-        num_buffers = max(8, self.num_workers * 2)
-        _, buffer_shape, dtype = self._get_model_and_buffer_config()
-        buffer_size = int(np.prod(buffer_shape) * np.dtype(dtype).itemsize)
-
-        self.shared_mem_buffers = [
-            shared_memory.SharedMemory(create=True, size=buffer_size) for _ in range(num_buffers)
-        ]
-        free_buffers_q = self.ctx.Queue()
-        for mem in self.shared_mem_buffers:
-            free_buffers_q.put(mem.name)
-        tensor_q = self.ctx.Queue(maxsize=num_buffers)
-
-        queue_size_multiplier = 4 if self.config.compare_by_channel else 1
-        results_q = self.ctx.Queue(maxsize=(num_items * queue_size_multiplier) + 1)
-        return free_buffers_q, tensor_q, results_q
-
-    def _start_inference_process(self, tensor_q, results_q, free_buffers_q) -> "multiprocessing.Process":
-        """Initializes and starts the single inference worker process."""
-        infer_cfg = {
-            "model_name": self.config.model_name,
-            "low_priority": self.config.perf.run_at_low_priority,
-            "device": self.config.device,
-        }
-        if "cpu" in self.config.device.lower():
-            infer_cfg["threads_per_worker"] = os.cpu_count() or 4
-
-        infer_proc = self.ctx.Process(
-            target=worker.inference_worker_loop,
-            args=(infer_cfg, tensor_q, results_q, free_buffers_q),
-            daemon=True,
-        )
-        infer_proc.start()
-        return infer_proc
-
-    def _create_ai_job_generator(self, items: list["AnalysisItem"]) -> Generator[list["AnalysisItem"]]:
+    def _monitor_preprocessing(self, items, input_size, dtype):
         """
-        Generator that yields batches of AnalysisItem objects to send to workers.
-        The file reading is now deferred to the worker process.
+        Submits tasks and waits for them to finish, then sends Sentinel.
+        Runs in a separate thread to not block the main loop.
         """
         batch_size = self.config.perf.batch_size
+        simple_config = {"ignore_solid_channels": self.config.ignore_solid_channels}
+
+        # Submit all tasks
         for i in range(0, len(items), batch_size):
-            if self.stop_event.is_set():
+            if self.stop_event.is_set() or self._internal_stop_event.is_set():
                 break
-            yield items[i : i + batch_size]
-
-    def _run_preprocessing_pool(
-        self, items_to_process, input_size, buffer_shape, dtype, free_buffers_q, tensor_q, results_q, cache, context
-    ) -> list[str]:
-        """Runs the main pipeline loop, processing data through the worker pool."""
-        preproc_init_cfg = {
-            "model_name": self.config.model_name,
-            "low_priority": self.config.perf.run_at_low_priority,
-        }
-
-        # Pass only simple, serializable arguments to the worker function.
-        # This avoids the deepcopy overhead of the full ScanConfig object.
-        worker_simple_config = {"ignore_solid_channels": self.config.ignore_solid_channels}
-        worker_func = partial(
-            worker.worker_preprocess_for_ai,
-            input_size=input_size,
-            buffer_shape=buffer_shape,
-            dtype=dtype,
-            simple_config=worker_simple_config,
-        )
-
-        with self.ctx.Pool(
-            processes=self.num_workers,
-            initializer=worker.init_preprocessor_worker,
-            initargs=(preproc_init_cfg, free_buffers_q),
-        ) as pool:
-            data_generator = self._create_ai_job_generator(items_to_process)
-            preproc_results_iterator = pool.imap_unordered(worker_func, data_generator)
-            _, all_skipped = self._pipeline_loop(preproc_results_iterator, tensor_q, results_q, cache, context)
-        return all_skipped
-
-    def _pipeline_loop(
-        self, preproc_results, tensor_q, results_q, cache, context: "ScanContext"
-    ) -> tuple[int, list[str]]:
-        """The core loop that orchestrates the data flow between workers."""
-        processed_count, fps_to_cache, all_skipped = 0, [], []
-        feeding_complete = False
-        processed_paths = set()
-
-        total_files = len({item.path for item in context.items_to_process})
-
-        while processed_count < total_files:
-            if self.stop_event.is_set() or not self.infer_proc.is_alive():
-                app_logger.error("Inference process terminated unexpectedly.")
-                break
-
-            if not feeding_complete:
-                try:
-                    preproc_output = next(preproc_results)
-                    if preproc_output is not None:
-                        tensor_q.put(preproc_output)
-                except StopIteration:
-                    tensor_q.put(None)
-                    feeding_complete = True
-
-            processed_now, should_break = self._process_gpu_results_queue(
-                results_q, cache, fps_to_cache, all_skipped, context, processed_paths
+            batch = items[i : i + batch_size]
+            self.preproc_executor.submit(
+                worker.worker_preprocess_threaded,
+                items=batch,
+                input_size=input_size,
+                dtype=dtype,
+                simple_config=simple_config,
+                output_queue=self.tensor_queue,
             )
-            if processed_now > 0:
-                processed_count = len(processed_paths)
-                self.state.update_progress(processed_count, total_files)
-            if should_break:
+
+        # Wait for all preprocessing tasks to finish
+        self.preproc_executor.shutdown(wait=True)
+
+        # Send Sentinel to Inference Thread ("No more data coming")
+        self.tensor_queue.put(None)
+
+    def _inference_loop(self):
+        """Consumes tensors, runs ONNX, produces results."""
+        while True:
+            try:
+                # Wait for data or Sentinel
+                item = self.tensor_queue.get()
+            except queue.Empty:
+                continue
+
+            # Sentinel received -> Stop
+            if item is None:
+                self.results_queue.put(None)  # Pass Sentinel to Collector
+                self.tensor_queue.task_done()
                 break
+
+            pixel_values, paths_with_channels, skipped_tuples = item
+
+            if pixel_values is not None:
+                results, inf_skipped = worker.run_inference_direct(pixel_values, paths_with_channels)
+                self.results_queue.put((results, skipped_tuples + inf_skipped))
+            else:
+                self.results_queue.put(({}, skipped_tuples))
+
+            self.tensor_queue.task_done()
+
+    def _collect_results(self, cache: CacheManager, context: "ScanContext") -> list[str]:
+        """
+        Reads from results_queue until Sentinel is received.
+        Buffers DB writes to reduce locking overhead on fast SSDs.
+        """
+        fps_to_cache_buffer = []  # Buffer for DuckDB (Metadata)
+        lancedb_buffer = []  # Buffer for LanceDB (Vectors)
+        all_skipped = []
+
+        unique_paths_processed = set()
+        unique_paths_total = len({item.path for item in context.items_to_process})
+
+        gc_trigger_counter = 0
+
+        # Threshold for flushing to DB. 2048-4096 is a sweet spot for Vector DBs.
+        WRITE_THRESHOLD = 2048
 
         while True:
-            processed_now, should_break = self._process_gpu_results_queue(
-                results_q, cache, fps_to_cache, all_skipped, context, processed_paths, timeout=1.0
-            )
-            if processed_now > 0:
-                processed_count = len(processed_paths)
-                self.state.update_progress(processed_count, total_files)
-            if should_break or processed_now == 0:
+            if self.stop_event.is_set():
                 break
 
-        if fps_to_cache:
-            cache.put_many(fps_to_cache)
-        return processed_count, all_skipped
+            try:
+                result_batch = self.results_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
 
-    def _process_gpu_results_queue(
-        self, results_q, cache, fps_to_cache, all_skipped, context: "ScanContext", processed_paths: set, timeout=0.01
-    ) -> tuple[int, bool]:
-        """Processes one batch of results from the GPU worker's queue."""
-        processed_count = 0
-        try:
-            gpu_result = results_q.get(timeout=timeout)
-            if gpu_result is None:
-                return 0, True
+            # Sentinel received -> All done
+            if result_batch is None:
+                self.results_queue.task_done()
+                break
 
-            batch_results, skipped_items = gpu_result
-            self._handle_batch_results(batch_results, skipped_items, cache, fps_to_cache, context, processed_paths)
-            all_skipped.extend([str(path) for path, _ in skipped_items])
-            processed_count += len(batch_results) + len(skipped_items)
+            batch_data, batch_skipped = result_batch
 
-        except Empty:
-            pass
+            # Process data into buffers
+            self._handle_batch_results(
+                batch_data, batch_skipped, fps_to_cache_buffer, lancedb_buffer, context, unique_paths_processed
+            )
 
-        return processed_count, False
+            all_skipped.extend([str(p) for p, _ in batch_skipped])
+
+            # Check buffers and flush if threshold met
+            if len(lancedb_buffer) >= WRITE_THRESHOLD:
+                self._add_to_lancedb(lancedb_buffer)
+                lancedb_buffer.clear()  # Reuse list reference, clear content
+
+            if len(fps_to_cache_buffer) >= DB_WRITE_BATCH_SIZE:
+                cache.put_many(fps_to_cache_buffer)
+                fps_to_cache_buffer.clear()
+
+            # Progress & GC
+            count_in_batch = len(batch_data) + len(batch_skipped)
+            gc_trigger_counter += count_in_batch
+
+            self.state.update_progress(len(unique_paths_processed), unique_paths_total)
+            self.results_queue.task_done()
+
+            # Aggressive GC to prevent RAM ballooning during massive scans
+            if gc_trigger_counter >= 1000:
+                gc.collect()
+                gc_trigger_counter = 0
+
+        # Final flush of remaining data
+        if lancedb_buffer:
+            self._add_to_lancedb(lancedb_buffer)
+
+        if fps_to_cache_buffer:
+            cache.put_many(fps_to_cache_buffer)
+
+        gc.collect()
+
+        return all_skipped
 
     def _handle_batch_results(
-        self, batch_results, skipped_items, cache, fps_to_cache, context: "ScanContext", processed_paths: set
+        self,
+        batch_results: dict,
+        skipped_items: list,
+        fps_to_cache_buffer: list,
+        lancedb_buffer: list,
+        context: "ScanContext",
+        unique_paths_processed: set,
     ):
         """
-        Processes a batch of results from the inference worker, creating copies of
-        ImageFingerprint objects for each channel to avoid race conditions.
+        Matches raw vectors to File Paths/Channels and fills the buffers.
         """
-        updated_fps_with_channels = []
         for (path_str, channel), vector in batch_results.items():
-            path = Path(path_str)
-            processed_paths.add(path)
-            if path in context.all_image_fps:
-                fp_orig = context.all_image_fps[path]
+            # Find the original metadata object
+            path_key = next((k for k in context.all_image_fps if str(k) == str(path_str)), None)
+
+            if path_key:
+                unique_paths_processed.add(path_key)
+                fp_orig = context.all_image_fps[path_key]
+
+                # Create a specific copy for this result (channel might differ from base)
                 fp_copy = copy.copy(fp_orig)
                 fp_copy.hashes = vector
-                updated_fps_with_channels.append((fp_copy, channel))
+                fp_copy.channel = channel
+
+                # Add to LanceDB buffer
+                lancedb_buffer.append((fp_copy, channel))
+
+                # Add to DuckDB buffer (to mark as processed/cached)
+                # Use fp_orig to avoid duplicate entries for different channels in cache
+                # or add fp_copy if cache supports channel info.
+                fps_to_cache_buffer.append(fp_copy)
             else:
-                app_logger.warning(f"Received AI vector for an unknown path: {path_str}. Skipping.")
+                app_logger.warning(f"Path mismatch during collection: {path_str}")
 
-        for path_str, reason in skipped_items:
-            path = Path(path_str)
-            processed_paths.add(path)
-            self.signals.log_message.emit(f"Skipped {path.name}: {reason}", "warning")
-
-        if updated_fps_with_channels:
-            self._add_to_lancedb(updated_fps_with_channels)
-
-            unique_fps = list({fp for fp, _ in updated_fps_with_channels})
-            fps_to_cache.extend(unique_fps)
-
-            if len(fps_to_cache) >= DB_WRITE_BATCH_SIZE:
-                cache.put_many(fps_to_cache)
-                fps_to_cache.clear()
+        for path_str, _ in skipped_items:
+            path_key = next((k for k in context.all_image_fps if str(k) == str(path_str)), None)
+            if path_key:
+                unique_paths_processed.add(path_key)
 
     def _add_to_lancedb(self, fingerprints_with_channels: list[tuple[ImageFingerprint, str]]):
-        """Adds a list of fully populated fingerprints to the LanceDB table."""
+        """
+        Submits a batch write task to the DB Executor.
+        """
         if not fingerprints_with_channels or not LANCEDB_AVAILABLE:
             return
 
-        data_to_convert = [
-            fp.to_lancedb_dict(channel=channel)
-            for fp, channel in fingerprints_with_channels
-            if fp.hashes is not None and fp.hashes.size > 0
-        ]
+        expected_dim = self.config.model_dim
+
+        # We construct the dictionary here (CPU work) to keep the DB thread purely for I/O
+        data_to_convert = []
+
+        for fp, channel in fingerprints_with_channels:
+            if fp.hashes is not None and isinstance(fp.hashes, np.ndarray) and fp.hashes.size == expected_dim:
+                data_to_convert.append(fp.to_lancedb_dict(channel=channel))
+            else:
+                actual_size = fp.hashes.size if fp.hashes is not None else 0
+                app_logger.warning(
+                    f"Skipping DB write for {fp.path}: Invalid vector size ({actual_size} vs {expected_dim})"
+                )
 
         if not data_to_convert:
             return
-        try:
-            arrow_table = pa.Table.from_pylist(data_to_convert)
-            self.db_executor.submit(self.lancedb_table.add, data=arrow_table)
-        except Exception as e:
-            app_logger.error(f"Failed to create PyArrow table for LanceDB: {e}", exc_info=True)
-            self.signals.log_message.emit(f"Critical error preparing data for database: {e}", "error")
 
-    def _cleanup(self):
-        """Terminates processes and cleans up shared memory."""
-        if self.infer_proc and self.infer_proc.is_alive():
-            self.infer_proc.terminate()
-            self.infer_proc.join(timeout=5)
-        for mem in self.shared_mem_buffers:
-            try:
-                mem.close()
-                mem.unlink()
-            except FileNotFoundError:
-                pass
+        # Submit the write to the single-threaded DB executor
+        self.db_executor.submit(self._write_task, data_to_convert)
+
+    def _write_task(self, data):
+        """Running inside the DB executor thread."""
+        try:
+            arrow_table = pa.Table.from_pylist(data)
+            self.lancedb_table.add(data=arrow_table)
+        except Exception as e:
+            app_logger.error(f"LanceDB batch write failed: {e}")
+
+    def _cleanup(self, cache):
+        self._internal_stop_event.set()
+
+        # Drain queues to unblock threads if they are stuck trying to put
+        while not self.tensor_queue.empty():
+            with contextlib.suppress(queue.Empty):
+                self.tensor_queue.get_nowait()
+
+        # Wait for writes to finish
+        self.db_executor.shutdown(wait=True)
+        cache.close()
         app_logger.info("Pipeline resources cleaned up.")

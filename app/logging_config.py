@@ -1,5 +1,8 @@
 # app/logging_config.py
-"""Handles the setup of the application-wide logging system."""
+"""
+Handles the setup of the application-wide logging system.
+Configures Console, File, and GUI logging destinations.
+"""
 
 import logging
 import os
@@ -30,14 +33,19 @@ class QtHandler(logging.Handler):
         self.signals_emitter = signals_emitter
 
     def emit(self, record):
-        log_level = record.levelname.lower()
-        message = self.format(record)
-        if hasattr(self.signals_emitter, "log_message"):
-            self.signals_emitter.log_message.emit(message, log_level)
+        try:
+            log_level = record.levelname.lower()
+            message = self.format(record)
+            # Check if the emitter has the specific signal before emitting
+            if hasattr(self.signals_emitter, "log_message"):
+                self.signals_emitter.log_message.emit(message, log_level)
+        except Exception:
+            self.handleError(record)
 
 
 def setup_logging(ui_signals_emitter: QObject | None = None, force_debug: bool = False):
-    """Configures the root logger for the application.
+    """
+    Configures the root logger for the application.
     - Directs logs to console, a rotating file, and optionally the GUI.
     - Logging level can be set to DEBUG via the APP_DEBUG environment variable or the force_debug flag.
     """
@@ -50,27 +58,48 @@ def setup_logging(ui_signals_emitter: QObject | None = None, force_debug: bool =
     simple_formatter = logging.Formatter("%(message)s")
 
     root_logger = logging.getLogger()
+
+    # Reset existing handlers to avoid duplication on reload
     if root_logger.hasHandlers():
         for handler in root_logger.handlers[:]:
             handler.close()
             root_logger.removeHandler(handler)
+
     root_logger.setLevel(log_level)
 
+    # --- 3rd Party Library Noise Suppression ---
+    # These libraries are very chatty even at INFO level
+    logging.getLogger("pyvips").setLevel(logging.WARNING)
+    logging.getLogger("PIL").setLevel(logging.WARNING)
+    logging.getLogger("numba").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+
+    # --- Console Handler ---
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(verbose_formatter)
     root_logger.addHandler(console_handler)
 
+    # --- File Handler ---
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+        file_handler = RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=10 * 1024 * 1024,  # 10 MB
+            backupCount=5,
+            encoding="utf-8",
+        )
         file_handler.setFormatter(verbose_formatter)
         root_logger.addHandler(file_handler)
     except (OSError, PermissionError) as e:
-        root_logger.error(f"Failed to configure file logger at '{LOG_FILE}': {e}")
+        # Fallback if we can't write to the log file
+        print(f"[ERROR] Failed to configure file logger at '{LOG_FILE}': {e}", file=sys.stderr)
 
+    # --- GUI Handler ---
     if ui_signals_emitter:
         qt_handler = QtHandler(ui_signals_emitter)
         qt_handler.setFormatter(simple_formatter)
+        # We generally only want INFO+ messages showing up in the GUI log panel
         qt_handler.addFilter(UILogFilter())
         root_logger.addHandler(qt_handler)
 

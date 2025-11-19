@@ -1,4 +1,6 @@
 # main.py
+import contextlib
+import ctypes
 import faulthandler
 import logging
 import multiprocessing
@@ -21,7 +23,7 @@ sys.path.insert(0, str(script_dir))
 # Enable OpenEXR support for relevant libraries if available.
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from app.constants import CRASH_LOG_DIR
 from app.gui.main_window import App
@@ -35,7 +37,12 @@ def log_global_crash(exc_type, exc_value, exc_traceback):
     """A global exception hook to catch and log any unhandled exceptions."""
     tb_info = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
     error_message = f"--- CRITICAL UNHANDLED ERROR ---\n{tb_info}"
-    logging.getLogger("AssetPixelHand.main").critical(error_message)
+
+    # Try logging via standard logger
+    with contextlib.suppress(Exception):
+        logging.getLogger("AssetPixelHand.main").critical(error_message)
+
+    # Save to crash file
     try:
         CRASH_LOG_DIR.mkdir(parents=True, exist_ok=True)
         log_file = CRASH_LOG_DIR / f"crash_report_{datetime.now(UTC).strftime('%Y-%m-%d_%H-%M-%S')}.txt"
@@ -44,8 +51,6 @@ def log_global_crash(exc_type, exc_value, exc_traceback):
 
         # If the Qt Application instance exists, show a message box.
         if QApplication.instance():
-            from PySide6.QtWidgets import QMessageBox
-
             QMessageBox.critical(
                 None,
                 "Critical Error",
@@ -61,16 +66,22 @@ def log_global_crash(exc_type, exc_value, exc_traceback):
 def run_application():
     """Initializes and runs the Qt application."""
 
+    # Initialize COM library for the main thread.
+    # This is required for QFileDialog and some GPU drivers to work correctly
+    # in a multithreaded Python environment on Windows.
+    if sys.platform == "win32":
+        with contextlib.suppress(Exception):
+            ctypes.windll.ole32.CoInitialize()
+
     # Set the global exception hook to our custom logger.
     sys.excepthook = log_global_crash
 
-    # Start tracing memory allocations. The number 25 indicates that it will store
-    # the 25 most recent frames in the stack trace for each allocation.
+    # Start tracing memory allocations (useful for debugging leaks)
     tracemalloc.start(25)
 
     app = QApplication(sys.argv)
 
-    # We now pass the global signal bus directly to the logging setup.
+    # Configure logging and pass the global signal bus
     setup_logging(APP_SIGNAL_BUS, force_debug=IS_DEBUG_MODE)
 
     app_logger = logging.getLogger("AssetPixelHand.main")
@@ -85,10 +96,10 @@ def run_application():
 
 if __name__ == "__main__":
     # Required for creating frozen executables with multiprocessing.
+    # Even though we moved to threading, keeping this is safe for potential future use.
     multiprocessing.freeze_support()
 
-    # Set the start method to "spawn" for better cross-platform stability,
-    # especially with GUI libraries and ONNX Runtime.
+    # Set the start method to "spawn" for better cross-platform stability
     if multiprocessing.get_start_method(allow_none=True) != "spawn":
         multiprocessing.set_start_method("spawn", force=True)
 
@@ -98,5 +109,5 @@ if __name__ == "__main__":
     try:
         run_application()
     except Exception:
-        # This is a final catch-all, but the sys.excepthook should handle most cases.
+        # This is a final catch-all
         log_global_crash(*sys.exc_info())

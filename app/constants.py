@@ -1,4 +1,9 @@
 # app/constants.py
+"""
+Global constants, file paths, and configuration enumerations.
+Handles library availability checks and environment setup.
+"""
+
 import importlib.util
 import json
 import logging
@@ -10,30 +15,34 @@ from typing import ClassVar
 
 from PIL import Image
 
+# --- Path Setup ---
 try:
+    # When running as a script
     APP_DIR = Path(__file__).resolve().parent
     SCRIPT_DIR = APP_DIR.parent
 except NameError:
-    # Fallback for environments where __file__ is not defined
+    # When running as a frozen executable (PyInstaller)
     SCRIPT_DIR = Path(os.path.abspath(os.path.join(os.path.dirname(sys.argv[0]))))
     APP_DIR = SCRIPT_DIR / "app"
 
 sys.path.insert(0, str(SCRIPT_DIR.resolve()))
 
-# --- Core Application Directories and Environment Setup ---
+# --- Core Application Directories ---
 APP_DATA_DIR = SCRIPT_DIR / "app_data"
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 MODELS_DIR = APP_DATA_DIR / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
 HF_CACHE_DIR = APP_DATA_DIR / ".hf_cache"
+# Set HF Home before importing transformers to redirect cache
 os.environ["HF_HOME"] = str(HF_CACHE_DIR.resolve())
+# Fix for OpenMP conflict errors
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 # --- File Paths ---
 CONFIG_FILE = APP_DATA_DIR / "app_settings.json"
 CACHE_DIR = APP_DATA_DIR / ".cache"
-
-# --- Ensure the cache directory is created on startup ---
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 RESULTS_DB_FILE = CACHE_DIR / "results.duckdb"
@@ -44,14 +53,24 @@ LOG_FILE = APP_DATA_DIR / "app_log.txt"
 CUSTOM_MODELS_CONFIG_FILE = APP_DATA_DIR / "custom_models.json"
 
 # --- Library Availability Checks ---
+
+# Check for Deep Learning libs (Lazy check via find_spec to avoid load cost)
 DEEP_LEARNING_AVAILABLE = all(importlib.util.find_spec(pkg) for pkg in ["onnxruntime", "transformers", "torch"])
+
 OIIO_AVAILABLE = bool(importlib.util.find_spec("OpenImageIO"))
 PYVIPS_AVAILABLE = bool(importlib.util.find_spec("pyvips"))
 DUCKDB_AVAILABLE = bool(importlib.util.find_spec("duckdb"))
 LANCEDB_AVAILABLE = bool(importlib.util.find_spec("lancedb"))
 ZSTD_AVAILABLE = bool(importlib.util.find_spec("zstandard"))
 OCIO_AVAILABLE = bool(importlib.util.find_spec("simple_ocio"))
-DIRECTXTEX_AVAILABLE = bool(importlib.util.find_spec("directxtex_decoder"))
+
+# Robust check for local DirectXTex binary (DDS support)
+try:
+    import directxtex_decoder  # noqa: F401
+
+    DIRECTXTEX_AVAILABLE = True
+except ImportError:
+    DIRECTXTEX_AVAILABLE = False
 
 try:
     Image.init()
@@ -59,14 +78,32 @@ try:
 except (ImportError, NameError):
     PILLOW_AVAILABLE = False
 
+# --- Library Optimizations ---
+
+if PYVIPS_AVAILABLE:
+    try:
+        import pyvips
+
+        # OPTIMIZATION: Prevent PyVips from spawning its own thread pool.
+        # Check if attribute exists to avoid crashes on broken/partial installs
+        if hasattr(pyvips, "concurrency_set"):
+            pyvips.concurrency_set(1)
+    except (ImportError, AttributeError, OSError):
+        # If PyVips fails to initialize (e.g. missing DLLs on Windows), disable it entirely
+        # to fall back to other loaders safely.
+        PYVIPS_AVAILABLE = False
+
 if DEEP_LEARNING_AVAILABLE:
-    from transformers import logging as transformers_logging
+    try:
+        from transformers import logging as transformers_logging
 
-    transformers_logging.set_verbosity_error()
+        transformers_logging.set_verbosity_error()
+    except ImportError:
+        pass
 
-# --- Application-wide Constants ---
+# --- Application Constants ---
 DB_WRITE_BATCH_SIZE = 4096
-CACHE_VERSION = "v4"
+CACHE_VERSION = "v5"
 DB_TABLE_NAME = "images"
 FP16_MODEL_SUFFIX = "_fp16"
 BEST_FILE_METHOD_NAME = "Best"
@@ -102,7 +139,7 @@ _all_ext = list(_main_supported_ext)
 ALL_SUPPORTED_EXTENSIONS = sorted(set(_all_ext))
 
 
-# --- Supported AI Models ---
+# --- AI Models Configuration ---
 def _get_default_models() -> dict:
     """Returns the hardcoded, built-in model configurations."""
     return {
@@ -157,23 +194,21 @@ def _get_default_models() -> dict:
 def _load_models_config() -> dict:
     """
     Loads model configurations by merging built-in defaults with user-defined custom models.
-    Custom models from 'custom_models.json' will override defaults if names match.
     """
     all_models = _get_default_models()
     if CUSTOM_MODELS_CONFIG_FILE.exists():
         try:
             with open(CUSTOM_MODELS_CONFIG_FILE, encoding="utf-8") as f:
                 custom_models = json.load(f)
-            # This allows users to override any key, including 'use_dynamo'
             for model_name, model_config in custom_models.items():
                 if model_name in all_models:
                     all_models[model_name].update(model_config)
                 else:
                     all_models[model_name] = model_config
-            logging.getLogger("AssetPixelHand.constants").info(f"Loaded and merged {len(custom_models)} custom models.")
+            logging.getLogger("AssetPixelHand.constants").info(f"Loaded {len(custom_models)} custom models.")
         except (json.JSONDecodeError, OSError) as e:
             logging.getLogger("AssetPixelHand.constants").error(
-                f"Failed to load custom_models.json: {e}. Using default models only."
+                f"Failed to load custom_models.json: {e}. Using defaults."
             )
     else:
         try:

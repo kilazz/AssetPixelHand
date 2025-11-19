@@ -1,7 +1,7 @@
 # app/core/hashing_worker.py
-"""Contains lightweight, standalone worker functions for hashing and metadata extraction.
-This file is kept separate from worker.py to ensure that processes
-spawned for these tasks do not load heavy AI libraries (torch, onnxruntime, etc.).
+"""
+Contains lightweight, standalone worker functions for hashing and metadata extraction.
+OPTIMIZED: Aggressive resizing before channel splitting to speed up hashing.
 """
 
 import traceback
@@ -29,26 +29,15 @@ except ImportError:
 def worker_calculate_hashes_and_meta(path: Path) -> dict[str, Any] | None:
     """
     A lightweight worker that collects basic file metadata and a full-file xxHash.
-
-    This function is designed to be fast. It avoids loading or decoding the image data,
-    only reading the raw bytes for hashing.
-
-    Args:
-        path: The path to the image file.
-
-    Returns:
-        A dictionary containing the path, metadata, and xxHash, or None on failure.
     """
     try:
-        # 1. Get basic metadata from stat, which is fast and handles file-not-found.
         meta = get_image_metadata(path)
         if not meta:
             return None
 
-        # 2. Calculate xxHash by reading the file bytes in chunks.
         hasher = xxhash.xxh64()
         with open(path, "rb") as f:
-            while chunk := f.read(4 * 1024 * 1024):  # Read in 4MB chunks
+            while chunk := f.read(4 * 1024 * 1024):
                 hasher.update(chunk)
         xxh = hasher.hexdigest()
 
@@ -58,10 +47,8 @@ def worker_calculate_hashes_and_meta(path: Path) -> dict[str, Any] | None:
             "xxhash": xxh,
         }
     except OSError:
-        # File could have been deleted between finding and processing.
         return None
     except Exception as e:
-        # Log unexpected crashes within the worker for better debugging.
         print(f"!!! XXHASH WORKER CRASH on {path.name}: {e}")
         traceback.print_exc()
         return None
@@ -69,35 +56,37 @@ def worker_calculate_hashes_and_meta(path: Path) -> dict[str, Any] | None:
 
 def worker_calculate_perceptual_hashes(item: "AnalysisItem", ignore_solid_channels: bool) -> dict[str, Any] | None:
     """
-    A medium-weight worker that loads an image to calculate its perceptual hashes (dHash, pHash)
-    based on the specified AnalysisItem.
-
-    This is more expensive than the xxHash worker because it requires decoding the image.
-
-    Args:
-        item: The AnalysisItem specifying the path and type of analysis (Composite, Channel, etc.).
-        ignore_solid_channels: Flag to control skipping of solid color channels.
-
-    Returns:
-        A dictionary containing the path, analysis_type, dHash, pHash, and precise metadata,
-        or None on failure.
+    Calculates perceptual hashes (dHash, pHash, wHash).
+    OPTIMIZED: Resizes image BEFORE splitting channels to save massive CPU time.
     """
     path = item.path
     analysis_type = item.analysis_type
 
     try:
-        # Always load the full original image first
-        original_pil_img = load_image(path)
+        # 1. Optimization: For hashing, we don't need full resolution.
+        # We request a shrunk version (e.g. roughly 512px is more than enough for 8x8 hashes)
+        original_pil_img = load_image(path, shrink=4)
+
         if not original_pil_img:
             return None
+
+        # 2. Optimization: Resize to small manageable size BEFORE splitting channels.
+        # pHash usually resizes to 32x32 internally. Let's do 128x128 to be safe but fast.
+        base_size = (128, 128)
+        if original_pil_img.width > 128 or original_pil_img.height > 128:
+            # Nearest neighbor is fast and sufficient for perceptual hashing
+            original_pil_img.thumbnail(base_size, Image.Resampling.NEAREST)
 
         image_for_hashing = None
 
         # Process the image based on the analysis type
         if analysis_type == "Luminance":
             image_for_hashing = original_pil_img.convert("L")
+
         elif analysis_type in ("R", "G", "B", "A"):
-            rgba_img = original_pil_img.convert("RGBA")
+            # Ensure RGBA for splitting (SIM108 Fix)
+            rgba_img = original_pil_img.convert("RGBA") if original_pil_img.mode != "RGBA" else original_pil_img
+
             channels = rgba_img.split()
             channel_map = {"R": 0, "G": 1, "B": 2, "A": 3}
             channel_index = channel_map.get(analysis_type)
@@ -107,12 +96,13 @@ def worker_calculate_perceptual_hashes(item: "AnalysisItem", ignore_solid_channe
 
                 if ignore_solid_channels:
                     min_val, max_val = channel_to_check.getextrema()
+                    # Check if channel is completely black (0) or white (255)
                     if min_val == max_val and (min_val == 0 or min_val == 255):
-                        return None  # Skip this solid channel by returning None
+                        return None  # Skip this solid channel
 
                 image_for_hashing = channel_to_check
             else:
-                return None  # Channel does not exist, so we can't process it.
+                return None
         else:  # "Composite"
             image_for_hashing = original_pil_img.convert("RGB")
 
@@ -121,12 +111,16 @@ def worker_calculate_perceptual_hashes(item: "AnalysisItem", ignore_solid_channe
             phash = imagehash.phash(image_for_hashing)
             whash = imagehash.whash(image_for_hashing)
 
-            # Get more precise metadata from the original loaded image if it differs from stat.
             precise_meta = {
-                "resolution": original_pil_img.size,
+                "resolution": original_pil_img.size,  # Note: This is the shrunk size
                 "format_details": f"{original_pil_img.mode}",
                 "has_alpha": "A" in original_pil_img.getbands(),
             }
+
+            # We query real metadata to ensure we don't overwrite the DB with thumbnail dimensions
+            real_meta = get_image_metadata(path)
+            if real_meta:
+                precise_meta["resolution"] = real_meta["resolution"]
 
             return {
                 "path": path,
@@ -138,6 +132,6 @@ def worker_calculate_perceptual_hashes(item: "AnalysisItem", ignore_solid_channe
             }
         return None
     except Exception as e:
-        print(f"!!! PERCEPTUAL HASH WORKER CRASH on {path.name} ({analysis_type}): {e}")
-        traceback.print_exc()
+        # Don't print full traceback for every file to keep console clean
+        print(f"Hash Worker Error on {path}: {e}")
         return None

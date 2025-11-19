@@ -61,6 +61,7 @@ dev = [
 
 [tool.ruff]
 exclude = [
+	"__pycache__",
 	"__pypackages__",
 	".direnv",
 	".eggs",

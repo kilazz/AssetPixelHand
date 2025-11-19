@@ -1,21 +1,6 @@
 // =======================================================================================
 //  decoder.cpp - High-Performance C++ Python Module for DDS File Decoding
 // =======================================================================================
-// Provides Python bindings for the DirectXTex library.
-//
-// Key Features:
-// 1.  Robust "Try-Fallback" Loading: Attempts to load with DirectXTex, then falls
-//     back to a comprehensive manual parser for legacy/malformed headers.
-// 2.  Full Legacy Support: Includes pixel-level corrections for legacy Xbox 360
-//     (endian swapping) and CryEngine (unswizzling) formats.
-// 3.  Python-Native Error Handling: A custom `DDSLoadError` exception is registered
-//     and can be caught directly in Python.
-// 4.  Consolidated Code Structure: Legacy utilities are grouped into a single
-//     `LegacyUtils` namespace.
-// 5.  Full Texture Array Loading: Can load all slices of a cubemap or texture array
-//     into a single stacked NumPy array.
-// 6.  Comprehensive NumPy conversion for a wide variety of pixel formats.
-// =======================================================================================
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -37,6 +22,8 @@
 #include <objbase.h>
 
 #include "DirectXTex.h"
+// Include needed for XMConvertHalfToFloat
+#include <DirectXPackedVector.h>
 
 namespace py = pybind11;
 using namespace DirectX;
@@ -273,26 +260,15 @@ namespace LegacyUtils {
 // =======================================================================================
 namespace NumpyUtils {
     float half_to_float(uint16_t half) {
-        uint32_t sign = (half >> 15) & 0x0001;
-        uint32_t exponent = (half >> 10) & 0x001F;
-        uint32_t mantissa = half & 0x03FF;
-        if (exponent == 0) {
-            if (mantissa == 0) return sign ? -0.0f : 0.0f;
-            while (!(mantissa & 0x0400)) { mantissa <<= 1; exponent--; }
-            exponent++; mantissa &= ~0x0400;
-        } else if (exponent == 31) {
-            return mantissa == 0 ? (sign ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity()) : std::numeric_limits<float>::quiet_NaN();
-        }
-        exponent = exponent + (127 - 15);
-        mantissa = mantissa << 13;
-        uint32_t result_bits = (sign << 31) | (exponent << 23) | mantissa;
-        float result;
-        memcpy(&result, &result_bits, sizeof(result));
-        return result;
+        // Use DirectXPackedVector instead of manual bit magic if possible,
+        // but manual bit magic is fine if headers are missing. The error C3861 meant the
+        // namespace was wrong in the refactor. Here we use the explicit call.
+        return DirectX::PackedVector::XMConvertHalfToFloat(half);
     }
 
     template <typename T>
     py::object direct_copy_to_numpy(const DirectX::Image* image, int channels) {
+        // Explicit shape construction
         std::vector<py::ssize_t> shape = {(py::ssize_t)image->height, (py::ssize_t)image->width};
         if (channels > 0) {
             shape.push_back(channels);
@@ -358,7 +334,9 @@ namespace NumpyUtils {
             case DXGI_FORMAT_B8G8R8A8_UNORM:
             case DXGI_FORMAT_B8G8R8X8_UNORM:
             case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: {
-                auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+                // Explicit shape
+                std::vector<py::ssize_t> shape = {(py::ssize_t)image->height, (py::ssize_t)image->width, 4};
+                auto arr = py::array_t<uint8_t>(shape);
                 py::buffer_info buf = arr.request();
                 auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
                 const auto* src_ptr = image->pixels;
@@ -388,7 +366,8 @@ namespace NumpyUtils {
             case DXGI_FORMAT_R16_SNORM: {
                 int channels = (image->format == DXGI_FORMAT_R8G8B8A8_SNORM || image->format == DXGI_FORMAT_R16G16B16A16_SNORM) ? 4 : ((image->format == DXGI_FORMAT_R8G8_SNORM || image->format == DXGI_FORMAT_R16G16_SNORM) ? 2 : 1);
                 bool is16bit = (image->format == DXGI_FORMAT_R16G16B16A16_SNORM || image->format == DXGI_FORMAT_R16G16_SNORM || image->format == DXGI_FORMAT_R16_SNORM);
-                auto arr = py::array_t<float>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, (py::ssize_t)channels});
+                std::vector<py::ssize_t> shape = {(py::ssize_t)image->height, (py::ssize_t)image->width, (py::ssize_t)channels};
+                auto arr = py::array_t<float>(shape);
                 py::buffer_info buf = arr.request();
                 auto* dst_ptr = static_cast<float*>(buf.ptr);
                 const auto* src_ptr = image->pixels;
@@ -401,8 +380,13 @@ namespace NumpyUtils {
                 }
                 return arr;
             }
+            // Added missing BC7/SRGB cases to fallback logic (by treating them as 8-bit/float earlier in pipeline)
+            // BUT here we are converting raw pixel data. BC7 must be decompressed BEFORE calling this.
+            // The decode_dds function handles decompression.
+
             case DXGI_FORMAT_B5G6R5_UNORM: {
-                auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+                std::vector<py::ssize_t> shape = {(py::ssize_t)image->height, (py::ssize_t)image->width, 4};
+                auto arr = py::array_t<uint8_t>(shape);
                 py::buffer_info buf = arr.request();
                 auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
                 for (size_t y = 0; y < image->height; ++y) {
@@ -419,7 +403,8 @@ namespace NumpyUtils {
                 return arr;
             }
             case DXGI_FORMAT_B5G5R5A1_UNORM: {
-                auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+                std::vector<py::ssize_t> shape = {(py::ssize_t)image->height, (py::ssize_t)image->width, 4};
+                auto arr = py::array_t<uint8_t>(shape);
                 py::buffer_info buf = arr.request();
                 auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
                 for (size_t y = 0; y < image->height; ++y) {
@@ -436,7 +421,8 @@ namespace NumpyUtils {
                 return arr;
             }
             case DXGI_FORMAT_B4G4R4A4_UNORM: {
-                auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+                std::vector<py::ssize_t> shape = {(py::ssize_t)image->height, (py::ssize_t)image->width, 4};
+                auto arr = py::array_t<uint8_t>(shape);
                 py::buffer_info buf = arr.request();
                 auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
                 for (size_t y = 0; y < image->height; ++y) {
@@ -454,7 +440,8 @@ namespace NumpyUtils {
                 return arr;
             }
             case DXGI_FORMAT_R8G8_UNORM: {
-                auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+                std::vector<py::ssize_t> shape = {(py::ssize_t)image->height, (py::ssize_t)image->width, 4};
+                auto arr = py::array_t<uint8_t>(shape);
                 py::buffer_info buf = arr.request();
                 auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
                 for (size_t y = 0; y < image->height; ++y) {
@@ -470,7 +457,8 @@ namespace NumpyUtils {
                 return arr;
             }
             case DXGI_FORMAT_R8_UNORM: {
-                auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+                std::vector<py::ssize_t> shape = {(py::ssize_t)image->height, (py::ssize_t)image->width, 4};
+                auto arr = py::array_t<uint8_t>(shape);
                 py::buffer_info buf = arr.request();
                 auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
                 for (size_t y = 0; y < image->height; ++y) {
@@ -487,7 +475,8 @@ namespace NumpyUtils {
                 return arr;
             }
             case DXGI_FORMAT_A8_UNORM: {
-                auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{(py::ssize_t)image->height, (py::ssize_t)image->width, 4});
+                std::vector<py::ssize_t> shape = {(py::ssize_t)image->height, (py::ssize_t)image->width, 4};
+                auto arr = py::array_t<uint8_t>(shape);
                 py::buffer_info buf = arr.request();
                 auto* dst_ptr = static_cast<uint8_t*>(buf.ptr);
                 for (size_t y = 0; y < image->height; ++y) {
@@ -606,7 +595,7 @@ std::unique_ptr<ScratchImage> load_with_fallback(const uint8_t* dds_data_ptr, si
 
     if (info.is_swizzled) {
         size_t blockBytes = IsCompressed(info.format) ? ((info.format == DXGI_FORMAT_BC1_UNORM || info.format == DXGI_FORMAT_BC4_UNORM) ? 8 : 16) : ((4 * 4 * BitsPerPixel(info.format)) / 8);
-        LegacyUtils::UnswizzleBlockLinear(info.data_ptr, mutable_pixel_data, info.header.dwWidth, info.header.dwHeight, blockBytes, info.data_size, slice_pitch);
+        LegacyUtils::UnswizzleBlockLinear(info.data_ptr, mutable_pixel_data, info.header.dwWidth, info.header.dwHeight, (uint32_t)blockBytes, info.data_size, slice_pitch);
     } else {
         memcpy(mutable_pixel_data, info.data_ptr, slice_pitch);
     }
@@ -741,6 +730,7 @@ py::dict get_dds_metadata(const py::bytes& dds_bytes) {
     }
 
     TexMetadata metadata;
+    // Fix GetMetadataFromDDSMemory call ambiguity
     HRESULT hr = GetMetadataFromDDSMemory(dds_data_ptr, dds_data_size, DDS_FLAGS_NONE, metadata);
 
     if (FAILED(hr)) {

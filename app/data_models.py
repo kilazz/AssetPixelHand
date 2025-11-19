@@ -1,5 +1,6 @@
 # app/data_models.py
-"""Contains all primary data structures (dataclasses) and Qt signal containers used
+"""
+Contains all primary data structures (dataclasses) and Qt signal containers used
 throughout the application. Centralizing these helps to ensure type
 consistency and avoids circular import dependencies.
 """
@@ -10,7 +11,7 @@ import uuid
 from dataclasses import dataclass, field, fields
 from enum import Enum, auto
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 import numpy as np
 import pyarrow as pa
@@ -24,28 +25,20 @@ from app.constants import (
     QuantizationMode,
 )
 
-if TYPE_CHECKING:
-    pass
-
-
 # Type hint for the analysis type. "Composite" means the full, standard image.
 AnalysisType = Literal["Composite", "Luminance", "R", "G", "B", "A"]
 
 
 @dataclass(frozen=True, slots=True)
 class AnalysisItem:
-    """Represents a single item to be analyzed by the pipeline.
-    This decouples the pipeline from files, allowing it to process channels,
-    luminance versions, or other variations of a file as distinct items.
-    """
+    """Represents a single item to be analyzed by the pipeline."""
 
     path: Path
     analysis_type: AnalysisType
 
 
-# A centralized source of truth for all fingerprint-related fields, their types, and defaults.
+# A centralized source of truth for all fingerprint-related fields.
 FINGERPRINT_FIELDS = {
-    # Field Name in dataclass: { types for different databases }
     "path": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
     "resolution_w": {"pyarrow": pa.int32(), "duckdb": "INTEGER"},
     "resolution_h": {"pyarrow": pa.int32(), "duckdb": "INTEGER"},
@@ -90,7 +83,7 @@ class FileOperation(Enum):
 
 @dataclass(slots=True)
 class ImageFingerprint:
-    """A container for all metadata and hashes of an image, evolving through the pipeline."""
+    """A container for all metadata and hashes of an image."""
 
     path: Path
     hashes: np.ndarray
@@ -107,7 +100,6 @@ class ImageFingerprint:
     texture_type: str
     color_space: str | None
 
-    # This is the correct way to define default-valued fields in a slotted dataclass
     xxhash: str | None = field(default=None)
     dhash: Any | None = field(default=None)
     phash: Any | None = field(default=None)
@@ -115,7 +107,6 @@ class ImageFingerprint:
     channel: str | None = field(default=None)
 
     def __hash__(self) -> int:
-        # Define a stable hash based on path and channel
         return hash((self.path, self.channel))
 
     def __eq__(self, other: object) -> bool:
@@ -125,12 +116,14 @@ class ImageFingerprint:
 
     def to_lancedb_dict(self, channel: str | None = None) -> dict[str, Any]:
         """Converts the object to a dictionary suitable for writing to LanceDB."""
-        # Use the passed channel argument, which comes from the pipeline
         final_channel = channel or self.channel
+
+        # Ensure vector is a flat list for LanceDB
+        vector_list = self.hashes.tolist() if isinstance(self.hashes, np.ndarray) else self.hashes
 
         data = {
             "id": str(uuid.uuid5(uuid.NAMESPACE_URL, str(self.path) + (final_channel or ""))),
-            "vector": self.hashes,
+            "vector": vector_list,
             "path": str(self.path),
             "resolution_w": int(self.resolution[0]),
             "resolution_h": int(self.resolution[1]),
@@ -171,20 +164,18 @@ class ImageFingerprint:
             texture_type=row.get("texture_type", "2D"),
             color_space=row.get("color_space", "sRGB"),
         )
-        # Also assign channel if it exists in the row
         if "channel" in row:
             fp.channel = row["channel"]
         return fp
 
 
-# Type Aliases for Clarity
+# Type Aliases
 DuplicateInfo = tuple[ImageFingerprint, int]
 DuplicateGroup = set[DuplicateInfo]
 DuplicateResults = dict[ImageFingerprint, Any]
 SearchResult = list[tuple[ImageFingerprint, float]]
 
 
-# Type-safe nodes for the results tree view model
 @dataclass(frozen=True)
 class ResultNode:
     path: str
@@ -274,6 +265,10 @@ class ScanConfig:
 
     # --- All fields WITH a default value MUST come after ---
     ignore_solid_channels: bool = True
+
+    # Selected Channels (R, G, B, A)
+    active_channels: list[str] = field(default_factory=lambda: ["R", "G", "B", "A"])
+
     channel_split_tags: list[str] = field(default_factory=list)
     model_info: dict = field(default_factory=dict)
     sample_path: Path | None = None
@@ -294,6 +289,15 @@ class HashingSettings:
     compare_by_channel: bool = False
     channel_split_tags: str = ""
     ignore_solid_channels: bool = True
+
+    # Channel toggles for persistence
+    channel_r: bool = True
+    channel_g: bool = True
+    channel_b: bool = True
+    channel_a: bool = True
+
+    # Auto-Cleanup logic
+    last_model_name: str = ""
 
 
 @dataclass
@@ -346,7 +350,7 @@ class AppSettings:
             with open(CONFIG_FILE, encoding="utf-8") as f:
                 data = json.load(f)
 
-            # Backward Compatibility
+            # Backward Compatibility Logic
             if "find_exact_duplicates" in data:
                 data["hashing"] = {
                     "use_ai": data.pop("use_ai", True),
@@ -360,49 +364,28 @@ class AppSettings:
                     "channel_split_tags": data.pop("channel_split_tags", ""),
                     "ignore_solid_channels": data.pop("ignore_solid_channels", True),
                 }
-            if "perf_num_workers" in data:
-                data["performance"] = {
-                    "num_workers": data.pop("perf_num_workers", "4"),
-                    "batch_size": data.pop("perf_batch_size", "256"),
-                    "low_priority": data.pop("perf_low_priority", True),
-                    "search_precision": data.pop("search_precision", DEFAULT_SEARCH_PRECISION),
-                    "device": data.pop("device", "CPU"),
-                    "quantization_mode": data.pop("quantization_mode", QuantizationMode.FP16.value),
-                }
-            if "save_visuals" in data:
-                data["visuals"] = {
-                    "save": data.pop("save_visuals", False),
-                    "max_count": data.pop("max_visuals", "100"),
-                    "columns": data.pop("visuals_columns", 6),
-                    "tonemap_enabled": data.pop("visuals_tonemap_enabled", False),
-                }
-            if "preview_size" in data:
-                data["viewer"] = {
-                    "preview_size": data.pop("preview_size", 250),
-                    "show_transparency": data.pop("show_transparency", True),
-                    "thumbnail_tonemap_enabled": data.pop("thumbnail_tonemap_enabled", False),
-                    "compare_tonemap_enabled": data.pop("compare_tonemap_enabled", False),
-                    "tonemap_view": data.pop("tonemap_view", "Khronos PBR Neutral"),
-                }
 
+            # Generic Loader
             settings = cls()
             for key, value in data.items():
                 if hasattr(settings, key):
-                    if isinstance(
-                        getattr(settings, key), (HashingSettings, PerformanceSettings, VisualsSettings, ViewerSettings)
-                    ):
-                        nested_obj = getattr(settings, key)
-                        for nested_key, nested_value in value.items():
-                            if hasattr(nested_obj, nested_key):
-                                setattr(nested_obj, nested_key, nested_value)
+                    attr = getattr(settings, key)
+                    if isinstance(attr, (HashingSettings, PerformanceSettings, VisualsSettings, ViewerSettings)):
+                        # Update nested dataclasses
+                        if isinstance(value, dict):
+                            for k, v in value.items():
+                                if hasattr(attr, k):
+                                    setattr(attr, k, v)
                     else:
                         setattr(settings, key, value)
+
             if not settings.selected_extensions:
                 settings.selected_extensions = list(ALL_SUPPORTED_EXTENSIONS)
-            if not settings.folder_path or not Path(settings.folder_path).is_dir():
-                settings.folder_path = str(SCRIPT_DIR)
+
+            # Default model fallback
             if settings.model_key not in SUPPORTED_MODELS:
                 settings.model_key = next(iter(SUPPORTED_MODELS.keys()))
+
             return settings
         except (OSError, json.JSONDecodeError) as e:
             print(f"Warning: Could not load settings file, using defaults. Error: {e}")
@@ -410,6 +393,7 @@ class AppSettings:
 
     def save(self):
         try:
+            # recursive dict conversion for nested dataclasses
             data_to_save = {k: v.__dict__ if hasattr(v, "__dict__") else v for k, v in self.__dict__.items()}
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(data_to_save, f, indent=4)

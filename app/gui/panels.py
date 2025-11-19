@@ -1,5 +1,6 @@
 # app/gui/panels.py
-"""Contains the main panel widgets (QGroupBox subclasses) that form the core layout
+"""
+Contains the main panel widgets (QGroupBox subclasses) that form the core layout
 of the application's main window, organizing all user-facing controls and views.
 """
 
@@ -9,7 +10,6 @@ import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import duckdb
 import onnxruntime
 from PIL import Image, ImageChops
 from PIL.ImageQt import ImageQt
@@ -288,7 +288,6 @@ class OptionsPanel(QGroupBox):
         self._update_scan_context()
 
     def _browse_for_folder(self):
-        """Opens a folder selection dialog with a fallback to the non-native version."""
         path = ""
         try:
             path = QFileDialog.getExistingDirectory(self, "Select Folder", self.folder_path_entry.text())
@@ -301,7 +300,6 @@ class OptionsPanel(QGroupBox):
             self.folder_path_entry.setText(path)
 
     def _browse_for_sample(self):
-        """Opens a file selection dialog with a fallback to the non-native version."""
         path_str, _ = "", ""
         try:
             path_str, _ = QFileDialog.getOpenFileName(
@@ -327,7 +325,6 @@ class OptionsPanel(QGroupBox):
 
     @Slot()
     def _clear_sample(self):
-        """Only clears the sample data, does not trigger a context update."""
         self._sample_path = None
         self.sample_path_label.setText("Sample: None")
 
@@ -381,7 +378,8 @@ class ScanOptionsPanel(QGroupBox):
 
         self.use_ai_check = QCheckBox("Use AI for similarity search")
         self.use_ai_check.setToolTip(
-            "Enables neural network to find visually similar (but not identical) images.\nDisabling this makes scanning much faster but only finds exact or near-identical duplicates."
+            "Enables neural network to find visually similar (but not identical) images.\n"
+            "Disabling this makes scanning much faster but only finds exact or near-identical duplicates."
         )
         layout.addWidget(self.use_ai_check)
 
@@ -393,32 +391,20 @@ class ScanOptionsPanel(QGroupBox):
         hashing_grid.addWidget(self.exact_duplicates_check, 0, 0, 1, 3)
 
         self.simple_duplicates_check = QCheckBox("Find simple duplicates (dHash)")
-        self.simple_duplicates_check.setToolTip(
-            "Finds resized or re-formatted images. Threshold controls sensitivity (lower is stricter)."
-        )
         self.dhash_threshold_spin = QSpinBox()
         self.dhash_threshold_spin.setRange(0, 64)
-        self.dhash_threshold_spin.setToolTip("dHash Threshold (Hamming distance). Default: 8")
         hashing_grid.addWidget(self.simple_duplicates_check, 1, 0, 1, 2)
         hashing_grid.addWidget(self.dhash_threshold_spin, 1, 2)
 
         self.perceptual_duplicates_check = QCheckBox("Find near-identical images (pHash)")
-        self.perceptual_duplicates_check.setToolTip(
-            "Finds visually identical images. Threshold controls sensitivity (lower is stricter)."
-        )
         self.phash_threshold_spin = QSpinBox()
         self.phash_threshold_spin.setRange(0, 64)
-        self.phash_threshold_spin.setToolTip("pHash Threshold (Hamming distance). Default: 8")
         hashing_grid.addWidget(self.perceptual_duplicates_check, 2, 0, 1, 2)
         hashing_grid.addWidget(self.phash_threshold_spin, 2, 2)
 
         self.structural_duplicates_check = QCheckBox("Find structural duplicates (wHash)")
-        self.structural_duplicates_check.setToolTip(
-            "More robust than pHash/dHash. Good for finding structural similarities."
-        )
         self.whash_threshold_spin = QSpinBox()
         self.whash_threshold_spin.setRange(0, 64)
-        self.whash_threshold_spin.setToolTip("wHash Threshold (Hamming distance). Default: 2")
         hashing_grid.addWidget(self.structural_duplicates_check, 3, 0, 1, 2)
         hashing_grid.addWidget(self.whash_threshold_spin, 3, 2)
 
@@ -426,27 +412,50 @@ class ScanOptionsPanel(QGroupBox):
         prep_layout = QVBoxLayout(self.image_prep_group)
 
         self.luminance_check = QCheckBox("Compare by luminance only (Grayscale)")
-        self.luminance_check.setToolTip(
-            "Analyzes image structure without color. Works for both AI and Perceptual Hashing."
-        )
         prep_layout.addWidget(self.luminance_check)
 
-        self.channel_check = QCheckBox("Compare by individual channels (R,G,B,A)")
-        self.channel_check.setToolTip(
-            "Splits images into channels before comparison. Works for both AI and Perceptual Hashing."
-        )
+        # --- Updated Channel Selection UI ---
+        self.channel_group_widget = QWidget()
+        channel_main_layout = QVBoxLayout(self.channel_group_widget)
+        channel_main_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.channel_check = QCheckBox("Compare by specific channels:")
+        self.channel_check.setToolTip("Splits images and compares selected channels independently.")
+
+        self.channels_layout = QHBoxLayout()
+        self.channels_layout.setContentsMargins(20, 0, 0, 0)
+
+        self.cb_r = QCheckBox("R")
+        self.cb_g = QCheckBox("G")
+        self.cb_b = QCheckBox("B")
+        self.cb_a = QCheckBox("A")
+
+        # Colored indicators
+        self.cb_r.setStyleSheet("color: #FF5555; font-weight: bold;")
+        self.cb_g.setStyleSheet("color: #55FF55; font-weight: bold;")
+        self.cb_b.setStyleSheet("color: #55AAFF; font-weight: bold;")
+        self.cb_a.setStyleSheet("color: #AAAAAA; font-weight: bold;")
+
+        self.channels_layout.addWidget(self.cb_r)
+        self.channels_layout.addWidget(self.cb_g)
+        self.channels_layout.addWidget(self.cb_b)
+        self.channels_layout.addWidget(self.cb_a)
+        self.channels_layout.addStretch()
+
+        channel_main_layout.addWidget(self.channel_check)
+        channel_main_layout.addLayout(self.channels_layout)
+        prep_layout.addWidget(self.channel_group_widget)
+
         self.channel_tags_entry = QLineEdit()
-        self.channel_tags_entry.setPlaceholderText("e.g. diff (comma-separated)")
-        channel_layout_container = QHBoxLayout()
-        channel_layout_container.setContentsMargins(0, 0, 0, 0)
-        channel_layout_container.addWidget(self.channel_check)
-        channel_layout_container.addWidget(self.channel_tags_entry)
-        prep_layout.addLayout(channel_layout_container)
+        self.channel_tags_entry.setPlaceholderText("Filter by filename tag (e.g. _diff, _norm)...")
+        channel_tags_layout = QHBoxLayout()
+        channel_tags_layout.setContentsMargins(20, 0, 0, 0)
+        channel_tags_layout.addWidget(QLabel("Filename Filter:"))
+        channel_tags_layout.addWidget(self.channel_tags_entry)
+        prep_layout.addLayout(channel_tags_layout)
+        # ------------------------------------
 
         self.ignore_solid_check = QCheckBox("Ignore solid black/white channels")
-        self.ignore_solid_check.setToolTip(
-            "If enabled, channels that are completely black or white will not be compared."
-        )
         ignore_layout = QHBoxLayout()
         ignore_layout.setContentsMargins(20, 0, 0, 0)
         ignore_layout.addWidget(self.ignore_solid_check)
@@ -456,15 +465,11 @@ class ScanOptionsPanel(QGroupBox):
         layout.addWidget(self.image_prep_group)
 
         self.lancedb_in_memory_check = QCheckBox("Use in-memory database (fastest)")
-        self.lancedb_in_memory_check.setToolTip(
-            "Stores caches and vector index in RAM. Fastest, but not persistent across runs."
-        )
         layout.addWidget(self.lancedb_in_memory_check)
 
         visuals_layout = QHBoxLayout()
         self.save_visuals_check = QCheckBox("Save visuals")
         self.visuals_tonemap_check = QCheckBox("TM HDR")
-        self.visuals_tonemap_check.setToolTip("Apply tonemapping to HDR images (e.g., EXR) in the saved visuals.")
         self.max_visuals_entry = QLineEdit()
         self.max_visuals_entry.setValidator(QIntValidator(0, 9999))
         self.max_visuals_entry.setFixedWidth(UIConfig.Sizes.MAX_VISUALS_ENTRY_WIDTH)
@@ -472,7 +477,6 @@ class ScanOptionsPanel(QGroupBox):
         self.visuals_columns_spinbox.setRange(2, 12)
         self.visuals_columns_spinbox.setFixedWidth(UIConfig.Sizes.VISUALS_COLUMNS_SPINBOX_WIDTH)
         self.open_visuals_folder_button = QPushButton("📂")
-        self.open_visuals_folder_button.setToolTip("Open visualizations folder")
         self.open_visuals_folder_button.setFixedWidth(UIConfig.Sizes.BROWSE_BUTTON_WIDTH)
 
         visuals_layout.addWidget(self.save_visuals_check)
@@ -504,6 +508,13 @@ class ScanOptionsPanel(QGroupBox):
 
         self.luminance_check.toggled.connect(self.settings_manager.set_compare_by_luminance)
         self.channel_check.toggled.connect(self.settings_manager.set_compare_by_channel)
+
+        # New Channel Signals
+        self.cb_r.toggled.connect(self.settings_manager.set_channel_r)
+        self.cb_g.toggled.connect(self.settings_manager.set_channel_g)
+        self.cb_b.toggled.connect(self.settings_manager.set_channel_b)
+        self.cb_a.toggled.connect(self.settings_manager.set_channel_a)
+
         self.channel_tags_entry.textChanged.connect(self.settings_manager.set_channel_split_tags)
         self.ignore_solid_check.toggled.connect(self.settings_manager.set_ignore_solid_channels)
 
@@ -525,11 +536,16 @@ class ScanOptionsPanel(QGroupBox):
         is_structural_on = self.structural_duplicates_check.isChecked()
 
         is_phash_any_on = is_simple_on or is_perceptual_on or is_structural_on
-
         is_prep_enabled = is_ai_on or is_phash_any_on
         self.image_prep_group.setEnabled(is_prep_enabled)
 
         is_channel_check_on = self.channel_check.isChecked()
+
+        # Enable sub-controls only if main channel check is ON
+        self.cb_r.setEnabled(is_prep_enabled and is_channel_check_on)
+        self.cb_g.setEnabled(is_prep_enabled and is_channel_check_on)
+        self.cb_b.setEnabled(is_prep_enabled and is_channel_check_on)
+        self.cb_a.setEnabled(is_prep_enabled and is_channel_check_on)
         self.channel_tags_entry.setEnabled(is_prep_enabled and is_channel_check_on)
         self.ignore_solid_check.setEnabled(is_prep_enabled and is_channel_check_on)
 
@@ -538,35 +554,29 @@ class ScanOptionsPanel(QGroupBox):
         self.whash_threshold_spin.setEnabled(is_structural_on)
 
         main_window = self.window()
-        if not main_window:
-            return
-
-        main_window.performance_panel.setEnabled(is_ai_on)
-
-        options_panel = main_window.options_panel
-        options_panel.model_combo.setEnabled(is_ai_on)
-        options_panel.threshold_spinbox.setEnabled(is_ai_on)
-
-        options_panel._update_scan_context()
+        if main_window and hasattr(main_window, "options_panel"):
+            main_window.performance_panel.setEnabled(is_ai_on)
+            main_window.options_panel.model_combo.setEnabled(is_ai_on)
+            main_window.options_panel.threshold_spinbox.setEnabled(is_ai_on)
+            main_window.options_panel._update_scan_context()
 
     def toggle_visuals_option(self, is_checked):
         for i in range(self.layout().count()):
             item = self.layout().itemAt(i)
-            if (
-                item
-                and item.layout()
-                and self.open_visuals_folder_button
-                in [
-                    item.layout().itemAt(j).widget()
-                    for j in range(item.layout().count())
-                    if item.layout().itemAt(j).widget()
-                ]
-            ):
-                for j in range(1, item.layout().count()):
-                    widget = item.layout().itemAt(j).widget()
-                    if widget:
-                        widget.setVisible(is_checked)
-                break
+            if item and item.layout():
+                # Crude check to find the visuals layout, assuming button is inside
+                has_button = False
+                for j in range(item.layout().count()):
+                    if item.layout().itemAt(j).widget() == self.open_visuals_folder_button:
+                        has_button = True
+                        break
+                if has_button:
+                    # Hide/Show secondary controls
+                    for j in range(2, item.layout().count()):
+                        widget = item.layout().itemAt(j).widget()
+                        if widget:
+                            widget.setVisible(is_checked)
+                    break
 
     def _open_visuals_folder(self):
         if not VISUALS_DIR.exists():
@@ -587,7 +597,13 @@ class ScanOptionsPanel(QGroupBox):
         self.phash_threshold_spin.setValue(s.hashing.phash_threshold)
         self.whash_threshold_spin.setValue(s.hashing.whash_threshold)
         self.luminance_check.setChecked(s.hashing.compare_by_luminance)
+
         self.channel_check.setChecked(s.hashing.compare_by_channel)
+        self.cb_r.setChecked(s.hashing.channel_r)
+        self.cb_g.setChecked(s.hashing.channel_g)
+        self.cb_b.setChecked(s.hashing.channel_b)
+        self.cb_a.setChecked(s.hashing.channel_a)
+
         self.channel_tags_entry.setText(s.hashing.channel_split_tags)
         self.ignore_solid_check.setChecked(s.hashing.ignore_solid_channels)
 
@@ -597,9 +613,6 @@ class ScanOptionsPanel(QGroupBox):
         self.max_visuals_entry.setText(s.visuals.max_count)
         self.visuals_columns_spinbox.setValue(s.visuals.columns)
         self.toggle_visuals_option(s.visuals.save)
-
-        # This call is deferred to main_window after all panels are created.
-        # self._update_dependent_ui_state()
 
 
 class PerformancePanel(QGroupBox):
@@ -633,7 +646,7 @@ class PerformancePanel(QGroupBox):
 
         self.num_workers_label = QLabel("Preprocessing Workers:")
         self.num_workers_spin = QSpinBox()
-        self.num_workers_spin.setRange(1, (multiprocessing.cpu_count() or 1) * 2)
+        self.num_workers_spin.setRange(1, (multiprocessing.cpu_count() or 1) * 4)
         layout.addRow(self.num_workers_label, self.num_workers_spin)
 
     def _connect_signals(self):
@@ -644,9 +657,7 @@ class PerformancePanel(QGroupBox):
         self.num_workers_spin.valueChanged.connect(self.settings_manager.set_num_workers)
 
     def _detect_and_setup_devices(self):
-        """Detects and populates the dropdown with ALL available ONNX Runtime providers."""
         self.device_combo.clear()
-
         if not DEEP_LEARNING_AVAILABLE:
             self.device_combo.addItem("CPUExecutionProvider", "CPUExecutionProvider")
             self.log_message.emit("Deep learning libraries not found, GPU support disabled.", "warning")
@@ -654,17 +665,12 @@ class PerformancePanel(QGroupBox):
 
         try:
             available_providers = onnxruntime.get_available_providers()
-
             if "CPUExecutionProvider" in available_providers:
                 self.device_combo.addItem("CPUExecutionProvider", "CPUExecutionProvider")
-
             for provider_id in available_providers:
                 if provider_id == "CPUExecutionProvider":
                     continue
                 self.device_combo.addItem(provider_id, provider_id)
-
-            self.log_message.emit(f"Detected providers: {available_providers}", "info")
-
         except Exception as e:
             self.log_message.emit(f"Error detecting ONNX providers: {e}", "error")
             if self.device_combo.count() == 0:
@@ -674,7 +680,6 @@ class PerformancePanel(QGroupBox):
 
     @Slot(int)
     def _on_device_selection_changed(self, index: int):
-        """Handles user selection from the device dropdown."""
         provider_id = self.device_combo.itemData(index)
         if provider_id:
             self.settings_manager.set_device(provider_id)
@@ -682,33 +687,26 @@ class PerformancePanel(QGroupBox):
 
     @Slot(str)
     def _on_device_change(self, provider_id: str):
-        """Notifies other UI components if the selected device is CPU or not."""
         is_cpu = provider_id == "CPUExecutionProvider"
         self.device_changed.emit(is_cpu)
 
     @Slot(str)
     def update_precision_presets(self, scan_mode_name: str):
-        """Updates the search precision dropdown based on the scan mode."""
         self.search_precision_combo.blockSignals(True)
         self.search_precision_combo.clear()
-
         presets = list(SEARCH_PRECISION_PRESETS.keys())
         self.search_precision_combo.addItems(presets)
-
         current_setting = self.settings_manager.settings.performance.search_precision
         if current_setting in presets:
             self.search_precision_combo.setCurrentText(current_setting)
         else:
             self.search_precision_combo.setCurrentText(DEFAULT_SEARCH_PRECISION)
-
         self.search_precision_combo.blockSignals(False)
 
     def load_settings(self, s: AppSettings):
         self._detect_and_setup_devices()
-
         saved_provider_id = s.performance.device
         index = self.device_combo.findData(saved_provider_id)
-
         if index != -1:
             self.device_combo.setCurrentIndex(index)
         else:
@@ -1136,13 +1134,15 @@ class ResultsPanel(QGroupBox):
             return
 
         try:
+            import duckdb
+
             with duckdb.connect(database=str(self.results_model.db_path), read_only=False) as conn:
                 conn.execute("CREATE TEMPORARY TABLE paths_to_delete (path VARCHAR)")
                 conn.executemany("INSERT INTO paths_to_delete VALUES (?)", [(str(p),) for p in paths_to_delete])
 
                 result = conn.execute("DELETE FROM results WHERE path IN (SELECT path FROM paths_to_delete)")
                 app_logger.info(f"Removed {result.fetchone()[0]} rows from results.duckdb.")
-        except duckdb.Error as e:
+        except Exception as e:
             app_logger.error(f"Failed to remove items from results.duckdb: {e}")
 
     def update_after_deletion(self, deleted_paths: list[Path]):

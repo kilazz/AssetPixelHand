@@ -1,5 +1,8 @@
 # app/services/settings_manager.py
-"""Contains the SettingsManager class, which centralizes all application settings logic."""
+"""
+Contains the SettingsManager class, which centralizes all application settings logic.
+Manages persistence, updates, and auto-saving.
+"""
 
 from PySide6.QtCore import QObject, QTimer, Slot
 
@@ -128,6 +131,31 @@ class SettingsManager(QObject):
             self._settings.hashing.compare_by_channel = checked
             self._request_save()
 
+    # --- New Slots for Channel Selection ---
+    @Slot(bool)
+    def set_channel_r(self, checked: bool):
+        if self._settings.hashing.channel_r != checked:
+            self._settings.hashing.channel_r = checked
+            self._request_save()
+
+    @Slot(bool)
+    def set_channel_g(self, checked: bool):
+        if self._settings.hashing.channel_g != checked:
+            self._settings.hashing.channel_g = checked
+            self._request_save()
+
+    @Slot(bool)
+    def set_channel_b(self, checked: bool):
+        if self._settings.hashing.channel_b != checked:
+            self._settings.hashing.channel_b = checked
+            self._request_save()
+
+    @Slot(bool)
+    def set_channel_a(self, checked: bool):
+        if self._settings.hashing.channel_a != checked:
+            self._settings.hashing.channel_a = checked
+            self._request_save()
+
     @Slot(str)
     def set_channel_split_tags(self, text: str):
         if self._settings.hashing.channel_split_tags != text:
@@ -170,7 +198,7 @@ class SettingsManager(QObject):
             self._settings.visuals.tonemap_enabled = checked
             self._request_save()
 
-    # --- Slots for PerformancePanel and Low Priority Check ---
+    # --- Slots for PerformancePanel ---
     @Slot(bool)
     def set_low_priority(self, checked: bool):
         if self._settings.performance.low_priority != checked:
