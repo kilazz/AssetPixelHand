@@ -213,6 +213,7 @@ class CompareMode(Enum):
 class QuantizationMode(Enum):
     FP32 = "FP32 (Max Accuracy)"
     FP16 = "FP16 (Recommended)"
+    INT8 = "INT8 (Fastest/CPU)"
 
 
 class TonemapMode(Enum):

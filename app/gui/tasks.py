@@ -7,6 +7,7 @@ import inspect
 import io
 import logging
 import os
+import shutil
 from pathlib import Path
 
 import send2trash
@@ -40,6 +41,7 @@ app_logger = logging.getLogger("AssetPixelHand.gui.tasks")
 class ModelConverter(QRunnable):
     """
     A task to download, convert, and cache a HuggingFace model to ONNX format.
+    Supports FP32, FP16, and INT8 (Dynamic Quantization).
     """
 
     class Signals(QObject):
@@ -68,6 +70,9 @@ class ModelConverter(QRunnable):
 
         try:
             import torch
+
+            # For INT8
+            from onnxruntime.quantization import QuantType, quantize_dynamic
             from PIL import Image
 
             from app.model_adapter import get_model_adapter
@@ -79,10 +84,11 @@ class ModelConverter(QRunnable):
 
             target_dir = self._setup_directories(MODELS_DIR, adapter)
 
-            vision_exists = (target_dir / "visual.onnx").exists()
-            text_exists = (target_dir / "text.onnx").exists()
-
-            if vision_exists and (not adapter.has_text_model() or text_exists):
+            # Check if model exists (visual.onnx is the key)
+            # NOTE: For INT8, we might use same folder name but overwrite, or verify internal structure.
+            # Currently _setup_directories adds suffix based on mode.
+            if (target_dir / "visual.onnx").exists():
+                # Simple check. For robustness, could check hash, but file existence is usually enough here.
                 self.signals.log.emit(f"Model '{target_dir.name}' already exists in cache.", "info")
                 self.signals.finished.emit(True, "Model already exists.")
                 return
@@ -95,18 +101,52 @@ class ModelConverter(QRunnable):
             processor = ProcessorClass.from_pretrained(self.hf_model_name)
             model = ModelClass.from_pretrained(self.hf_model_name)
 
-            if self.quant_mode == QuantizationMode.FP16:
+            # For INT8, we export FP32 first, then quantize.
+            # For FP16, we cast model to half() and export directly.
+            export_fp16 = self.quant_mode == QuantizationMode.FP16
+
+            if export_fp16:
                 self.signals.log.emit("Converting model to FP16 precision...", "info")
                 model.half()
 
             use_dynamo = self.model_info.get("use_dynamo", False)
 
+            # Define output paths
+            visual_out_path = target_dir / "visual.onnx"
+            text_out_path = target_dir / "text.onnx"
+
+            # Export Logic
+            self.signals.log.emit("Exporting to ONNX...", "info")
+
             if use_dynamo:
-                self.signals.log.emit("Using modern Dynamo exporter for this model.", "info")
-                self._export_with_dynamo(model, processor, target_dir, torch, Image, adapter)
+                self._export_with_dynamo(model, processor, target_dir, torch, Image, adapter, export_fp16)
             else:
-                self.signals.log.emit("Using stable legacy exporter for this model.", "info")
-                self._export_with_legacy(model, processor, target_dir, torch, Image, adapter)
+                self._export_with_legacy(model, processor, target_dir, torch, Image, adapter, export_fp16)
+
+            # --- INT8 POST-PROCESSING ---
+            if self.quant_mode == QuantizationMode.INT8:
+                self.signals.log.emit("Applying INT8 Dynamic Quantization...", "info")
+
+                # Quantize Visual Model
+                temp_visual = target_dir / "visual_fp32.onnx"
+                # Rename the just-exported FP32 model to temp
+                if visual_out_path.exists():
+                    shutil.move(str(visual_out_path), str(temp_visual))
+
+                    quantize_dynamic(
+                        model_input=temp_visual,
+                        model_output=visual_out_path,
+                        weight_type=QuantType.QUInt8,  # QUInt8 is standard for CPU
+                    )
+                    temp_visual.unlink()  # Cleanup
+
+                # Quantize Text Model (if exists)
+                if text_out_path.exists():
+                    temp_text = target_dir / "text_fp32.onnx"
+                    shutil.move(str(text_out_path), str(temp_text))
+
+                    quantize_dynamic(model_input=temp_text, model_output=text_out_path, weight_type=QuantType.QUInt8)
+                    temp_text.unlink()
 
             self.signals.finished.emit(True, "Model prepared successfully.")
 
@@ -115,6 +155,7 @@ class ModelConverter(QRunnable):
             app_logger.error(msg, exc_info=True)
             self.signals.finished.emit(False, str(e))
         finally:
+            # Restore env var
             if original_progress_bar_setting is None:
                 if "HF_HUB_DISABLE_PROGRESS_BARS" in os.environ:
                     del os.environ["HF_HUB_DISABLE_PROGRESS_BARS"]
@@ -125,15 +166,19 @@ class ModelConverter(QRunnable):
         target_dir_name = self.onnx_name_base
         if self.quant_mode == QuantizationMode.FP16:
             target_dir_name += FP16_MODEL_SUFFIX
+        elif self.quant_mode == QuantizationMode.INT8:
+            target_dir_name += "_int8"  # Distinct folder for INT8
+
         target_dir = models_dir / target_dir_name
         target_dir.mkdir(parents=True, exist_ok=True)
 
+        # Save processor config
         ProcessorClass = adapter.get_processor_class()
         processor = ProcessorClass.from_pretrained(self.hf_model_name)
         processor.save_pretrained(target_dir)
         return target_dir
 
-    def _export_with_dynamo(self, model, processor, target_dir, torch, Image, adapter):
+    def _export_with_dynamo(self, model, processor, target_dir, torch, Image, adapter, is_fp16):
         import torch._dynamo
         from torch.export import Dim
 
@@ -145,7 +190,7 @@ class ModelConverter(QRunnable):
         dummy_input = processor(images=Image.new("RGB", input_size), return_tensors="pt")
 
         pixel_values = dummy_input["pixel_values"].repeat(2, 1, 1, 1)
-        if self.quant_mode == QuantizationMode.FP16:
+        if is_fp16:
             pixel_values = pixel_values.half()
 
         torch.onnx.export(
@@ -158,14 +203,14 @@ class ModelConverter(QRunnable):
             opset_version=opset_version,
         )
 
-    def _export_with_legacy(self, model, processor, target_dir, torch, Image, adapter):
+    def _export_with_legacy(self, model, processor, target_dir, torch, Image, adapter, is_fp16):
         opset_version = 18
 
         vision_wrapper = adapter.get_vision_wrapper(model, torch)
         input_size = adapter.get_input_size(processor)
         dummy_input = processor(images=Image.new("RGB", input_size), return_tensors="pt")
         pixel_values = dummy_input["pixel_values"]
-        if self.quant_mode == QuantizationMode.FP16:
+        if is_fp16:
             pixel_values = pixel_values.half()
 
         torch.onnx.export(

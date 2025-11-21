@@ -132,6 +132,8 @@ class ScanConfigBuilder:
         onnx_name = model_info["onnx_name"]
         if quant_mode == QuantizationMode.FP16:
             onnx_name += FP16_MODEL_SUFFIX
+        elif quant_mode == QuantizationMode.INT8:
+            onnx_name += "_int8"
         return model_info, onnx_name
 
     def _build_performance_config(self) -> PerformanceConfig:

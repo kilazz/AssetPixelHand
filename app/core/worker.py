@@ -164,7 +164,7 @@ class ModelManager:
             from transformers import AutoProcessor
 
             model_dir = MODELS_DIR / requested_model
-            self.preprocessor = AutoProcessor.from_pretrained(model_dir)
+            self.preprocessor = AutoProcessor.from_pretrained(str(model_dir))
 
             self.current_model_name = requested_model
         except Exception as e:
