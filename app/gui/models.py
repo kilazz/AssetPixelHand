@@ -10,11 +10,13 @@ from dataclasses import fields
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from PIL import Image, ImageQt
 from PySide6.QtCore import (
     QAbstractItemModel,
     QAbstractListModel,
     QModelIndex,
     QPersistentModelIndex,
+    QRect,
     QSize,
     QSortFilterProxyModel,
     Qt,
@@ -837,7 +839,7 @@ class ImagePreviewModel(QAbstractListModel):
 
 
 class ImageItemDelegate(QStyledItemDelegate):
-    """Custom delegate for rendering items in the ImagePreviewModel."""
+    """Custom delegate for rendering items in the ImagePreviewModel with Channel Hover Preview."""
 
     def __init__(self, preview_size: int, state: "ImageComparerState", parent=None):
         super().__init__(parent)
@@ -848,6 +850,15 @@ class ImageItemDelegate(QStyledItemDelegate):
         self.bold_font.setBold(True)
         self.bold_font_metrics = QFontMetrics(self.bold_font)
         self.regular_font_metrics = QFontMetrics(QFont())
+
+        # --- Channel Preview State ---
+        self._hover_index_key = None  # Store id(item_data) to identify index uniquely
+        self._hover_channel = None
+
+        # Small cache for generated channel thumbnails to ensure 60 FPS hover
+        # Key: (path_str, channel_char) -> QPixmap
+        self._channel_cache = OrderedDict()
+        self._CACHE_SIZE = 100
 
     def set_bg_alpha(self, alpha: int):
         self.bg_alpha = alpha
@@ -861,6 +872,30 @@ class ImageItemDelegate(QStyledItemDelegate):
     def sizeHint(self, option, index):
         return QSize(self.preview_size + 250, self.preview_size + 10)
 
+    @Slot(QModelIndex, object)
+    def set_hover_channel(self, index: QModelIndex, channel: str | None):
+        """Called by the view when mouse moves over specific zones."""
+        # Identify the item uniquely (pointer to ResultNode)
+        item_key = None
+        if index.isValid():
+            item_data = index.data(Qt.ItemDataRole.UserRole)
+            if item_data:
+                item_key = id(item_data)  # Fast unique ID for the current python object
+
+        if item_key != self._hover_index_key or channel != self._hover_channel:
+            self._hover_index_key = item_key
+            self._hover_channel = channel
+
+            # Trigger repaint of the view (can be optimized to update specific rect)
+            # Correctly reference the list_view's viewport via the parent Panel
+            if self.parent():
+                # If parent is the Panel (which has .list_view)
+                if hasattr(self.parent(), "list_view"):
+                    self.parent().list_view.viewport().update()
+                # Fallback: if parent is the View itself
+                elif hasattr(self.parent(), "viewport"):
+                    self.parent().viewport().update()
+
     def paint(self, painter, option, index):
         painter.save()
         try:
@@ -869,7 +904,7 @@ class ImageItemDelegate(QStyledItemDelegate):
             if not item_data:
                 return
             self._draw_background(painter, option, item_data)
-            self._draw_thumbnail(painter, option, index)
+            self._draw_thumbnail(painter, option, index, item_data)
             self._draw_text_info(painter, option, item_data)
         finally:
             painter.restore()
@@ -885,32 +920,62 @@ class ImageItemDelegate(QStyledItemDelegate):
             painter.setPen(QPen(QColor(UIConfig.Colors.HIGHLIGHT), 2))
             painter.drawRect(option.rect.adjusted(1, 1, -1, -1))
 
-    def _draw_thumbnail(self, painter, option, index):
+    def _draw_thumbnail(self, painter, option, index, item_data):
         thumb_rect = option.rect.adjusted(5, 5, -(option.rect.width() - self.preview_size - 5), -5)
+
         if self.is_transparency_enabled:
             painter.drawPixmap(
                 thumb_rect.topLeft(),
                 AlphaBackgroundWidget._get_checkered_pixmap(thumb_rect.size(), self.bg_alpha),
             )
-        pixmap = index.data(Qt.ItemDataRole.DecorationRole)
 
-        item_data = index.data(Qt.ItemDataRole.UserRole)
-        channel = item_data.channel if item_data else None
+        # Get original pixmap
+        original_pixmap = index.data(Qt.ItemDataRole.DecorationRole)
+
+        # --- CHANNEL PREVIEW LOGIC ---
+        pixmap_to_draw = original_pixmap
+
+        # Check if this is the currently hovered item and a channel is selected
+        is_hovered = id(item_data) == self._hover_index_key
+
+        if is_hovered and self._hover_channel and original_pixmap and not original_pixmap.isNull():
+            cache_key = (item_data.path, self._hover_channel)
+
+            if cache_key in self._channel_cache:
+                # Hit cache
+                pixmap_to_draw = self._channel_cache[cache_key]
+                self._channel_cache.move_to_end(cache_key)
+            else:
+                # Generate and cache
+                pixmap_to_draw = self._generate_channel_pixmap(original_pixmap, self._hover_channel)
+                self._channel_cache[cache_key] = pixmap_to_draw
+                if len(self._channel_cache) > self._CACHE_SIZE:
+                    self._channel_cache.popitem(last=False)
+
         # Key must match how model generates it
-        cache_key = f"{item_data.path}_{channel or 'full'}"
-        error_msg = self.parent().model.error_paths.get(cache_key)
+        cache_key = f"{item_data.path}_{item_data.channel or 'full'}"
+        # Access error via parent (ListView) -> model
+        error_msg = None
+        if self.parent() and hasattr(self.parent(), "model"):
+            error_msg = self.parent().model.error_paths.get(cache_key)
 
-        if pixmap and not pixmap.isNull():
-            scaled = pixmap.scaled(
+        if pixmap_to_draw and not pixmap_to_draw.isNull():
+            scaled = pixmap_to_draw.scaled(
                 thumb_rect.size(),
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            painter.drawPixmap(
-                thumb_rect.x() + (thumb_rect.width() - scaled.width()) // 2,
-                thumb_rect.y() + (thumb_rect.height() - scaled.height()) // 2,
-                scaled,
-            )
+
+            # Determine positioning to center
+            x_pos = thumb_rect.x() + (thumb_rect.width() - scaled.width()) // 2
+            y_pos = thumb_rect.y() + (thumb_rect.height() - scaled.height()) // 2
+
+            painter.drawPixmap(x_pos, y_pos, scaled)
+
+            # Draw channel indicator label if hovering
+            if is_hovered and self._hover_channel:
+                self._draw_channel_label(painter, x_pos, y_pos, self._hover_channel)
+
         elif error_msg:
             painter.save()
             painter.setPen(QColor(UIConfig.Colors.ERROR))
@@ -918,6 +983,53 @@ class ImageItemDelegate(QStyledItemDelegate):
             painter.restore()
         else:
             painter.drawText(thumb_rect, Qt.AlignmentFlag.AlignCenter, "Loading...")
+
+    def _generate_channel_pixmap(self, qpixmap: QPixmap, channel: str) -> QPixmap:
+        """
+        Extracts a channel from QPixmap and returns it as a Grayscale QPixmap.
+        Uses PIL for robust format handling.
+        """
+        try:
+            # QPixmap -> QImage
+            qimg = qpixmap.toImage()
+            # Ensure RGBA format for PIL conversion consistency
+            if qimg.format() != QImage.Format.Format_RGBA8888:
+                qimg = qimg.convertToFormat(QImage.Format.Format_RGBA8888)
+
+            # QImage -> PIL
+            pil_img = ImageQt.fromqimage(qimg)
+
+            # Split channels
+            bands = pil_img.split()
+            channel_idx = {"R": 0, "G": 1, "B": 2, "A": 3}.get(channel)
+
+            if channel_idx is not None and channel_idx < len(bands):
+                band_img = bands[channel_idx]
+                # Convert single channel (L) back to RGB so it displays as grayscale
+                gray_img = Image.merge("RGB", (band_img, band_img, band_img))
+
+                # Convert back to QPixmap
+                return QPixmap.fromImage(ImageQt.ImageQt(gray_img))
+
+            return qpixmap  # Fallback
+        except Exception as e:
+            print(f"Error generating channel preview: {e}")
+            return qpixmap
+
+    def _draw_channel_label(self, painter, x, y, channel):
+        """Draws a small colored badge indicating which channel is being shown."""
+        colors = {"R": "#FF5555", "G": "#55FF55", "B": "#55AAFF", "A": "#FFFFFF"}
+        rect = QRect(x + 5, y + 5, 20, 20)
+
+        painter.save()
+        painter.setBrush(QColor(colors.get(channel, "#CCCCCC")))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(rect, 5, 5)
+
+        painter.setPen(QColor("black"))
+        painter.setFont(self.bold_font)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, channel)
+        painter.restore()
 
     def _draw_text_info(self, painter, option, item_data: ResultNode):
         text_rect = option.rect.adjusted(self.preview_size + 15, 5, -5, -5)

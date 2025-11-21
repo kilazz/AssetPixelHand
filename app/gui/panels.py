@@ -1286,8 +1286,13 @@ class ImageViewerPanel(QGroupBox):
 
         self.delegate = ImageItemDelegate(self.settings_manager.settings.viewer.preview_size, self.state, self)
         self.list_view = ResizedListView(self)
+        self.list_view.set_preview_size(self.settings_manager.settings.viewer.preview_size)
         self.list_view.setModel(self.model)
         self.list_view.setItemDelegate(self.delegate)
+
+        # Connect the hover signal from the list view to the delegate's slot
+        self.list_view.channel_hovered.connect(self.delegate.set_hover_channel)
+
         self.list_view.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.list_view.setUniformItemSizes(True)
         self.list_view.setSpacing(5)
@@ -1520,6 +1525,7 @@ class ImageViewerPanel(QGroupBox):
         new_size = self.preview_size_slider.value()
         self.delegate.set_preview_size(new_size)
         self.model.set_target_size(new_size)
+        self.list_view.set_preview_size(new_size)
         self.settings_manager.set_preview_size(new_size)
         self.list_view.viewport().update()
 

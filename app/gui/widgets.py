@@ -2,15 +2,15 @@
 """
 Contains small, reusable custom QWidget subclasses used throughout the GUI.
 These widgets encapsulate specific functionalities like displaying images with
-transparency, comparing images, or emitting signals on resize.
+transparency, comparing images, or emitting signals on resize/hover.
 """
 
 import math
 from collections import OrderedDict
 from typing import ClassVar
 
-from PySide6.QtCore import QPoint, QRect, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
+from PySide6.QtCore import QModelIndex, QPoint, QRect, Qt, Signal
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QListView, QWidget
 
 from app.constants import CompareMode, UIConfig
@@ -206,10 +206,74 @@ class ImageCompareWidget(QWidget):
 
 
 class ResizedListView(QListView):
-    """A QListView subclass that emits a signal when it's resized."""
+    """
+    A QListView subclass that emits a signal when it's resized
+    and handles mouse hovering for channel preview.
+    """
 
     resized = Signal()
+    # Signal emits: (index, channel_char or None)
+    # channel_char: 'R', 'G', 'B', 'A', or None
+    channel_hovered = Signal(QModelIndex, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self._last_hovered_index = QModelIndex()
+        self._last_channel = None
+        self.preview_size = 250  # Default value
+
+    def set_preview_size(self, size: int):
+        """Updates the internal knowledge of thumbnail size for hit-testing."""
+        self.preview_size = size
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.resized.emit()
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        super().mouseMoveEvent(event)
+
+        index = self.indexAt(event.pos())
+
+        def clear_hover():
+            if self._last_channel is not None:
+                self._last_channel = None
+                self._last_hovered_index = QModelIndex()
+                self.channel_hovered.emit(QModelIndex(), None)
+
+        if not index.isValid():
+            clear_hover()
+            return
+
+        rect = self.visualRect(index)
+
+        # Bounds check: Ensure hover is within the specific thumbnail square
+        # Padding is 5px (top/left) based on ImageItemDelegate logic
+        thumb_rect = QRect(rect.x() + 5, rect.y() + 5, self.preview_size, self.preview_size)
+
+        if not thumb_rect.contains(event.pos()):
+            clear_hover()
+            return
+
+        # Calculate relative position within the thumbnail
+        local_pos = event.pos() - thumb_rect.topLeft()
+        rel_x = local_pos.x() / thumb_rect.width()
+        rel_y = local_pos.y() / thumb_rect.height()
+
+        # --- 2x2 Grid Logic ---
+        # Top Half: R | G, Bottom Half: B | A
+        channel = ("R" if rel_x < 0.5 else "G") if rel_y < 0.5 else ("B" if rel_x < 0.5 else "A")
+
+        # Optimization: Emit only on change
+        if index != self._last_hovered_index or channel != self._last_channel:
+            self._last_hovered_index = index
+            self._last_channel = channel
+            self.channel_hovered.emit(index, channel)
+
+    def leaveEvent(self, event):
+        # Clear hover state when mouse leaves the widget
+        if self._last_channel is not None:
+            self._last_channel = None
+            self.channel_hovered.emit(QModelIndex(), None)
+        super().leaveEvent(event)
