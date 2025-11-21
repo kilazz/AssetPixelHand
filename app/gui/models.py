@@ -949,7 +949,6 @@ class ImageItemDelegate(QStyledItemDelegate, PaintUtilsMixin):
 
         # Key must match how model generates it
         cache_key = f"{item_data.path}_{item_data.channel or 'full'}"
-        # Access error via parent (ListView) -> model
         error_msg = None
         if self.parent() and hasattr(self.parent(), "model"):
             error_msg = self.parent().model.error_paths.get(cache_key)
@@ -961,15 +960,14 @@ class ImageItemDelegate(QStyledItemDelegate, PaintUtilsMixin):
                 Qt.TransformationMode.SmoothTransformation,
             )
 
-            # Determine positioning to center
+            # Determine positioning to center image
             x_pos = thumb_rect.x() + (thumb_rect.width() - scaled.width()) // 2
             y_pos = thumb_rect.y() + (thumb_rect.height() - scaled.height()) // 2
 
             painter.drawPixmap(x_pos, y_pos, scaled)
 
-            # Draw channel indicator label if hovering
             if is_hovered and self._hover_channel:
-                self._draw_channel_label(painter, x_pos, y_pos, self._hover_channel)
+                self._draw_channel_label(painter, thumb_rect.x(), thumb_rect.y(), self._hover_channel)
 
         elif error_msg:
             painter.save()

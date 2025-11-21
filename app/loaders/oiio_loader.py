@@ -15,12 +15,11 @@ from .base_loader import BaseLoader
 if OIIO_AVAILABLE:
     import OpenImageIO as oiio
 
-    # Limit OIIO's global tile cache to 512 MB.
-    # By default, OIIO can use half of the physical RAM, which causes
-    # massive usage spikes when scanning thousands of large textures.
+    # --- RAM OPTIMIZATION ---
     try:
+        # Limit global cache to 512MB to prevent OOM on massive datasets
         oiio.attribute("max_memory_MB", 512.0)
-        oiio.attribute("autotile", 64)  # Smaller tiles = less memory fragmentation
+        oiio.attribute("autotile", 64)
     except Exception:
         pass
 
@@ -30,90 +29,76 @@ app_logger = logging.getLogger("AssetPixelHand.oiio_loader")
 class OIIOLoader(BaseLoader):
     """
     High-performance loader using OpenImageIO (OIIO).
-
-    Optimizations:
-    1. Uses `ImageInput` instead of `ImageBuf` for precise control over IO.
-    2. Implements MIP-Map seeking (`seek_subimage`) to read thumbnail-sized
-       data directly from formats like EXR, TIFF, DDS, and TX, significantly
-       reducing RAM usage and CPU time for large assets.
-    3. Performs native data type conversion (e.g., Float to UInt8) inside
-       the C++ backend of OIIO before passing data to Python.
+    Now utilizes ImageBufAlgo for high-quality, multi-threaded resizing.
     """
 
     def load(self, path: Path, tonemap_mode: str, shrink: int = 1) -> Image.Image | None:
         if not OIIO_AVAILABLE:
             return None
 
-        # Use ImageInput to open the file without reading pixels immediately
-        inp = oiio.ImageInput.open(str(path))
-        if not inp:
-            # OIIO might return None or log an error internally if opening fails
+        # 1. Create ImageBuf (Backed by ImageCache, efficient I/O)
+        buf = oiio.ImageBuf(str(path))
+        if buf.has_error:
             return None
 
         try:
-            spec = inp.spec()
+            spec = buf.spec()
 
-            # --- SMART-SHRINK LOGIC ---
-            # Use getattr for nsubimages as some OIIO python bindings
-            # do not expose it as a direct property on ImageSpec.
+            # --- SMART-SHRINK LOGIC (MIP-MAPS) ---
+            # If the file has MIP-maps, read the smallest usable subimage first.
+            # This saves massive I/O before we even start resizing.
             nsubimages = getattr(spec, "nsubimages", 1)
-
-            # If a shrink factor is requested (preview generation) and the file
-            # contains sub-images (MIP-maps), we search for the best matching level.
             if shrink > 1 and nsubimages > 1:
                 target_width = spec.width // shrink
                 best_subimage = 0
-
                 for i in range(nsubimages):
-                    mipspec = inp.spec_dimensions(i)
+                    mipspec = buf.spec_dimensions(i)
                     if mipspec.width >= target_width:
                         best_subimage = i
                     else:
                         break
 
                 if best_subimage > 0:
-                    inp.seek_subimage(best_subimage, 0)
-                    spec = inp.spec()
+                    # Force read the specific subimage
+                    buf.read(0, best_subimage)
+                    spec = buf.spec()
 
-            # --- DATA READING ---
-            is_float_source = spec.format.basetype in (oiio.FLOAT, oiio.HALF, oiio.DOUBLE)
-            is_hdr_requested = tonemap_mode == TonemapMode.ENABLED.value
+            # --- OIIO ALGO RESIZE (Aspect Ratio Preserved) ---
+            # If we still need to shrink (e.g. MIP was 1024, we need 256), use C++ resize
+            if shrink > 1:
+                # Calculate target dimension roughly based on shrink factor
+                # (Assuming user wanted approx original_size / shrink)
+                target_dim = max(spec.width // shrink, spec.height // shrink)
+                buf = self._resize_keep_aspect(buf, target_dim)
+                spec = buf.spec()
 
-            if is_float_source and is_hdr_requested:
-                # Read as FLOAT
-                data = inp.read_image(format=oiio.FLOAT)
+            # --- DATA CONVERSION ---
+            # Convert OIIO buffer to NumPy array
 
-                # Remove singleton dimensions if present (e.g. 1x1x1 -> 1x1)
-                # This helps tonemap logic dealing with shapes
-                if data.ndim == 3 and data.shape[2] == 1:
-                    data = data.squeeze(2)
+            is_float = spec.format.basetype in (oiio.FLOAT, oiio.HALF, oiio.DOUBLE)
+            is_hdr = tonemap_mode == TonemapMode.ENABLED.value
 
-                if data.ndim == 3 and data.shape[2] > 4:
-                    data = data[:, :, :4]
-
+            if is_float and is_hdr:
+                # Read as Float32 for Tonemapping
+                data = buf.get_pixels(format=oiio.FLOAT)
                 pil_image = Image.fromarray(tonemap_float_array(data))
-
             else:
-                # Read as UINT8
-                data = inp.read_image(format=oiio.UINT8)
+                # Read as UInt8 (Standard)
+                data = buf.get_pixels(format=oiio.UINT8)
 
-                # "Cannot handle this data type: (1, 1, 1), |u1"
-                # PIL expects grayscale images to be 2D (H, W), not 3D (H, W, 1).
-                if data.ndim == 3 and data.shape[2] == 1:
-                    data = data.squeeze(2)
-
-                # Handle channel configurations
-                if spec.nchannels not in (1, 3, 4):
-                    if spec.nchannels == 2:
-                        pil_image = Image.fromarray(data, mode="LA").convert("RGBA")
-                    elif spec.nchannels > 4:
-                        # Crop extra channels (Z-depth, IDs, etc.)
-                        pil_image = Image.fromarray(data[:, :, :4])
-                    else:
-                        pil_image = Image.fromarray(data)
+                # Handle Channel layouts
+                n_ch = spec.nchannels
+                if n_ch == 3:
+                    pil_image = Image.fromarray(data, "RGB")
+                elif n_ch == 4:
+                    pil_image = Image.fromarray(data, "RGBA")
+                elif n_ch == 1:
+                    # Squeeze 3D array (H, W, 1) to 2D (H, W) for PIL 'L' mode
+                    pil_image = Image.fromarray(data.squeeze(), "L")
                 else:
-                    # Standard Gray (now squeezed to 2D), RGB, or RGBA
-                    pil_image = Image.fromarray(data)
+                    # Fallback for weird channels (crop to RGB/RGBA)
+                    limit = 4 if n_ch > 4 else 3
+                    pil_image = Image.fromarray(data[:, :, :limit])
 
             return pil_image
 
@@ -121,14 +106,45 @@ class OIIOLoader(BaseLoader):
             app_logger.error(f"OIIO load failed for {path}: {e}")
             return None
         finally:
-            # Ensure resources are released immediately
-            inp.close()
+            # Critical: Release cache hold for this file
+            buf.reset()
+
+    def _resize_keep_aspect(self, src_buf: "oiio.ImageBuf", target_size: int) -> "oiio.ImageBuf":
+        """
+        Resizes an OIIO ImageBuf while preserving aspect ratio.
+        Uses high-quality 'lanczos3' filter via C++ backend.
+        """
+        spec = src_buf.spec()
+        w, h = spec.width, spec.height
+
+        # 1. Calculate Scale Factor to fit in target_size x target_size box
+        scale = min(target_size / w, target_size / h)
+
+        # Don't upscale or resize if difference is tiny
+        if scale >= 1.0:
+            return src_buf
+
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+
+        # 2. Create Destination Buffer
+        # We keep the same channel count and format (float/uint8) as source
+        dst_spec = oiio.ImageSpec(new_w, new_h, spec.nchannels, spec.format)
+        dst_buf = oiio.ImageBuf(dst_spec)
+
+        # 3. Execute C++ Resize
+        # "lanczos3" is sharp and good for downscaling.
+        # "mitchell" is smoother (less ringing).
+        oiio.ImageBufAlgo.resize(dst_buf, src_buf, filtername="lanczos3")
+
+        return dst_buf
 
     def get_metadata(self, path: Path, stat_result: Any) -> dict | None:
         if not OIIO_AVAILABLE:
             return None
 
         try:
+            # Use ImageBuf just to read header (very fast)
             buf = oiio.ImageBuf(str(path))
             if buf.has_error:
                 return None
@@ -160,7 +176,8 @@ class OIIOLoader(BaseLoader):
                 with contextlib.suppress(ValueError, TypeError):
                     capture_date = datetime.strptime(dt, "%Y:%m:%d %H:%M:%S").timestamp()
 
-            mipmap_count = getattr(buf, "nsubimages", 1)
+            # nsubimages is safer than buf.nsubimages in some python bindings
+            mipmap_count = getattr(spec, "nsubimages", 1)
 
             return {
                 "resolution": (spec.width, spec.height),
@@ -179,3 +196,7 @@ class OIIOLoader(BaseLoader):
         except Exception as e:
             app_logger.warning(f"OIIO metadata error for {path}: {e}")
             return None
+        finally:
+            # Clear cache entry for metadata reads too
+            if "buf" in locals():
+                buf.reset()
