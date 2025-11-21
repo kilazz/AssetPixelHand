@@ -17,18 +17,21 @@ from app.loaders import (
     DirectXTexLoader,
     OIIOLoader,
     PillowLoader,
-    PyVipsLoader,
 )
 
 app_logger = logging.getLogger("AssetPixelHand.image_io")
 
 # --- Loader Instantiation and Prioritization ---
+# DirectXTex is preferred for DDS as it handles modern BC compression and cubemaps best.
 DDS_LOADERS = [DirectXTexLoader(), OIIOLoader(), PillowLoader()]
-GENERAL_LOADERS = [PyVipsLoader(), OIIOLoader(), PillowLoader()]
+
+# OIIO is now the primary high-performance loader for general formats (EXR, TIF, JPG, etc.),
+# providing fast MIP-map reading and robust metadata support.
+GENERAL_LOADERS = [OIIOLoader(), PillowLoader()]
+
 ALL_LOADERS = {
     "directx": DDS_LOADERS[0],
     "oiio": OIIOLoader(),
-    "pyvips": GENERAL_LOADERS[0],
     "pillow": PillowLoader(),
 }
 
@@ -69,10 +72,10 @@ def load_image(
         try:
             pil_image = loader.load(path, tonemap_mode, shrink=shrink)
             if pil_image:
-                app_logger.debug(f"Successfully loaded '{path.name}' with {loader.__class__.__name__}.")
+                # app_logger.debug(f"Successfully loaded '{path.name}' with {loader.__class__.__name__}.")
                 return pil_image.convert("RGBA") if pil_image.mode != "RGBA" else pil_image
-        except Exception as e:
-            app_logger.debug(f"{loader.__class__.__name__} failed for '{path.name}': {e}")
+        except Exception:
+            # app_logger.debug(f"{loader.__class__.__name__} failed for '{path.name}': {e}")
             continue
 
     app_logger.error(f"All available loaders failed for '{path.name}'.")
@@ -93,18 +96,21 @@ def get_image_metadata(path: Path, precomputed_stat: Any = None) -> dict | None:
         try:
             metadata = loader.get_metadata(path, stat_result)
             if metadata:
+                # If using DirectXTex for DDS, try to enrich color space info from OIIO if possible
                 if is_dds and isinstance(loader, DirectXTexLoader):
                     try:
-                        oiio_meta = ALL_LOADERS["oiio"].get_metadata(path, stat_result)
-                        if oiio_meta and (cs := oiio_meta.get("color_space")):
-                            metadata["color_space"] = cs
+                        oiio_loader = ALL_LOADERS.get("oiio")
+                        if oiio_loader:
+                            oiio_meta = oiio_loader.get_metadata(path, stat_result)
+                            if oiio_meta and (cs := oiio_meta.get("color_space")):
+                                metadata["color_space"] = cs
                     except Exception:
                         pass
 
-                app_logger.debug(f"Got metadata for '{path.name}' with {loader.__class__.__name__}.")
+                # app_logger.debug(f"Got metadata for '{path.name}' with {loader.__class__.__name__}.")
                 return metadata
-        except Exception as e:
-            app_logger.debug(f"{loader.__class__.__name__} metadata failed for '{path.name}': {e}")
+        except Exception:
+            # app_logger.debug(f"{loader.__class__.__name__} metadata failed for '{path.name}': {e}")
             continue
 
     app_logger.error(f"All metadata methods failed for {path.name}.")

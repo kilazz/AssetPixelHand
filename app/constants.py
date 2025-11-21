@@ -57,8 +57,10 @@ CUSTOM_MODELS_CONFIG_FILE = APP_DATA_DIR / "custom_models.json"
 # Check for Deep Learning libs (Lazy check via find_spec to avoid load cost)
 DEEP_LEARNING_AVAILABLE = all(importlib.util.find_spec(pkg) for pkg in ["onnxruntime", "transformers", "torch"])
 
+# Image Engines
 OIIO_AVAILABLE = bool(importlib.util.find_spec("OpenImageIO"))
-PYVIPS_AVAILABLE = bool(importlib.util.find_spec("pyvips"))
+
+# Database & Utilities
 DUCKDB_AVAILABLE = bool(importlib.util.find_spec("duckdb"))
 LANCEDB_AVAILABLE = bool(importlib.util.find_spec("lancedb"))
 ZSTD_AVAILABLE = bool(importlib.util.find_spec("zstandard"))
@@ -79,19 +81,6 @@ except (ImportError, NameError):
     PILLOW_AVAILABLE = False
 
 # --- Library Optimizations ---
-if PYVIPS_AVAILABLE:
-    try:
-        import pyvips
-
-        # OPTIMIZATION: Prevent PyVips from spawning its own thread pool.
-        # Check if attribute exists to avoid crashes on broken/partial installs
-        if hasattr(pyvips, "concurrency_set"):
-            pyvips.concurrency_set(1)
-    except (ImportError, AttributeError, OSError):
-        # If PyVips fails to initialize (e.g. missing DLLs on Windows), disable it entirely
-        # to fall back to other loaders safely.
-        PYVIPS_AVAILABLE = False
-
 if DEEP_LEARNING_AVAILABLE:
     try:
         from transformers import logging as transformers_logging

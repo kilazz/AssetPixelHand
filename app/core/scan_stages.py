@@ -41,15 +41,6 @@ app_logger = logging.getLogger("AssetPixelHand.scan_stages")
 NodeType = TypeVar("NodeType")
 
 
-# --- Helper functions (Optimized, No Numba) ---
-def _popcount(n: int | np.integer) -> int:
-    """
-    Calculates the population count (number of set bits).
-    Uses Python 3.10+ native implementation which is extremely fast.
-    """
-    return int(n).bit_count()
-
-
 @dataclass(frozen=True)
 class EvidenceRecord:
     method: str
@@ -371,6 +362,7 @@ class PerceptualDuplicateStage(ScanStage):
         if not items_with_hashes:
             return
 
+        # Convert hashes to a numpy array of uint64 for vectorized processing
         uint64_hashes = np.array(
             [int("".join(row.astype(int).astype(str)), 2) for row in (h.hash.flatten() for _, h in items_with_hashes)],
             dtype=np.uint64,
@@ -380,6 +372,7 @@ class PerceptualDuplicateStage(ScanStage):
         band_size = 16
         buckets = [defaultdict(list) for _ in range(num_bands)]
 
+        # Bucket distribution
         for i, h in enumerate(uint64_hashes):
             for band_idx in range(num_bands):
                 key = (h >> (band_idx * band_size)) & 0xFFFF
@@ -387,38 +380,48 @@ class PerceptualDuplicateStage(ScanStage):
 
         processed_pairs = set()
 
+        # OPTIMIZED: Vectorized matching within buckets using NumPy
         for bucket_group in buckets:
-            for bucket in bucket_group.values():
-                if len(bucket) < 2:
+            for bucket_indices in bucket_group.values():
+                n = len(bucket_indices)
+                if n < 2:
                     continue
 
-                pivot_idx = bucket[0]
+                # Create a subset array for the current bucket
+                bucket_hashes = uint64_hashes[bucket_indices]
 
-                for i in range(1, len(bucket)):
-                    candidate_idx = bucket[i]
-                    pair_key = tuple(sorted((pivot_idx, candidate_idx)))
+                # Iterate over elements, comparing pivot vs rest-of-bucket in one go
+                for i in range(n - 1):
+                    pivot_val = bucket_hashes[i]
+                    pivot_real_idx = bucket_indices[i]
 
-                    if pair_key in processed_pairs:
-                        continue
-                    processed_pairs.add(pair_key)
+                    # XOR the pivot against all remaining candidates in the bucket
+                    candidates_hashes = bucket_hashes[i + 1 :]
+                    xor_results = np.bitwise_xor(candidates_hashes, pivot_val)
 
-                    # OPTIMIZED: Native Python bit_count instead of Numba
-                    val1 = uint64_hashes[pivot_idx]
-                    val2 = uint64_hashes[candidate_idx]
-                    distance = _popcount(val1 ^ val2)
+                    # Calculate Hamming distance (population count)
+                    # int.bit_count() is available in Python 3.10+ and is very fast
+                    distances = [int(x).bit_count() for x in xor_results]
 
-                    if distance <= threshold:
-                        item1 = items_with_hashes[pivot_idx][0]
-                        item2 = items_with_hashes[candidate_idx][0]
+                    for j, dist in enumerate(distances):
+                        if dist <= threshold:
+                            candidate_real_idx = bucket_indices[i + 1 + j]
 
-                        # Optimization: Use Strings for keys
-                        ch1 = item1.analysis_type if item1.analysis_type != "Composite" else None
-                        ch2 = item2.analysis_type if item2.analysis_type != "Composite" else None
+                            pair_key = tuple(sorted((pivot_real_idx, candidate_real_idx)))
+                            if pair_key in processed_pairs:
+                                continue
+                            processed_pairs.add(pair_key)
 
-                        node1 = (str(item1.path), ch1)
-                        node2 = (str(item2.path), ch2)
+                            item1 = items_with_hashes[pivot_real_idx][0]
+                            item2 = items_with_hashes[candidate_real_idx][0]
 
-                        context.cluster_manager.add_evidence(node1, node2, method.value, 0.0)
+                            ch1 = item1.analysis_type if item1.analysis_type != "Composite" else None
+                            ch2 = item2.analysis_type if item2.analysis_type != "Composite" else None
+
+                            node1 = (str(item1.path), ch1)
+                            node2 = (str(item2.path), ch2)
+
+                            context.cluster_manager.add_evidence(node1, node2, method.value, 0.0)
 
 
 class FingerprintGenerationStage(ScanStage):

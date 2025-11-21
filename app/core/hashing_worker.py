@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 try:
     import imagehash
-    from PIL import Image
+    from PIL import Image, ImageStat
 
     IMAGEHASH_AVAILABLE = True
 except ImportError:
@@ -95,9 +95,16 @@ def worker_calculate_perceptual_hashes(item: "AnalysisItem", ignore_solid_channe
 
                 if ignore_solid_channels:
                     min_val, max_val = channel_to_check.getextrema()
-                    # Check if channel is completely black (0) or white (255)
-                    if min_val == max_val and (min_val == 0 or min_val == 255):
-                        return None  # Skip this solid channel
+
+                    # 1. Fast Bounds Check
+                    if max_val < 5 or min_val > 250:
+                        return None
+
+                    # 2. Robust Average Check
+                    stat = ImageStat.Stat(channel_to_check)
+                    mean_val = stat.mean[0]
+                    if mean_val < 5 or mean_val > 250:
+                        return None
 
                 image_for_hashing = channel_to_check
             else:

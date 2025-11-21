@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import onnxruntime as ort
-from PIL import Image
+from PIL import Image, ImageStat
 
 # Attempt to pre-load libraries to avoid import lock contention in threads
 try:
@@ -195,8 +195,6 @@ class ModelManager:
 
 
 # --- Helper Functions (API) ---
-
-
 def cleanup_worker():
     """Forces cleanup of global models."""
     ModelManager.instance().release_resources()
@@ -271,9 +269,18 @@ def _read_and_process_batch_for_ai(
                     channel_img = channels[idx]
                     if ignore_solid_channels:
                         min_val, max_val = channel_img.getextrema()
-                        # Skip if channel is purely black (0) or white (255)
-                        if min_val == max_val and (min_val == 0 or min_val == 255):
+
+                        # Check 1: Fast absolute bounds check
+                        if max_val < 5 or min_val > 250:
                             continue
+
+                        # Check 2: Robust average check (handles 99% solid with some noise/artifacts)
+                        # This catches cases where min_val is 0 but the image is 99.9% white.
+                        stat = ImageStat.Stat(channel_img)
+                        mean_val = stat.mean[0]
+                        if mean_val < 5 or mean_val > 250:
+                            continue
+
                     # Reconstruct as RGB for the model (R,R,R)
                     processed_image = Image.merge("RGB", (channel_img, channel_img, channel_img))
                     channel_name = analysis_type

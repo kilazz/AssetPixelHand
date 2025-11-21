@@ -91,9 +91,8 @@ def check_library_imports() -> bool:
         },
         "Image Hashing": {"PIL": "Pillow", "imagehash": "ImageHash", "xxhash": "xxhash"},
         "Scientific and Math": {"scipy": "scipy"},
-        "Advanced Image I/O (Optional but Recommended)": {
+        "Advanced Image I/O": {
             "OpenImageIO": "OpenImageIO",
-            "pyvips": "pyvips",
             "simple_ocio": "simple-ocio",
         },
         "Performance (Optional)": {"zstandard": "zstandard"},

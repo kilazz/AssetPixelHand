@@ -24,10 +24,10 @@
 *   **GUI**: PySide6
 *   **AI Core**: PyTorch, Transformers, ONNX Runtime
 *   **Databases**: LanceDB, DuckDB, Polars
-*   **Image Processing**: PyVips, OpenImageIO, Pillow, DirectXTex
+*   **Image Processing**: OpenImageIO, Pillow, DirectXTex
 
 ## Requirements
-*   Python >= 3.13
+*   Python 3.13
 
 ## Quick Start
 1.  Clone the repository.
