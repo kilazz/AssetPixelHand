@@ -22,7 +22,7 @@
 ## Tech Stack
 *   **GUI**: PySide6
 *   **AI Core**: PyTorch, Transformers, ONNXRuntime
-*   **Databases**: DuckDB
+*   **Databases**: LanceDB
 *   **Image Processing**: OpenImageIO, Pillow, DirectXTex
 
 ## Requirements

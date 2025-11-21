@@ -8,7 +8,7 @@ Includes logic for automatic cache cleanup on model change.
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThreadPool, Slot
+from PySide6.QtCore import QModelIndex, Qt, QThreadPool, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -214,8 +214,22 @@ class App(QMainWindow):
         self.results_panel.results_view.selectionModel().selectionChanged.connect(self._on_results_selection_changed)
         self.results_panel.visible_results_changed.connect(self.viewer_panel.display_results)
 
+        self.results_panel.results_model.fetch_completed.connect(self._on_group_fetch_finished)
+
         self.viewer_panel.group_became_empty.connect(self.results_panel.results_model.remove_group_by_id)
         self.viewer_panel.group_became_empty.connect(self.results_panel._update_summary)
+
+        # --- Connection for Auto-Removal of Missing Files ---
+        self.viewer_panel.file_missing_detected.connect(self._on_external_file_missing)
+
+    @Slot(Path)
+    def _on_external_file_missing(self, path: Path):
+        """Handles cases where a file is deleted externally (manually)."""
+        # 1. Update database (remove missing vector)
+        self.results_panel.remove_items_from_results_db([path])
+        # 2. Update UI (remove row from model)
+        self.results_panel.update_after_deletion([path])
+        app_logger.info(f"Detected external deletion: {path.name}. Removed from list.")
 
     @Slot()
     def _on_results_selection_changed(self):
@@ -224,8 +238,7 @@ class App(QMainWindow):
             return
 
         results_model = self.results_panel.results_model
-        if not results_model.db_path:
-            return
+        # Note: We no longer check for db_path here, as data is in memory.
 
         source_index = self.results_panel.proxy_model.mapToSource(proxy_indexes[0])
         if not source_index.isValid():
@@ -235,10 +248,30 @@ class App(QMainWindow):
         if not node:
             return
 
-        if results_model.mode == ScanMode.DUPLICATES:
-            group_id = node.group_id
-            scroll_to_path = Path(node.path) if isinstance(node, ResultNode) else None
-            self.viewer_panel.show_image_group(results_model.db_path, group_id, scroll_to_path)
+        # Handle lazy loading on click
+        if isinstance(node, GroupNode) and not node.fetched:
+            results_model.fetchMore(source_index)
+            return
+
+        group_id = node.group_id
+        scroll_to_path = Path(node.path) if isinstance(node, ResultNode) else None
+
+        items = results_model.get_group_children(group_id)
+        self.viewer_panel.show_image_group(items, group_id, scroll_to_path)
+
+    @Slot(QModelIndex)
+    def _on_group_fetch_finished(self, index: QModelIndex):
+        """Called when a group finishes lazy loading from DB."""
+        # Check if the currently selected item is the one that just finished loading
+        proxy_indexes = self.results_panel.results_view.selectionModel().selectedRows()
+        if not proxy_indexes:
+            return
+
+        current_source_index = self.results_panel.proxy_model.mapToSource(proxy_indexes[0])
+
+        # If the fetched group corresponds to the current selection, update the view
+        if current_source_index == index:
+            self._on_results_selection_changed()
 
     def _log_system_status(self):
         app_logger.info("Application ready. System capabilities are displayed in the status panel.")
@@ -258,7 +291,8 @@ class App(QMainWindow):
         # 2. Check if changed -> Clear Cache
         if last_used_model and last_used_model != current_model:
             APP_SIGNAL_BUS.log_message.emit(
-                f"Model changed from '{last_used_model}' to '{current_model}'. Auto-clearing cache...", "warning"
+                f"Model changed from '{last_used_model}' to '{current_model}'. Auto-clearing cache...",
+                "warning",
             )
             thumbnail_cache.close()
             clear_scan_cache()
@@ -341,14 +375,14 @@ class App(QMainWindow):
 
         time_str = f"{int(duration // 60)}m {int(duration % 60)}s" if duration > 0 else "less than a second"
         data_to_display = payload if isinstance(payload, dict) else {}
-        db_path = data_to_display.get("db_path")
         groups_data = data_to_display.get("groups_data")
 
         log_msg = f"Finished! Found {num_found} {'similar items' if mode == ScanMode.DUPLICATES else 'results'} in {time_str}."
         APP_SIGNAL_BUS.log_message.emit(log_msg, "success")
         app_logger.info(log_msg)
 
-        self.results_panel.display_results(db_path, num_found, mode)
+        # Pass the full dictionary payload to display_results
+        self.results_panel.display_results(data_to_display, num_found, mode)
 
         if num_found > 0 and mode == ScanMode.DUPLICATES:
             scan_config = self.controller.config
@@ -470,7 +504,8 @@ class App(QMainWindow):
 
     def _clear_app_data(self):
         if self._confirm_action(
-            "Clear All App Data", "Delete ALL app data (caches, logs, settings, models)? This cannot be undone."
+            "Clear All App Data",
+            "Delete ALL app data (caches, logs, settings, models)? This cannot be undone.",
         ):
             thumbnail_cache.close()
             logging.shutdown()

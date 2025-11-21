@@ -1,154 +1,158 @@
 # app/core/engines.py
 """
-Contains the core processing engines for similarity search using DuckDB.
+Contains the core processing engines for similarity search.
+LanceDBSimilarityEngine is used for scalable on-disk search using IVF-PQ indices.
 """
 
 import gc
 import logging
 import threading
+from typing import TYPE_CHECKING
 
-import numpy as np
 from PySide6.QtCore import QObject
 
-from app.constants import DUCKDB_AVAILABLE
+from app.constants import DEFAULT_SEARCH_PRECISION, LANCEDB_AVAILABLE, SEARCH_PRECISION_PRESETS
 from app.data_models import ScanConfig, ScanState
 from app.services.signal_bus import SignalBus
 
-if DUCKDB_AVAILABLE:
-    import duckdb
+if LANCEDB_AVAILABLE:
+    import lancedb
+
+if TYPE_CHECKING:
+    pass
+
 
 app_logger = logging.getLogger("AssetPixelHand.engines")
 
+if LANCEDB_AVAILABLE:
 
-class DuckDBSimilarityEngine(QObject):
-    """
-    Uses DuckDB + NumPy to perform brute-force similarity search.
-    It loads all vectors from DuckDB into RAM (numpy array) and performs matrix multiplication.
-    This is very fast for < 1M images on modern CPUs.
-    """
+    class LanceDBSimilarityEngine(QObject):
+        """
+        Manages all-to-all similarity search on LanceDB using IVF-PQ indices.
+        This implementation is memory-safe and iterates through the DB instead of loading it all.
+        """
 
-    def __init__(
-        self,
-        config: ScanConfig,
-        state: ScanState,
-        signals: SignalBus,
-        db_connection: "duckdb.DuckDBPyConnection",
-        table_name: str,
-    ):
-        super().__init__()
-        self.config = config
-        self.state = state
-        self.signals = signals
-        self.conn = db_connection
-        self.table_name = table_name
-        self.dist_threshold = 1.0 - (self.config.similarity_threshold / 100.0)
+        def __init__(
+            self,
+            config: ScanConfig,
+            state: ScanState,
+            signals: SignalBus,
+            lancedb_table: "lancedb.table.Table",
+        ):
+            super().__init__()
+            self.config = config
+            self.state = state
+            self.signals = signals
+            self.table = lancedb_table
+            # Cosine Distance Threshold: (1.0 - similarity)
+            self.dist_threshold = 1.0 - (self.config.similarity_threshold / 100.0)
 
-    def find_similar_pairs(self, stop_event: threading.Event) -> list[tuple[str, str, str, str, float]]:
-        # 1. Count Rows
-        try:
-            count_res = self.conn.execute(f"SELECT COUNT(*) FROM {self.table_name}").fetchone()
-            num_rows = count_res[0] if count_res else 0
-        except duckdb.Error:
-            num_rows = 0
+        def find_similar_pairs(self, stop_event: threading.Event) -> list[tuple[str, str, str, str, float]]:
+            """
+            Performs an Approximate Nearest Neighbor (ANN) search for every item in the DB.
+            Uses the IVF-PQ index to avoid loading the full dataset into RAM.
+            """
+            try:
+                num_rows = self.table.to_lance().count_rows()
+            except Exception:
+                num_rows = 0
 
-        if num_rows == 0:
-            return []
-
-        self.state.update_progress(0, num_rows, "Linking images (Vectorized F32)...")
-        self.signals.log_message.emit(f"Linking {num_rows} items...", "info")
-
-        found_links = []
-
-        try:
-            # 1. Load Data from DuckDB to NumPy via Arrow
-            # Query returns: vector (list of floats), path, channel
-            query = f"SELECT vector, path, channel FROM {self.table_name}"
-            arrow_table = self.conn.execute(query).fetch_arrow_table()
-
-            # Convert vector list column to numpy 2D array
-            # FIX: .combine_chunks() is required because arrow_table["vector"] is a ChunkedArray
-            vectors_flat = arrow_table["vector"].combine_chunks().values.to_numpy()
-
-            dim = self.config.model_dim
-
-            # Integrity check
-            if len(vectors_flat) != num_rows * dim:
-                app_logger.error(f"Vector data size mismatch. Expected {num_rows * dim}, got {len(vectors_flat)}.")
+            if num_rows == 0:
                 return []
 
-            X = vectors_flat.reshape(num_rows, dim)
+            self.state.update_progress(0, num_rows, "Linking images (IVF-PQ Search)...")
+            self.signals.log_message.emit(f"Searching {num_rows} items using LanceDB Index...", "info")
 
-            # Arrow column to python list
-            paths = arrow_table["path"].to_pylist()
-            channels_list = arrow_table["channel"].to_pylist()
+            found_pairs_set = set()  # Stores tuple(sorted((id1, id2))) to avoid duplicates
+            found_links = []
 
-            # Normalize vectors (L2) to use Dot Product as Cosine Similarity
-            norms = np.linalg.norm(X, axis=1, keepdims=True)
-            norms[norms == 0] = 1.0
-            X = (X / norms).astype(np.float32)
+            # Determine search precision parameters
+            precision_config = SEARCH_PRECISION_PRESETS.get(
+                self.config.search_precision, SEARCH_PRECISION_PRESETS[DEFAULT_SEARCH_PRECISION]
+            )
+            nprobes = precision_config["nprobes"]
+            refine_factor = precision_config["refine_factor"]
 
-            # 2. Batched Matrix Multiplication (Block-wise)
-            BATCH_SIZE = 2048
-            TOP_K = 50
-            sim_threshold = 1.0 - self.dist_threshold
+            # Limit neighbours per item. For duplicates, we rarely need > 50 matches per file.
+            k_neighbors = 50
 
-            for i in range(0, num_rows, BATCH_SIZE):
-                if stop_event.is_set():
-                    return []
+            try:
+                processed_count = 0
 
-                end = min(i + BATCH_SIZE, num_rows)
+                # Stream the database row by row (or batch by batch) to be memory safe
+                # We only need 'id', 'vector', 'path', 'channel' for the query context
+                stream = self.table.to_lance().to_batches(columns=["id", "vector", "path", "channel"], batch_size=1024)
 
-                # Dot Product: (Batch, Dim) @ (Dim, All) -> (Batch, All)
-                sim_batch = np.dot(X[i:end], X.T)
+                for batch in stream:
+                    if stop_event.is_set():
+                        return []
 
-                # 3. Masking (Self-matches and Lower Triangle to avoid duplicates A-B, B-A)
-                # Create row indices for the batch broadcasted
-                rows_idx = np.arange(i, end)[:, None]
-                # Create col indices broadcasted
-                cols_idx = np.arange(num_rows)[None, :]
+                    # Convert Arrow batch to Python list of dicts for easier iteration
+                    batch_rows = batch.to_pylist()
 
-                # Keep only where col > row (Upper Triangle)
-                mask = cols_idx > rows_idx
-                sim_batch[~mask] = 0
+                    for row in batch_rows:
+                        if stop_event.is_set():
+                            return []
 
-                # 4. Thresholding
-                sim_batch[sim_batch < sim_threshold] = 0
+                        query_vec = row["vector"]
+                        query_id = row["id"]
+                        query_path = row["path"]
+                        query_channel = row["channel"] or "RGB"
 
-                # 5. Top-K Filtering (Optional optimization)
-                if num_rows > TOP_K:
-                    pass
+                        # Perform ANN Search for this specific vector against the whole DB
+                        # This leverages the IVF-PQ index on disk.
+                        results = (
+                            self.table.search(query_vec)
+                            .metric("cosine")
+                            .limit(k_neighbors)
+                            .nprobes(nprobes)
+                            .refine_factor(refine_factor)
+                            .to_list()
+                        )
 
-                # 6. Extraction
-                local_rows, match_cols = np.nonzero(sim_batch)
+                        for match in results:
+                            match_dist = match["_distance"]
 
-                if len(local_rows) > 0:
-                    scores = sim_batch[local_rows, match_cols]
+                            # Filter by threshold
+                            if match_dist > self.dist_threshold:
+                                continue
 
-                    # Map local batch rows back to global list indices
-                    global_rows = local_rows + i
+                            match_id = match["id"]
 
-                    batch_results = []
-                    for g_r, m_c, sc in zip(global_rows, match_cols, scores, strict=True):
-                        p1 = paths[g_r]
-                        c1 = channels_list[g_r] or "RGB"
-                        p2 = paths[m_c]
-                        c2 = channels_list[m_c] or "RGB"
+                            # Skip self-match (distance is approx 0.0)
+                            if query_id == match_id:
+                                continue
 
-                        # Distance = 1.0 - Similarity
-                        dist = max(0.0, 1.0 - float(sc))
-                        batch_results.append((p1, c1, p2, c2, dist))
+                            # Deduplicate pairs (A-B is same as B-A)
+                            # Create a sorted signature for the pair
+                            pair_sig = tuple(sorted((query_id, match_id)))
 
-                    found_links.extend(batch_results)
+                            if pair_sig in found_pairs_set:
+                                continue
 
-                self.state.update_progress(min(end, num_rows), num_rows)
+                            found_pairs_set.add(pair_sig)
 
-                del sim_batch
-                if i % 8192 == 0:
-                    gc.collect()
+                            # Extract match details
+                            match_path = match["path"]
+                            match_channel = match["channel"] or "RGB"
 
-            self.signals.log_message.emit(f"Linking complete. Found {len(found_links)} pairs.", "success")
-            return found_links
+                            found_links.append((query_path, query_channel, match_path, match_channel, match_dist))
 
-        except Exception as e:
-            app_logger.error(f"Vectorized search failed: {e}", exc_info=True)
-            return []
+                        processed_count += 1
+
+                    # Update UI progress
+                    self.state.update_progress(processed_count, num_rows)
+
+                    # Periodic GC to prevent memory creep during long loops
+                    if processed_count % 5000 == 0:
+                        gc.collect()
+
+                self.signals.log_message.emit(
+                    f"Linking complete. Found {len(found_links)} pairs via Index Search.", "success"
+                )
+                return found_links
+
+            except Exception as e:
+                app_logger.error(f"LanceDB IVF-PQ search failed: {e}", exc_info=True)
+                self.signals.log_message.emit(f"Search failed: {e}", "error")
+                return []

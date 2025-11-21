@@ -64,7 +64,11 @@ def check_permissions() -> bool:
             test_file.unlink()
             print_status(f"Write access to '{dir_path.relative_to(APP_DATA_DIR.parent)}'", True)
         except (OSError, PermissionError) as e:
-            print_status(f"Write access to '{dir_path.relative_to(APP_DATA_DIR.parent)}'", False, f"Error: {e}")
+            print_status(
+                f"Write access to '{dir_path.relative_to(APP_DATA_DIR.parent)}'",
+                False,
+                f"Error: {e}",
+            )
             all_ok = False
     if not all_ok:
         print("Error: The application cannot write to its data directories. Please check folder permissions.")
@@ -75,7 +79,10 @@ def check_library_imports() -> bool:
     """Checks if all critical and optional libraries can be imported."""
     print_header("3. Library Import Check")
     libraries = {
-        "Core GUI and System": {"PySide6.QtCore": "PySide6", "send2trash": "send2trash"},
+        "Core GUI and System": {
+            "PySide6.QtCore": "PySide6",
+            "send2trash": "send2trash",
+        },
         "AI and Deep Learning": {
             "torch": "torch",
             "transformers": "transformers",
@@ -84,14 +91,19 @@ def check_library_imports() -> bool:
         },
         "Data Handling and Vector DB": {
             "numpy": "numpy",
-            "duckdb": "duckdb",
+            "lancedb": "lancedb",
             "pyarrow": "pyarrow",
         },
-        "Image Hashing": {"PIL": "Pillow", "imagehash": "ImageHash", "xxhash": "xxhash"},
+        "Image Hashing": {
+            "PIL": "Pillow",
+            "imagehash": "ImageHash",
+            "xxhash": "xxhash",
+        },
         "Advanced Image I/O": {
             "OpenImageIO": "OpenImageIO",
             "simple_ocio": "simple-ocio",
         },
+        # Removed Performance/Zstandard check as it is an internal dependency of LanceDB
     }
 
     overall_ok = True
@@ -140,7 +152,8 @@ def check_onnx_backend() -> bool:
         }
 
         found_gpu_provider = next(
-            (provider for provider in available_providers if provider in known_gpu_providers), None
+            (provider for provider in available_providers if provider in known_gpu_providers),
+            None,
         )
 
         if found_gpu_provider:
@@ -154,7 +167,11 @@ def check_onnx_backend() -> bool:
         print_status("ONNX Runtime is not installed.", False)
         return False
     except Exception as e:
-        print_status("An unexpected error occurred while checking ONNX backend.", False, f"Error: {e}")
+        print_status(
+            "An unexpected error occurred while checking ONNX backend.",
+            False,
+            f"Error: {e}",
+        )
         return False
 
 

@@ -66,6 +66,12 @@ def load_image(
         app_logger.error(f"Invalid path provided to load_image: {path_or_buffer}")
         return None
 
+    # Check if file exists before trying loaders to avoid error spam
+    if not path.exists() or not path.is_file():
+        # Fail silently or with a debug log, as this often happens during deletion
+        # app_logger.debug(f"File not found: {path}")
+        return None
+
     loaders_to_try = DDS_LOADERS if path.suffix.lower() == ".dds" else GENERAL_LOADERS
 
     for loader in loaders_to_try:
@@ -85,8 +91,9 @@ def load_image(
 def get_image_metadata(path: Path, precomputed_stat: Any = None) -> dict | None:
     """Extracts image metadata using a cascade of loaders, with special enrichment for DDS."""
     try:
+        # If the file is gone (deleted), stat() will fail with FileNotFoundError
         stat_result = precomputed_stat or path.stat()
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError):
         return None
 
     is_dds = path.suffix.lower() == ".dds"

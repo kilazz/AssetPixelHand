@@ -35,7 +35,7 @@ class FileFinder:
         folder_path: Path,
         excluded: list[str],
         extensions: list[str],
-        signals: SignalBus,  # Type hint the actual object
+        signals: SignalBus,
     ):
         self.state = state
         self.folder_path = folder_path
@@ -96,7 +96,10 @@ class FileFinder:
                         self.signals.log_message.emit(f"Skipping unreadable entry '{entry.name}': {e}", "warning")
 
         except (OSError, PermissionError) as e:
-            self.signals.log_message.emit(f"Could not scan directory, skipping: {current_path}. Error: {e}", "warning")
+            self.signals.log_message.emit(
+                f"Could not scan directory, skipping: {current_path}. Error: {e}",
+                "warning",
+            )
             app_logger.warning(f"Could not scan directory {current_path}: {e}")
 
 
@@ -142,7 +145,10 @@ class VisualizationTask(QRunnable):
 
             self.signals.progress.emit(f"Processing group {i + 1}...", i + 1, total_groups_to_process)
 
-            all_fps = [orig_fp] + [fp for fp, _, _ in dups]
+            # Sort duplicates by score (descending)
+            sorted_dups = sorted(list(dups), key=lambda x: x[1], reverse=True)
+            all_fps = [orig_fp] + [fp for fp, _, _ in sorted_dups]
+
             to_visualize = all_fps[:MAX_IMGS]
 
             for page in range(math.ceil(len(to_visualize) / IMGS_PER_FILE)):
@@ -169,39 +175,97 @@ class VisualizationTask(QRunnable):
                         if not img:
                             raise ValueError("Image failed to load")
 
+                        # --- Extract Specific Channel if applicable ---
+                        if fp.channel:
+                            # Ensure RGBA to handle Alpha correctly
+                            if img.mode != "RGBA":
+                                img = img.convert("RGBA")
+
+                            try:
+                                # Extract the single channel (returns 'L' mode - Grayscale)
+                                channel_img = img.getchannel(fp.channel)
+                                # Convert back to RGB so it can be pasted on the colored canvas
+                                img = channel_img.convert("RGB")
+                            except ValueError:
+                                # Fallback if channel doesn't exist (e.g. Alpha in RGB)
+                                pass
+
                         img.thumbnail((THUMB, THUMB), Image.Resampling.LANCZOS)
-                        canvas.paste(img, (x + (THUMB - img.width) // 2, y + (THUMB - img.height) // 2))
+                        canvas.paste(
+                            img,
+                            (
+                                x + (THUMB - img.width) // 2,
+                                y + (THUMB - img.height) // 2,
+                            ),
+                        )
 
                         dist_str = "[BEST]"
                         if fp != orig_fp:
-                            dup_info = next(d for d in dups if d[0] == fp)
-                            score, method = dup_info[1], dup_info[2]
-                            dist_str = (
-                                "Exact Match"
-                                if method == "xxHash"
-                                else "Near-Identical"
-                                if method == "pHash"
-                                else f"Similarity: {score}%"
-                            )
+                            dup_info = next((d for d in dups if d[0] == fp), None)
+                            if dup_info:
+                                score, method = dup_info[1], dup_info[2]
+                                dist_str = (
+                                    "Exact Match"
+                                    if method == "xxHash"
+                                    else "Near-Identical"
+                                    if method == "pHash"
+                                    else f"Similarity: {score}%"
+                                )
 
                         path_str = self._wrap_path(str(fp.path), THUMB, font)
                         meta_str = f"{fp.resolution[0]}x{fp.resolution[1]} | {dist_str}"
 
                         text_y = y + THUMB + 8
-                        draw.text((x, text_y), fp.path.name, font=font_bold, fill=(220, 220, 220))
+
+                        # Display Channel Name & Color Code
+                        display_name = fp.path.name
+                        text_color = (220, 220, 220)  # Default Gray
+
+                        if fp.channel:
+                            display_name += f" ({fp.channel})"
+                            if fp.channel == "R":
+                                text_color = (255, 100, 100)
+                            elif fp.channel == "G":
+                                text_color = (100, 255, 100)
+                            elif fp.channel == "B":
+                                text_color = (100, 200, 255)
+                            elif fp.channel == "A":
+                                text_color = (255, 255, 255)
+
+                        draw.text(
+                            (x, text_y),
+                            display_name,
+                            font=font_bold,
+                            fill=text_color,
+                        )
                         path_y = text_y + 20
-                        draw.multiline_text((x, path_y), path_str, font=font, fill=(180, 180, 180), spacing=5)
+                        draw.multiline_text(
+                            (x, path_y),
+                            path_str,
+                            font=font,
+                            fill=(180, 180, 180),
+                            spacing=5,
+                        )
                         meta_y = path_y + draw.multiline_textbbox((0, 0), path_str, font=font, spacing=5)[3] + 5
                         draw.text((x, meta_y), meta_str, font=font, fill=(220, 220, 220))
 
                     except Exception:
                         draw.rectangle([(x, y), (x + THUMB, y + THUMB)], fill=(60, 60, 60))
-                        draw.text((x + 10, y + 10), "Error Loading", font=font, fill=(255, 100, 100))
+                        draw.text(
+                            (x + 10, y + 10),
+                            "Error Loading",
+                            font=font,
+                            fill=(255, 100, 100),
+                        )
 
                 footer = f"Showing images {page * IMGS_PER_FILE + 1}-{page * IMGS_PER_FILE + len(page_fps)} of {len(to_visualize)}"
                 if len(all_fps) > MAX_IMGS:
                     footer += f" (from a total of {len(all_fps)} in group)"
-                draw.line([(0, height - 40), (width, height - 40)], fill=(80, 80, 80), width=1)
+                draw.line(
+                    [(0, height - 40), (width, height - 40)],
+                    fill=(80, 80, 80),
+                    width=1,
+                )
                 draw.text((PADDING, height - 30), footer, font=font, fill=(180, 180, 180))
 
                 filename = (

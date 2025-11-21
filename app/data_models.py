@@ -7,13 +7,13 @@ consistency and avoids circular import dependencies.
 
 import json
 import threading
+import uuid
 from dataclasses import dataclass, field, fields
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
-import pyarrow as pa
 
 from app.constants import (
     ALL_SUPPORTED_EXTENSIONS,
@@ -36,24 +36,30 @@ class AnalysisItem:
     analysis_type: AnalysisType
 
 
-# A centralized source of truth for all fingerprint-related fields.
-FINGERPRINT_FIELDS = {
-    "path": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
-    "resolution_w": {"pyarrow": pa.int32(), "duckdb": "INTEGER"},
-    "resolution_h": {"pyarrow": pa.int32(), "duckdb": "INTEGER"},
-    "file_size": {"pyarrow": pa.int64(), "duckdb": "UBIGINT"},
-    "mtime": {"pyarrow": pa.float64(), "duckdb": "DOUBLE"},
-    "capture_date": {"pyarrow": pa.float64(), "duckdb": "DOUBLE"},
-    "format_str": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
-    "compression_format": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
-    "format_details": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
-    "has_alpha": {"pyarrow": pa.bool_(), "duckdb": "BOOLEAN"},
-    "bit_depth": {"pyarrow": pa.int32(), "duckdb": "INTEGER"},
-    "mipmap_count": {"pyarrow": pa.int32(), "duckdb": "INTEGER"},
-    "texture_type": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
-    "color_space": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
-    "channel": {"pyarrow": pa.string(), "duckdb": "VARCHAR"},
-}
+def get_fingerprint_fields_schema() -> dict:
+    """Returns the schema dictionary, loading pyarrow on demand."""
+    import pyarrow as pa
+
+    return {
+        "path": {"pyarrow": pa.string()},
+        "resolution_w": {"pyarrow": pa.int32()},
+        "resolution_h": {"pyarrow": pa.int32()},
+        "file_size": {"pyarrow": pa.int64()},
+        "mtime": {"pyarrow": pa.float64()},
+        "capture_date": {"pyarrow": pa.float64()},
+        "format_str": {"pyarrow": pa.string()},
+        "compression_format": {"pyarrow": pa.string()},
+        "format_details": {"pyarrow": pa.string()},
+        "has_alpha": {"pyarrow": pa.bool_()},
+        "bit_depth": {"pyarrow": pa.int32()},
+        "mipmap_count": {"pyarrow": pa.int32()},
+        "texture_type": {"pyarrow": pa.string()},
+        "color_space": {"pyarrow": pa.string()},
+        "channel": {"pyarrow": pa.string()},
+    }
+
+
+FINGERPRINT_FIELDS = get_fingerprint_fields_schema()
 
 
 class EvidenceMethod(Enum):
@@ -113,30 +119,60 @@ class ImageFingerprint:
             return self.path == other.path and self.channel == other.channel
         return NotImplemented
 
+    def to_lancedb_dict(self, channel: str | None = None) -> dict[str, Any]:
+        """Converts the object to a dictionary suitable for writing to LanceDB."""
+        final_channel = channel or self.channel
+
+        # Ensure vector is a flat list for LanceDB
+        vector_list = self.hashes.tolist() if isinstance(self.hashes, np.ndarray) else self.hashes
+
+        data = {
+            "id": str(uuid.uuid5(uuid.NAMESPACE_URL, str(self.path) + (final_channel or ""))),
+            "vector": vector_list,
+            "path": str(self.path),
+            "resolution_w": int(self.resolution[0]),
+            "resolution_h": int(self.resolution[1]),
+            "file_size": int(self.file_size),
+            "mtime": float(self.mtime),
+            "capture_date": float(self.capture_date) if self.capture_date is not None else None,
+            "format_str": str(self.format_str),
+            "compression_format": str(self.compression_format),
+            "format_details": str(self.format_details),
+            "has_alpha": bool(self.has_alpha),
+            "bit_depth": int(self.bit_depth),
+            "mipmap_count": int(self.mipmap_count),
+            "texture_type": str(self.texture_type),
+            "color_space": str(self.color_space) if self.color_space is not None else None,
+            "channel": final_channel,
+        }
+        return data
+
     @classmethod
     def from_db_row(cls, row: dict) -> "ImageFingerprint":
         """Factory method to create an ImageFingerprint from a final results database row."""
         vector_data = row.get("vector")
         hashes = np.array(vector_data) if vector_data is not None else np.array([])
-
         fp = cls(
             path=Path(row["path"]),
             hashes=hashes,
             resolution=(row["resolution_w"], row["resolution_h"]),
             file_size=row["file_size"],
             mtime=row["mtime"],
-            capture_date=row["capture_date"],
+            capture_date=row.get("capture_date"),
             format_str=row["format_str"],
-            compression_format=row.get("compression_format", row["format_str"]),
+            compression_format=row.get("compression_format", row.get("format_str")),
             format_details=row["format_details"],
             has_alpha=bool(row["has_alpha"]),
             bit_depth=row.get("bit_depth", 8),
             mipmap_count=row.get("mipmap_count", 1),
             texture_type=row.get("texture_type", "2D"),
             color_space=row.get("color_space", "sRGB"),
+            xxhash=row.get("xxhash"),
+            dhash=row.get("dhash"),
+            phash=row.get("phash"),
+            whash=row.get("whash"),
+            channel=row.get("channel"),
         )
-        if "channel" in row:
-            fp.channel = row["channel"]
         return fp
 
 
@@ -147,7 +183,7 @@ DuplicateResults = dict[ImageFingerprint, Any]
 SearchResult = list[tuple[ImageFingerprint, float]]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ResultNode:
     path: str
     is_best: bool
@@ -173,7 +209,10 @@ class ResultNode:
     @classmethod
     def from_dict(cls, data: dict) -> "ResultNode":
         class_fields = {f.name for f in fields(cls)}
+        # Filter data to prevent TypeError when slots=True (no __dict__)
         filtered_data = {k: v for k, v in data.items() if k in class_fields}
+
+        # Set defaults for missing fields
         if "compression_format" not in filtered_data:
             filtered_data["compression_format"] = filtered_data.get("format_str", "Unknown")
         if "mipmap_count" not in filtered_data:
@@ -182,10 +221,11 @@ class ResultNode:
             filtered_data["texture_type"] = "2D"
         if "color_space" not in filtered_data:
             filtered_data["color_space"] = "sRGB"
+
         return cls(**filtered_data)
 
 
-@dataclass
+@dataclass(slots=True)
 class GroupNode:
     name: str
     count: int
@@ -236,7 +276,6 @@ class ScanConfig:
 
     # --- All fields WITH a default value MUST come after ---
     ignore_solid_channels: bool = True
-    ai_ignore_alpha: bool = True
 
     # Selected Channels (R, G, B, A)
     active_channels: list[str] = field(default_factory=lambda: ["R", "G", "B", "A"])
@@ -261,7 +300,6 @@ class HashingSettings:
     compare_by_channel: bool = False
     channel_split_tags: str = ""
     ignore_solid_channels: bool = True
-    ai_ignore_alpha: bool = True
 
     # Channel toggles for persistence
     channel_r: bool = True

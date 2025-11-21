@@ -5,8 +5,6 @@ Handles library availability checks and environment setup.
 """
 
 import importlib.util
-import json
-import logging
 import os
 import sys
 from enum import Enum
@@ -35,7 +33,9 @@ MODELS_DIR = APP_DATA_DIR / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 HF_CACHE_DIR = APP_DATA_DIR / ".hf_cache"
+# Set HF Home before importing transformers to redirect cache
 os.environ["HF_HOME"] = str(HF_CACHE_DIR.resolve())
+# Fix for OpenMP conflict errors
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 # --- File Paths ---
@@ -43,19 +43,22 @@ CONFIG_FILE = APP_DATA_DIR / "app_settings.json"
 CACHE_DIR = APP_DATA_DIR / ".cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-RESULTS_DB_FILE = CACHE_DIR / "results.duckdb"
 THUMBNAIL_CACHE_DB = CACHE_DIR / "thumbnail_cache.db"
 CRASH_LOG_DIR = APP_DATA_DIR / "crash_logs"
 VISUALS_DIR = APP_DATA_DIR / "duplicate_visuals"
 LOG_FILE = APP_DATA_DIR / "app_log.txt"
-CUSTOM_MODELS_CONFIG_FILE = APP_DATA_DIR / "custom_models.json"
 
 # --- Library Availability Checks ---
-DEEP_LEARNING_AVAILABLE = all(importlib.util.find_spec(pkg) for pkg in ["onnxruntime", "transformers", "torch"])
-OIIO_AVAILABLE = bool(importlib.util.find_spec("OpenImageIO"))
-DUCKDB_AVAILABLE = bool(importlib.util.find_spec("duckdb"))
-OCIO_AVAILABLE = bool(importlib.util.find_spec("simple_ocio"))
 
+# Check for Deep Learning libs (Lazy check via find_spec to avoid load cost)
+DEEP_LEARNING_AVAILABLE = all(importlib.util.find_spec(pkg) for pkg in ["onnxruntime", "transformers", "torch"])
+
+OIIO_AVAILABLE = bool(importlib.util.find_spec("OpenImageIO"))
+LANCEDB_AVAILABLE = bool(importlib.util.find_spec("lancedb"))
+OCIO_AVAILABLE = bool(importlib.util.find_spec("simple_ocio"))
+POLARS_AVAILABLE = bool(importlib.util.find_spec("polars"))
+
+# Robust check for local DirectXTex binary (DDS support)
 try:
     import directxtex_decoder  # noqa: F401
 
@@ -68,14 +71,6 @@ try:
     PILLOW_AVAILABLE = True
 except (ImportError, NameError):
     PILLOW_AVAILABLE = False
-
-if DEEP_LEARNING_AVAILABLE:
-    try:
-        from transformers import logging as transformers_logging
-
-        transformers_logging.set_verbosity_error()
-    except ImportError:
-        pass
 
 # --- Application Constants ---
 DB_WRITE_BATCH_SIZE = 4096
@@ -117,6 +112,7 @@ ALL_SUPPORTED_EXTENSIONS = sorted(set(_all_ext))
 
 # --- AI Models Configuration ---
 def _get_default_models() -> dict:
+    """Returns the hardcoded, built-in model configurations."""
     return {
         "Fastest (OpenCLIP ViT-B/32)": {
             "hf_name": "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
@@ -166,34 +162,11 @@ def _get_default_models() -> dict:
     }
 
 
-def _load_models_config() -> dict:
-    all_models = _get_default_models()
-    if CUSTOM_MODELS_CONFIG_FILE.exists():
-        try:
-            with open(CUSTOM_MODELS_CONFIG_FILE, encoding="utf-8") as f:
-                custom_models = json.load(f)
-            for model_name, model_config in custom_models.items():
-                if model_name in all_models:
-                    all_models[model_name].update(model_config)
-                else:
-                    all_models[model_name] = model_config
-            logging.getLogger("AssetPixelHand.constants").info(f"Loaded {len(custom_models)} custom models.")
-        except (json.JSONDecodeError, OSError) as e:
-            logging.getLogger("AssetPixelHand.constants").error(
-                f"Failed to load custom_models.json: {e}. Using defaults."
-            )
-    else:
-        try:
-            with open(CUSTOM_MODELS_CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump({}, f)
-        except OSError:
-            pass
-    return all_models
+# Simplified model loading (Custom models removed for stability)
+SUPPORTED_MODELS = _get_default_models()
 
 
-SUPPORTED_MODELS = _load_models_config()
-
-
+# --- UI Configuration and Enums ---
 class UIConfig:
     class Colors:
         SUCCESS = "#4CAF50"
@@ -219,6 +192,7 @@ class UIConfig:
         SORT_OPTIONS: ClassVar[list[str]] = ["By Duplicate Count", "By Size on Disk", "By Filename"]
 
 
+# --- Search Configuration ---
 SEARCH_PRECISION_PRESETS = {
     "Fast": {"nprobes": 8, "refine_factor": 1},
     "Balanced (Default)": {"nprobes": 20, "refine_factor": 3},
@@ -246,6 +220,7 @@ class TonemapMode(Enum):
     ENABLED = "enabled"
 
 
+# --- Data Model and UI Constants ---
 METHOD_DISPLAY_NAMES = {
     "xxHash": "Exact Match",
     "dHash": "Simple Match",

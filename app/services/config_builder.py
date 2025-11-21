@@ -84,7 +84,8 @@ class ScanConfigBuilder:
             whash_threshold=self.settings.hashing.whash_threshold,
             compare_by_luminance=self.settings.hashing.compare_by_luminance,
             compare_by_channel=self.settings.hashing.compare_by_channel,
-            lancedb_in_memory=self.settings.lancedb_in_memory,
+            # --- Disable In-Memory mode permanently ---
+            lancedb_in_memory=False,
             save_visuals=self.settings.visuals.save,
             max_visuals=int(self.settings.visuals.max_count),
             visuals_columns=self.settings.visuals.columns,
@@ -123,7 +124,10 @@ class ScanConfigBuilder:
         """Determines the correct ONNX model name based on UI selections."""
         model_info = SUPPORTED_MODELS.get(self.settings.model_key, next(iter(SUPPORTED_MODELS.values())))
         quant_mode_str = self.settings.performance.quantization_mode
-        quant_mode = next((q for q in QuantizationMode if q.value == quant_mode_str), QuantizationMode.FP16)
+        quant_mode = next(
+            (q for q in QuantizationMode if q.value == quant_mode_str),
+            QuantizationMode.FP16,
+        )
 
         onnx_name = model_info["onnx_name"]
         if quant_mode == QuantizationMode.FP16:

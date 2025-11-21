@@ -22,12 +22,12 @@ dependencies = [
     "huggingface_hub[hf_xet]>=0.36.0", #transformers
     "onnx>=1.19.1",
     "onnxscript>=0.5.6",
-    # Databases
-    "duckdb>=1.4.2",
-    # Data Handling & Utilities
+    # Data Handling and Vector DB
+    "lancedb>=0.25.3",
     "numpy>=2.3.4",
-    #"numba>=0.62.1",
+    "numba>=0.62.1",
     "pyarrow>=22.0.0",
+    "polars>=1.35.2",
     "xxhash>=3.6.0",
     "ImageHash>=4.3.2",
     # Image Processing

@@ -7,16 +7,14 @@ import inspect
 import io
 import logging
 import os
-import threading
-import time
 from pathlib import Path
 
 import send2trash
 from PIL import Image
+from PIL.ImageQt import ImageQt
 from PySide6.QtCore import (
     Q_ARG,
     QMetaObject,
-    QModelIndex,
     QObject,
     QRunnable,
     Qt,
@@ -27,22 +25,16 @@ from PySide6.QtGui import QImage
 from app.cache import get_thumbnail_cache_key, thumbnail_cache
 from app.constants import (
     DEEP_LEARNING_AVAILABLE,
-    DUCKDB_AVAILABLE,
     FP16_MODEL_SUFFIX,
+    LANCEDB_AVAILABLE,
     MODELS_DIR,
     QuantizationMode,
     TonemapMode,
 )
-from app.data_models import FileOperation, ScanMode
+from app.data_models import FileOperation
 from app.image_io import get_image_metadata, load_image
 
-if DUCKDB_AVAILABLE:
-    import duckdb
-
 app_logger = logging.getLogger("AssetPixelHand.gui.tasks")
-
-# Global lock to prevent race conditions in Pillow's C-extensions.
-_PILLOW_LOCK = threading.Lock()
 
 
 class ModelConverter(QRunnable):
@@ -54,7 +46,13 @@ class ModelConverter(QRunnable):
         finished = Signal(bool, str)
         log = Signal(str, str)
 
-    def __init__(self, hf_model_name: str, onnx_name_base: str, quant_mode: QuantizationMode, model_info: dict):
+    def __init__(
+        self,
+        hf_model_name: str,
+        onnx_name_base: str,
+        quant_mode: QuantizationMode,
+        model_info: dict,
+    ):
         super().__init__()
         self.setAutoDelete(True)
         self.hf_model_name = hf_model_name
@@ -176,7 +174,10 @@ class ModelConverter(QRunnable):
             str(target_dir / "visual.onnx"),
             input_names=["pixel_values"],
             output_names=["image_embeds"],
-            dynamic_axes={"pixel_values": {0: "batch_size"}, "image_embeds": {0: "batch_size"}},
+            dynamic_axes={
+                "pixel_values": {0: "batch_size"},
+                "image_embeds": {0: "batch_size"},
+            },
             opset_version=opset_version,
             dynamo=False,
         )
@@ -194,7 +195,10 @@ class ModelConverter(QRunnable):
 
             sig = inspect.signature(text_wrapper.forward)
             if "attention_mask" in sig.parameters:
-                onnx_inputs = (dummy_text_input["input_ids"], dummy_text_input["attention_mask"])
+                onnx_inputs = (
+                    dummy_text_input["input_ids"],
+                    dummy_text_input["attention_mask"],
+                )
                 input_names = ["input_ids", "attention_mask"]
                 dynamic_axes = {
                     "input_ids": {0: "batch_size", 1: "sequence"},
@@ -224,7 +228,6 @@ class ModelConverter(QRunnable):
 class ImageLoader(QRunnable):
     """
     A cancellable task to load an image in a background thread for the UI.
-    Uses robust QImage conversion to avoid RGB/BGR channel swapping issues.
     """
 
     def __init__(
@@ -238,7 +241,7 @@ class ImageLoader(QRunnable):
         on_finish_slot=None,
         on_error_slot=None,
         channel_to_load: str | None = None,
-        ui_key: str | None = None,  # Added unique identifier for the UI row
+        ui_key: str | None = None,
     ):
         super().__init__()
         self.setAutoDelete(True)
@@ -252,11 +255,9 @@ class ImageLoader(QRunnable):
         self.on_finish_slot = on_finish_slot
         self.on_error_slot = on_error_slot
         self.channel_to_load = channel_to_load
-        # If no UI key provided, fallback to path (legacy behavior)
-        self.ui_key = ui_key if ui_key is not None else path_str
+        self.ui_key = ui_key
 
     def cancel(self):
-        """Mark the task as cancelled. It will abort as soon as possible."""
         self._is_cancelled = True
 
     @property
@@ -268,18 +269,16 @@ class ImageLoader(QRunnable):
             if self.is_cancelled:
                 return
 
-            # === THROTTLING for Rapid Resizing ===
-            time.sleep(0.02)
-
-            if self.is_cancelled:
-                return
-
             pil_img = None
             cache_key = get_thumbnail_cache_key(
-                self.path_str, self.mtime, self.target_size, self.tonemap_mode, self.channel_to_load
+                self.path_str,
+                self.mtime,
+                self.target_size,
+                self.tonemap_mode,
+                self.channel_to_load,
             )
 
-            # 1. Check Cache (Thread-safe operations)
+            # 1. Check Cache
             if self.use_cache:
                 if self.is_cancelled:
                     return
@@ -296,11 +295,20 @@ class ImageLoader(QRunnable):
 
             # 2. Load from Disk
             if pil_img is None:
-                try:
-                    metadata = get_image_metadata(Path(self.path_str))
-                except Exception:
-                    metadata = None
+                path_obj = Path(self.path_str)
+                if not path_obj.exists():
+                    if self.receiver and self.on_error_slot:
+                        result_key = self.ui_key if self.ui_key else self.path_str
+                        QMetaObject.invokeMethod(
+                            self.receiver,
+                            self.on_error_slot,
+                            Qt.ConnectionType.QueuedConnection,
+                            Q_ARG(str, result_key),
+                            Q_ARG(str, "File not found (Deleted)"),
+                        )
+                    return
 
+                metadata = get_image_metadata(path_obj)
                 shrink = 1
                 if metadata and self.target_size:
                     width, height = metadata["resolution"]
@@ -314,147 +322,121 @@ class ImageLoader(QRunnable):
                 if self.is_cancelled:
                     return
 
-                with _PILLOW_LOCK:
+                pre_shrunk_img = load_image(
+                    self.path_str,
+                    tonemap_mode=self.tonemap_mode,
+                    shrink=shrink,
+                )
+
+                if self.is_cancelled:
+                    return
+
+                if pre_shrunk_img:
+                    if self.channel_to_load:
+                        pre_shrunk_img = pre_shrunk_img.convert("RGBA")
+                        channels = pre_shrunk_img.split()
+                        channel_map = {"R": 0, "G": 1, "B": 2, "A": 3}
+                        channel_index = channel_map.get(self.channel_to_load)
+
+                        if channel_index is not None and channel_index < len(channels):
+                            single_channel = channels[channel_index]
+                            pil_img = Image.merge("RGB", (single_channel, single_channel, single_channel))
+                        else:
+                            pil_img = pre_shrunk_img.convert("RGBA")
+                    else:
+                        pil_img = pre_shrunk_img.convert("RGBA")
+
                     if self.is_cancelled:
                         return
 
-                    try:
-                        pre_shrunk_img = load_image(
-                            self.path_str,
-                            tonemap_mode=self.tonemap_mode,
-                            shrink=shrink,
+                    if self.target_size:
+                        pil_img.thumbnail(
+                            (self.target_size, self.target_size),
+                            Image.Resampling.LANCZOS,
                         )
-                    except Exception as e:
-                        app_logger.warning(f"Failed to load image inside lock: {e}")
-                        pre_shrunk_img = None
 
-                    if pre_shrunk_img:
-                        # 3. Post-Processing
+                    if self.use_cache and not self.is_cancelled:
                         try:
-                            if self.channel_to_load:
-                                pre_shrunk_img = pre_shrunk_img.convert("RGBA")
-                                channels = pre_shrunk_img.split()
-                                channel_map = {"R": 0, "G": 1, "B": 2, "A": 3}
-                                channel_index = channel_map.get(self.channel_to_load)
-
-                                if channel_index is not None and channel_index < len(channels):
-                                    single_channel = channels[channel_index]
-                                    pil_img = Image.merge("RGB", (single_channel, single_channel, single_channel))
-                                else:
-                                    pil_img = pre_shrunk_img.convert("RGB")
-                            else:
-                                pil_img = pre_shrunk_img.convert("RGBA")
-
-                            if self.target_size:
-                                pil_img.thumbnail((self.target_size, self.target_size), Image.Resampling.BILINEAR)
-
-                            # 4. Save to Cache
-                            if self.use_cache and not self.is_cancelled:
-                                try:
-                                    buffer = io.BytesIO()
-                                    pil_img.save(buffer, "WEBP", quality=90)
-                                    thumbnail_cache.put(cache_key, buffer.getvalue())
-                                except Exception as e:
-                                    app_logger.warning(f"Cache write failed for {self.path_str}: {e}")
+                            buffer = io.BytesIO()
+                            pil_img.save(buffer, "WEBP", quality=90)
+                            thumbnail_cache.put(cache_key, buffer.getvalue())
                         except Exception as e:
-                            app_logger.error(f"Error during image processing: {e}")
-                            pil_img = None
+                            app_logger.warning(f"Cache write failed for {self.path_str}: {e}")
 
             if self.is_cancelled:
                 return
 
-            # 5. Emit Result to GUI
-            if self.receiver and self.on_finish_slot and pil_img:
-                # Force RGBA for Qt safety
-                if pil_img.mode != "RGBA":
-                    pil_img = pil_img.convert("RGBA")
-
-                # Manual conversion for safe memory ownership
-                data = pil_img.tobytes("raw", "RGBA")
-                q_img_view = QImage(data, pil_img.width, pil_img.height, QImage.Format_RGBA8888)
-                q_img = q_img_view.copy()
-
-                QMetaObject.invokeMethod(
-                    self.receiver,
-                    self.on_finish_slot,
-                    Qt.ConnectionType.QueuedConnection,
-                    # RETURN THE UI_KEY, NOT JUST THE PATH
-                    Q_ARG(str, self.ui_key),
-                    Q_ARG(QImage, q_img),
-                )
-            elif self.receiver and self.on_error_slot:
-                QMetaObject.invokeMethod(
-                    self.receiver,
-                    self.on_error_slot,
-                    Qt.ConnectionType.QueuedConnection,
-                    Q_ARG(str, self.ui_key),
-                    Q_ARG(str, "Image loader returned None."),
-                )
+            if self.receiver and self.on_finish_slot:
+                if pil_img:
+                    q_img = ImageQt(pil_img)
+                    result_key = self.ui_key if self.ui_key else self.path_str
+                    QMetaObject.invokeMethod(
+                        self.receiver,
+                        self.on_finish_slot,
+                        Qt.ConnectionType.QueuedConnection,
+                        Q_ARG(str, result_key),
+                        Q_ARG(QImage, q_img),
+                    )
+                elif self.on_error_slot:
+                    result_key = self.ui_key if self.ui_key else self.path_str
+                    QMetaObject.invokeMethod(
+                        self.receiver,
+                        self.on_error_slot,
+                        Qt.ConnectionType.QueuedConnection,
+                        Q_ARG(str, result_key),
+                        Q_ARG(str, "Image loader returned None."),
+                    )
 
         except Exception as e:
             if not self.is_cancelled and self.receiver and self.on_error_slot:
-                app_logger.error(f"ImageLoader crashed for {self.path_str}", exc_info=True)
+                result_key = self.ui_key if self.ui_key else self.path_str
                 QMetaObject.invokeMethod(
                     self.receiver,
                     self.on_error_slot,
                     Qt.ConnectionType.QueuedConnection,
-                    Q_ARG(str, self.ui_key),
+                    Q_ARG(str, result_key),
                     Q_ARG(str, f"Loader error: {e}"),
                 )
 
 
-class GroupFetcherTask(QRunnable):
+class LanceDBGroupFetcherTask(QRunnable):
     """
-    A task to fetch children of a results group from DuckDB in a background thread.
+    Fetches children of a specific group from LanceDB in a background thread.
+    Used for Async Lazy Loading in large datasets.
     """
 
     class Signals(QObject):
-        finished = Signal(list, int, QModelIndex)
+        # Emits list of dictionaries (children data) and the original group_id
+        finished = Signal(list, int)
         error = Signal(str)
 
-    def __init__(self, db_path: Path, group_id: int, mode: ScanMode, parent: QModelIndex):
+    def __init__(self, db_uri: str, group_id: int):
         super().__init__()
         self.setAutoDelete(True)
-        self.db_path = db_path
+        self.db_uri = db_uri
         self.group_id = group_id
-        self.mode = mode
-        self.parent = parent
         self.signals = self.Signals()
 
     def run(self):
-        if not DUCKDB_AVAILABLE:
-            self.signals.error.emit("DuckDB not available.")
+        if not LANCEDB_AVAILABLE:
+            self.signals.error.emit("LanceDB not available.")
             return
 
         try:
-            with duckdb.connect(database=str(self.db_path), read_only=True) as conn:
-                query = "SELECT * FROM results WHERE group_id = ? ORDER BY is_best DESC, distance DESC"
-                result_proxy = conn.execute(query, [self.group_id])
-                cols = [desc[0] for desc in result_proxy.description]
-                rows = result_proxy.fetchall()
+            import lancedb
 
-                children = []
-                for row_tuple in rows:
-                    child_dict = dict(zip(cols, row_tuple, strict=False))
-                    if Path(child_dict["path"]).exists():
-                        dist_val = child_dict.get("distance")
-                        child_dict["distance"] = int(dist_val) if dist_val is not None else -1
-                        children.append(child_dict)
+            # Zero-copy connection
+            db = lancedb.connect(self.db_uri)
+            table = db.open_table("scan_results")
 
-                is_search = self.mode in [ScanMode.TEXT_SEARCH, ScanMode.SAMPLE_SEARCH]
-                if is_search and children and children[0].get("is_best"):
-                    children.pop(0)
+            # Efficient query
+            res = table.search().where(f"group_id = {self.group_id}").limit(10000).to_list()
 
-                self.signals.finished.emit(children, self.group_id, self.parent)
+            self.signals.finished.emit(res, self.group_id)
 
-        except duckdb.Error as e:
-            error_msg = f"Failed to fetch children for group {self.group_id}: {e}"
-            app_logger.error(error_msg)
-            self.signals.error.emit(error_msg)
         except Exception as e:
-            error_msg = f"An unexpected error occurred during group fetch: {e}"
-            app_logger.error(error_msg, exc_info=True)
-            self.signals.error.emit(error_msg)
+            app_logger.error(f"Background group fetch failed: {e}", exc_info=True)
+            self.signals.error.emit(str(e))
 
 
 class FileOperationTask(QRunnable):
@@ -468,7 +450,10 @@ class FileOperationTask(QRunnable):
         progress_updated = Signal(str, int, int)
 
     def __init__(
-        self, operation: FileOperation, paths: list[Path] | None = None, link_map: dict[Path, Path] | None = None
+        self,
+        operation: FileOperation,
+        paths: list[Path] | None = None,
+        link_map: dict[Path, Path] | None = None,
     ):
         super().__init__()
         self.setAutoDelete(True)
@@ -496,7 +481,8 @@ class FileOperationTask(QRunnable):
                     send2trash.send2trash(str(path))
                     moved.append(path)
                 else:
-                    failed += 1
+                    # Treat non-existent as success (already deleted)
+                    moved.append(path)
             except Exception:
                 failed += 1
         self.signals.finished.emit(moved, len(moved), failed)

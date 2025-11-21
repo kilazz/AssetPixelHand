@@ -1,6 +1,8 @@
 # app/core/pipeline.py
 """
 Contains the PipelineManager, which orchestrates the scanning pipeline.
+This manager runs multi-threaded image preprocessing, ONNX model inference,
+and vector database writing (now LanceDB only).
 """
 
 import contextlib
@@ -9,6 +11,7 @@ import gc
 import logging
 import queue
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
@@ -16,8 +19,8 @@ import numpy as np
 import pyarrow as pa
 from PySide6.QtCore import QObject
 
-from app.cache import CacheManager
-from app.constants import DB_WRITE_BATCH_SIZE, FP16_MODEL_SUFFIX
+from app.cache import POLARS_AVAILABLE, CacheManager
+from app.constants import DB_WRITE_BATCH_SIZE, FP16_MODEL_SUFFIX, LANCEDB_AVAILABLE
 from app.services.signal_bus import SignalBus
 
 from . import worker
@@ -25,6 +28,13 @@ from . import worker
 if TYPE_CHECKING:
     from app.core.scan_stages import ScanContext
     from app.data_models import ScanConfig, ScanState
+
+
+if LANCEDB_AVAILABLE:
+    pass
+
+if POLARS_AVAILABLE:
+    import polars as pl
 
 app_logger = logging.getLogger("AssetPixelHand.pipeline")
 
@@ -35,7 +45,8 @@ class PipelineManager(QObject):
         config: "ScanConfig",
         state: "ScanState",
         signals: SignalBus,
-        db_connection: Any,
+        # Accepts LanceDB Table only
+        vector_db_writer: Any,
         table_name: str,
         stop_event: "threading.Event",
     ):
@@ -43,17 +54,23 @@ class PipelineManager(QObject):
         self.config = config
         self.state = state
         self.signals = signals
-        self.conn = db_connection
+        self.vector_db_writer = vector_db_writer
         self.table_name = table_name
+
+        # Flag is now simpler: Are we using LanceDB? (Should always be True if we reach here)
+        self.is_lancedb_mode = LANCEDB_AVAILABLE
+
         self.stop_event = stop_event
 
         self._internal_stop_event = threading.Event()
 
+        # Executors
         self.db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="DBWriter")
         self.preproc_executor = ThreadPoolExecutor(
             max_workers=self.config.perf.num_workers, thread_name_prefix="Preprocessor"
         )
 
+        # Queues:
         self.tensor_queue = queue.Queue(maxsize=self.config.perf.num_workers * 4 + 32)
         self.results_queue = queue.Queue()
 
@@ -68,12 +85,12 @@ class PipelineManager(QObject):
             f"({unique_files_count} unique files). Device: {self.config.device}."
         )
 
-        # Note: lancedb_in_memory logic from config is reused for DuckDB in-memory flag if needed
-        # but CacheManager handles file cache separately.
-        cache = CacheManager(self.config.folder_path, self.config.model_name, in_memory=self.config.lancedb_in_memory)
+        # CacheManager now works exclusively with the LanceDB path/logic
+        cache = CacheManager(self.config.folder_path, self.config.model_name, lancedb_table=self.vector_db_writer)
         all_skipped = []
 
         try:
+            # 1. Init Global Workers
             worker.init_worker(
                 {"model_name": self.config.model_name, "device": self.config.device, "threads_per_worker": 1}
             )
@@ -83,9 +100,11 @@ class PipelineManager(QObject):
             is_fp16 = FP16_MODEL_SUFFIX in self.config.model_name.lower()
             dtype = np.float16 if is_fp16 else np.float32
 
+            # 2. Start Inference Thread
             inference_thread = threading.Thread(target=self._inference_loop, daemon=True, name="InferenceThread")
             inference_thread.start()
 
+            # 3. Start Preprocessing Monitor
             monitor_thread = threading.Thread(
                 target=self._monitor_preprocessing,
                 args=(items_to_process, input_size, dtype),
@@ -94,8 +113,10 @@ class PipelineManager(QObject):
             )
             monitor_thread.start()
 
+            # 4. Collect Results
             all_skipped = self._collect_results(cache, context)
 
+            # Clean shutdown
             inference_thread.join(timeout=1.0)
             monitor_thread.join(timeout=1.0)
 
@@ -108,6 +129,9 @@ class PipelineManager(QObject):
             self._cleanup(cache)
 
     def _monitor_preprocessing(self, items, input_size, dtype):
+        """
+        Submits tasks and waits for them to finish, then sends Sentinel.
+        """
         batch_size = self.config.perf.batch_size
         simple_config = {"ignore_solid_channels": self.config.ignore_solid_channels}
 
@@ -128,6 +152,7 @@ class PipelineManager(QObject):
         self.tensor_queue.put(None)
 
     def _inference_loop(self):
+        """Consumes tensors, runs ONNX, produces results."""
         while True:
             try:
                 item = self.tensor_queue.get()
@@ -150,12 +175,16 @@ class PipelineManager(QObject):
             self.tensor_queue.task_done()
 
     def _collect_results(self, cache: CacheManager, context: "ScanContext") -> list[str]:
-        fps_to_cache_buffer = []
-        db_buffer = []
+        """
+        Buffers DB writes to reduce locking overhead on fast SSDs.
+        """
+        fps_to_cache_buffer = []  # This buffer now holds metadata/vectors for LanceDB update
+        db_buffer = []  # This buffer holds data ready for LanceDB vector insertion
         all_skipped = []
 
         unique_paths_processed = set()
         unique_paths_total = len({item.path for item in context.items_to_process})
+
         gc_trigger_counter = 0
         WRITE_THRESHOLD = 2048
 
@@ -181,7 +210,7 @@ class PipelineManager(QObject):
             all_skipped.extend([str(p) for p, _ in batch_skipped])
 
             if len(db_buffer) >= WRITE_THRESHOLD:
-                self._add_to_db(db_buffer)
+                self._add_to_lancedb(db_buffer)
                 db_buffer.clear()
 
             if len(fps_to_cache_buffer) >= DB_WRITE_BATCH_SIZE:
@@ -198,13 +227,15 @@ class PipelineManager(QObject):
                 gc.collect()
                 gc_trigger_counter = 0
 
+        # Final flush of remaining data
         if db_buffer:
-            self._add_to_db(db_buffer)
+            self._add_to_lancedb(db_buffer)
 
         if fps_to_cache_buffer:
             cache.put_many(fps_to_cache_buffer)
 
         gc.collect()
+
         return all_skipped
 
     def _handle_batch_results(
@@ -216,10 +247,11 @@ class PipelineManager(QObject):
         context: "ScanContext",
         unique_paths_processed: set,
     ):
-        for (path_str, channel), vector in batch_results.items():
-            if self.config.ai_ignore_alpha and channel == "A":
-                continue
+        """
+        Matches raw vectors to File Paths/Channels and fills the buffers.
+        """
 
+        for (path_str, channel), vector in batch_results.items():
             path_key = next((k for k in context.all_image_fps if str(k) == str(path_str)), None)
 
             if path_key:
@@ -227,10 +259,14 @@ class PipelineManager(QObject):
                 fp_orig = context.all_image_fps[path_key]
 
                 vector_list = vector.tolist() if isinstance(vector, np.ndarray) else vector
+
+                # Data structure ready for LanceDB vector insertion
                 db_buffer.append({"path": str(fp_orig.path), "channel": channel, "vector": vector_list})
 
+                # Add to CacheManager buffer (for metadata/vector update)
                 fp_copy = copy.copy(fp_orig)
-                fp_copy.hashes = vector
+                fp_copy.hashes = vector  # Attach the vector for completeness
+                fp_copy.channel = channel  # Ensure channel info is carried for to_lancedb_dict
                 fps_to_cache_buffer.append(fp_copy)
             else:
                 app_logger.warning(f"Path mismatch during collection: {path_str}")
@@ -240,41 +276,51 @@ class PipelineManager(QObject):
             if path_key:
                 unique_paths_processed.add(path_key)
 
-    def _add_to_db(self, data_dicts: list[dict]):
-        if not data_dicts:
+    def _add_to_lancedb(self, data_dicts: list[dict]):
+        """Submits a batch write task to the single-threaded DB Executor for LanceDB."""
+        if not data_dicts or not LANCEDB_AVAILABLE:
             return
-        # Explicitly pass schema via closure or direct logic if needed,
-        # but here we construct it inside _write_task
-        self.db_executor.submit(self._write_task, data_dicts, self.config.model_dim)
+        self.db_executor.submit(self._write_lancedb_task, data_dicts)
 
-    def _write_task(self, data_dicts, model_dim):
+    def _write_lancedb_task(self, data_dicts: list[dict]):
+        """Running inside the DB executor thread (Writing to LanceDB On-Disk)."""
         if not data_dicts:
             return
+
         try:
-            # Define strict schema to prevent "Must have at least one column" error
-            # if data inference fails or list is strangely empty.
-            # Vector in DuckDB via Arrow is typically a List[Float].
-            schema = pa.schema(
-                [
-                    ("path", pa.string()),
-                    ("channel", pa.string()),
-                    ("vector", pa.list_(pa.float32(), model_dim)),  # Fixed size list for vectors
-                ]
-            )
+            # LanceDB requires an 'id' column for primary key
+            data_for_lancedb = [
+                {
+                    "id": str(uuid.uuid5(uuid.NAMESPACE_URL, d["path"] + (d["channel"] or ""))),
+                    "vector": d["vector"],
+                    "path": d["path"],
+                    "channel": d["channel"],
+                }
+                for d in data_dicts
+            ]
 
-            table = pa.Table.from_pylist(data_dicts, schema=schema)
+            # --- Use Polars if available for potentially faster pydict->Arrow conversion ---
+            if POLARS_AVAILABLE:
+                polars_df = pl.DataFrame(data_for_lancedb)
+                arrow_table = polars_df.to_arrow()
+            else:
+                # Fallback to PyArrow
+                arrow_table = pa.Table.from_pylist(data_for_lancedb)
 
-            self.conn.register("batch_vectors_arrow", table)
-            self.conn.execute(f"INSERT INTO {self.table_name} SELECT path, channel, vector FROM batch_vectors_arrow")
-            self.conn.unregister("batch_vectors_arrow")
+            # self.vector_db_writer is the LanceDB Table object in this mode
+            self.vector_db_writer.add(data=arrow_table)
         except Exception as e:
-            app_logger.error(f"DuckDB vector batch write failed: {e}")
+            app_logger.error(f"LanceDB batch write failed: {e}")
 
     def _cleanup(self, cache):
         self._internal_stop_event.set()
+
+        # Drain queues to unblock threads if they are stuck trying to put
         while not self.tensor_queue.empty():
             with contextlib.suppress(queue.Empty):
                 self.tensor_queue.get_nowait()
+
+        # Wait for writes to finish
         self.db_executor.shutdown(wait=True)
         cache.close()
         app_logger.info("Pipeline resources cleaned up.")

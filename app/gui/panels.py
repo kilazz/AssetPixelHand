@@ -40,9 +40,11 @@ from PySide6.QtWidgets import (
 
 from app.constants import (
     ALL_SUPPORTED_EXTENSIONS,
+    DB_TABLE_NAME,
     DEEP_LEARNING_AVAILABLE,
     DEFAULT_SEARCH_PRECISION,
     DIRECTXTEX_AVAILABLE,
+    LANCEDB_AVAILABLE,
     OIIO_AVAILABLE,
     SCRIPT_DIR,
     SEARCH_PRECISION_PRESETS,
@@ -53,7 +55,7 @@ from app.constants import (
     TonemapMode,
     UIConfig,
 )
-from app.data_models import AppSettings, FileOperation, ScanMode
+from app.data_models import AppSettings, FileOperation, ResultNode, ScanMode
 from app.image_utils import TONE_MAPPER, set_active_tonemap_view
 from app.services.settings_manager import SettingsManager
 from app.view_models import ImageComparerState
@@ -268,7 +270,10 @@ class OptionsPanel(QGroupBox):
             self.current_scan_mode = ScanMode.DUPLICATES
             self.scan_button_text = "Scan for Duplicates"
 
-        is_ai_search = self.current_scan_mode in (ScanMode.TEXT_SEARCH, ScanMode.SAMPLE_SEARCH)
+        is_ai_search = self.current_scan_mode in (
+            ScanMode.TEXT_SEARCH,
+            ScanMode.SAMPLE_SEARCH,
+        )
         self.threshold_spinbox.setEnabled(not is_ai_search and is_ai_on)
 
         label = self.form_layout.labelForField(self.threshold_spinbox)
@@ -293,7 +298,10 @@ class OptionsPanel(QGroupBox):
         except Exception as e:
             app_logger.warning(f"Native folder dialog failed: {e}. Falling back to non-native dialog.")
             path = QFileDialog.getExistingDirectory(
-                self, "Select Folder", self.folder_path_entry.text(), options=QFileDialog.Option.DontUseNativeDialog
+                self,
+                "Select Folder",
+                self.folder_path_entry.text(),
+                options=QFileDialog.Option.DontUseNativeDialog,
             )
         if path:
             self.folder_path_entry.setText(path)
@@ -463,9 +471,6 @@ class ScanOptionsPanel(QGroupBox):
         layout.addWidget(self.hashing_options_group)
         layout.addWidget(self.image_prep_group)
 
-        self.lancedb_in_memory_check = QCheckBox("Use in-memory database (fastest)")
-        layout.addWidget(self.lancedb_in_memory_check)
-
         visuals_layout = QHBoxLayout()
         self.save_visuals_check = QCheckBox("Save visuals")
         self.visuals_tonemap_check = QCheckBox("TM HDR")
@@ -519,7 +524,8 @@ class ScanOptionsPanel(QGroupBox):
 
         self.channel_check.toggled.connect(self._update_dependent_ui_state)
 
-        self.lancedb_in_memory_check.toggled.connect(self.settings_manager.set_lancedb_in_memory)
+        # --- REMOVED SIGNAL CONNECTION FOR LANCE_DB_IN_MEMORY ---
+
         self.save_visuals_check.toggled.connect(self.settings_manager.set_save_visuals)
         self.visuals_tonemap_check.toggled.connect(self.settings_manager.set_visuals_tonemap)
         self.max_visuals_entry.textChanged.connect(self.settings_manager.set_max_visuals)
@@ -606,7 +612,6 @@ class ScanOptionsPanel(QGroupBox):
         self.channel_tags_entry.setText(s.hashing.channel_split_tags)
         self.ignore_solid_check.setChecked(s.hashing.ignore_solid_channels)
 
-        self.lancedb_in_memory_check.setChecked(s.lancedb_in_memory)
         self.save_visuals_check.setChecked(s.visuals.save)
         self.visuals_tonemap_check.setChecked(s.visuals.tonemap_enabled)
         self.max_visuals_entry.setText(s.visuals.max_count)
@@ -912,8 +917,6 @@ class ResultsPanel(QGroupBox):
 
     @Slot(QPoint)
     def _show_context_menu(self, pos):
-        from app.data_models import ResultNode
-
         proxy_idx = self.results_view.indexAt(pos)
         if not proxy_idx.isValid():
             return
@@ -1004,7 +1007,12 @@ class ResultsPanel(QGroupBox):
         is_duplicate_mode = self.results_model.mode == ScanMode.DUPLICATES
 
         enable_general = is_enabled and has_results
-        for w in [self.results_view, self.search_entry, self.expand_button, self.collapse_button]:
+        for w in [
+            self.results_view,
+            self.search_entry,
+            self.expand_button,
+            self.collapse_button,
+        ]:
             w.setEnabled(enable_general)
 
         self.sort_combo.setEnabled(enable_general and is_duplicate_mode)
@@ -1093,7 +1101,11 @@ class ResultsPanel(QGroupBox):
 
         link_map = self.results_model.get_link_map_for_paths(to_link)
         if not link_map:
-            QMessageBox.information(self, "No Action", "Selected files did not contain any duplicates to replace.")
+            QMessageBox.information(
+                self,
+                "No Action",
+                "Selected files did not contain any duplicates to replace.",
+            )
             return
 
         msg = (
@@ -1113,7 +1125,11 @@ class ResultsPanel(QGroupBox):
 
         link_map = self.results_model.get_link_map_for_paths(to_link)
         if not link_map:
-            QMessageBox.information(self, "No Action", "Selected files did not contain any duplicates to replace.")
+            QMessageBox.information(
+                self,
+                "No Action",
+                "Selected files did not contain any duplicates to replace.",
+            )
             return
 
         msg = (
@@ -1126,20 +1142,36 @@ class ResultsPanel(QGroupBox):
             self.file_op_manager.request_reflink(link_map)
 
     def remove_items_from_results_db(self, paths_to_delete: list[Path]):
+        """
+        Removes deleted items from the vector database to keep it in sync.
+        Uses LanceDB logic instead of the legacy DuckDB logic.
+        """
         if not self.results_model.db_path or not paths_to_delete:
             return
 
+        if not LANCEDB_AVAILABLE:
+            return
+
         try:
-            import duckdb
+            import lancedb
 
-            with duckdb.connect(database=str(self.results_model.db_path), read_only=False) as conn:
-                conn.execute("CREATE TEMPORARY TABLE paths_to_delete (path VARCHAR)")
-                conn.executemany("INSERT INTO paths_to_delete VALUES (?)", [(str(p),) for p in paths_to_delete])
+            # Escape single quotes for SQL query
+            path_list_str = ", ".join(f"'{str(p).replace("'", "''")}'" for p in paths_to_delete)
 
-                result = conn.execute("DELETE FROM results WHERE path IN (SELECT path FROM paths_to_delete)")
-                app_logger.info(f"Removed {result.fetchone()[0]} rows from results.duckdb.")
+            # Connect to LanceDB (db_path is the folder URI)
+            db = lancedb.connect(str(self.results_model.db_path))
+
+            # Open the table and delete rows
+            if DB_TABLE_NAME in db.table_names():
+                table = db.open_table(DB_TABLE_NAME)
+                table.delete(f"path IN ({path_list_str})")
+                app_logger.info(f"Removed {len(paths_to_delete)} items from LanceDB.")
+            else:
+                app_logger.warning(f"Table '{DB_TABLE_NAME}' not found in DB, skipping DB deletion.")
+
         except Exception as e:
-            app_logger.error(f"Failed to remove items from results.duckdb: {e}")
+            # Log error but don't crash, so UI can still update
+            app_logger.error(f"Failed to remove items from LanceDB: {e}")
 
     def update_after_deletion(self, deleted_paths: list[Path]):
         expanded = self._get_expanded_group_ids()
@@ -1188,9 +1220,13 @@ class ImageViewerPanel(QGroupBox):
 
     log_message = Signal(str, str)
     group_became_empty = Signal(int)
+    file_missing_detected = Signal(Path)
 
     def __init__(
-        self, settings_manager: SettingsManager, thread_pool: QThreadPool, file_op_manager: "FileOperationManager"
+        self,
+        settings_manager: SettingsManager,
+        thread_pool: QThreadPool,
+        file_op_manager: "FileOperationManager",
     ):
         super().__init__("Image Viewer")
         self.settings_manager = settings_manager
@@ -1246,6 +1282,10 @@ class ImageViewerPanel(QGroupBox):
         self.compare_button = QPushButton("Compare (0)")
         parent_layout.addWidget(self.compare_button)
         self.model = ImagePreviewModel(self.thread_pool, self)
+
+        # --- Connect missing file signal ---
+        self.model.file_missing.connect(self.file_missing_detected.emit)
+
         self.delegate = ImageItemDelegate(self.settings_manager.settings.viewer.preview_size, self.state, self)
         self.list_view = ResizedListView(self)
         self.list_view.setModel(self.model)
@@ -1316,7 +1356,10 @@ class ImageViewerPanel(QGroupBox):
         sbs_layout = QHBoxLayout(sbs_view)
         sbs_layout.setContentsMargins(0, 0, 0, 0)
         sbs_layout.setSpacing(1)
-        self.compare_view_1, self.compare_view_2 = AlphaBackgroundWidget(), AlphaBackgroundWidget()
+        self.compare_view_1, self.compare_view_2 = (
+            AlphaBackgroundWidget(),
+            AlphaBackgroundWidget(),
+        )
         sbs_layout.addWidget(self.compare_view_1, 1)
         sbs_layout.addWidget(self.compare_view_2, 1)
         self.compare_widget, self.diff_view = ImageCompareWidget(), AlphaBackgroundWidget()
@@ -1435,16 +1478,28 @@ class ImageViewerPanel(QGroupBox):
         self.current_group_id = None
         self._back_to_list_view()
 
-    @Slot(Path, int, object)
-    def show_image_group(self, db_path: Path, group_id: int, scroll_to_path: Path | None):
+    @Slot(list, int, object)
+    def show_image_group(self, items: list, group_id: int, scroll_to_path: Path | None):
+        """
+        Displays a group of images in the viewer.
+
+        CRITICAL FIX: Accepts a list of ResultNode items directly instead of querying a DB.
+        This prevents groups from disappearing due to empty queries on non-existent DBs.
+        """
         if self.current_group_id == group_id and not scroll_to_path:
             return
+
         self._back_to_list_view()
         self.current_group_id = group_id
         self.state.clear_candidates()
-        self.model.set_group(db_path, group_id)
+
+        # Set data directly from the list provided by the main window/model
+        self.model.set_items_from_list(items)
+        # Force update the group ID in the model for context tracking
+        self.model.group_id = group_id
 
         if self.model.rowCount() == 0 and self.current_group_id is not None:
+            # Only trigger removal if we genuinely received an empty list for a valid group ID
             self.group_became_empty.emit(self.current_group_id)
             self.current_group_id = None
             return
@@ -1527,7 +1582,10 @@ class ImageViewerPanel(QGroupBox):
         images = self.state.get_pil_images()
         if len(images) != 2:
             return
-        act1, act2 = self._get_channel_activity(images[0]), self._get_channel_activity(images[1])
+        act1, act2 = (
+            self._get_channel_activity(images[0]),
+            self._get_channel_activity(images[1]),
+        )
         for channel, button in self.channel_buttons.items():
             is_active = act1.get(channel, False) or act2.get(channel, False)
             button.setEnabled(is_active)
@@ -1573,11 +1631,20 @@ class ImageViewerPanel(QGroupBox):
         self.bg_alpha_check.setChecked(state)
         self.compare_bg_alpha_check.setChecked(state)
 
-        for w in [self.alpha_slider, self.alpha_label, self.compare_bg_alpha_slider]:
+        for w in [
+            self.alpha_slider,
+            self.alpha_label,
+            self.compare_bg_alpha_slider,
+        ]:
             w.setEnabled(state)
 
         self.delegate.set_transparency_enabled(state)
-        for view in [self.compare_view_1, self.compare_view_2, self.compare_widget, self.diff_view]:
+        for view in [
+            self.compare_view_1,
+            self.compare_view_2,
+            self.compare_widget,
+            self.diff_view,
+        ]:
             view.set_transparency_enabled(state)
 
         self.settings_manager.set_show_transparency(state)
@@ -1592,7 +1659,12 @@ class ImageViewerPanel(QGroupBox):
         self.compare_bg_alpha_slider.setValue(value)
         self.delegate.set_bg_alpha(value)
         self.list_view.viewport().update()
-        for view in [self.compare_view_1, self.compare_view_2, self.compare_widget, self.diff_view]:
+        for view in [
+            self.compare_view_1,
+            self.compare_view_2,
+            self.compare_widget,
+            self.diff_view,
+        ]:
             view.set_alpha(value)
 
     @Slot(int)
@@ -1612,11 +1684,21 @@ class ImageViewerPanel(QGroupBox):
         if not button.isEnabled():
             button.setStyleSheet("background-color: #3c3c3c; color: #7f8c8d;")
             return
-        color = {"R": "red", "G": "lime", "B": "deepskyblue", "A": "white"}[channel]
+        color = {
+            "R": "red",
+            "G": "lime",
+            "B": "deepskyblue",
+            "A": "white",
+        }[channel]
         if is_checked:
             button.setStyleSheet(f"background-color: {color}; color: black; font-weight: bold;")
         else:
-            border_color = {"R": "#c0392b", "G": "#27ae60", "B": "#2980b9", "A": "#bdc3c7"}[channel]
+            border_color = {
+                "R": "#c0392b",
+                "G": "#27ae60",
+                "B": "#2980b9",
+                "A": "#bdc3c7",
+            }[channel]
             button.setStyleSheet(f"background-color: #2c3e50; border: 1px solid {border_color}; color: {border_color};")
 
     def _update_compare_views(self):
@@ -1682,7 +1764,10 @@ class ImageViewerPanel(QGroupBox):
             return None
         img1, img2 = images[0], images[1]
         if img1.size != img2.size:
-            target_size = (max(img1.width, img2.width), max(img1.height, img2.height))
+            target_size = (
+                max(img1.width, img2.width),
+                max(img1.height, img2.height),
+            )
             img1 = img1.resize(target_size, Image.Resampling.LANCZOS)
             img2 = img2.resize(target_size, Image.Resampling.LANCZOS)
         if img1.mode != "RGBA":

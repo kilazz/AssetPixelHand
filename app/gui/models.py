@@ -4,7 +4,9 @@ Contains Qt Item Models and Delegates for displaying data.
 """
 
 import logging
+import os
 from collections import OrderedDict
+from dataclasses import fields
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -12,6 +14,7 @@ from PySide6.QtCore import (
     QAbstractItemModel,
     QAbstractListModel,
     QModelIndex,
+    QPersistentModelIndex,
     QSize,
     QSortFilterProxyModel,
     Qt,
@@ -24,20 +27,16 @@ from PySide6.QtWidgets import QStyle, QStyledItemDelegate
 
 from app.constants import (
     BEST_FILE_METHOD_NAME,
-    DUCKDB_AVAILABLE,
     METHOD_DISPLAY_NAMES,
     UIConfig,
 )
 from app.data_models import GroupNode, ResultNode, ScanMode
-from app.gui.tasks import GroupFetcherTask, ImageLoader
+from app.gui.tasks import ImageLoader, LanceDBGroupFetcherTask
 from app.gui.widgets import AlphaBackgroundWidget
-from app.utils import find_common_base_name
 
 if TYPE_CHECKING:
     from app.view_models import ImageComparerState
 
-if DUCKDB_AVAILABLE:
-    import duckdb
 
 app_logger = logging.getLogger("AssetPixelHand.gui.models")
 
@@ -47,8 +46,13 @@ SortRole = Qt.ItemDataRole.UserRole + 1
 
 def _format_metadata_string(node: ResultNode) -> str:
     """Helper to create the detailed metadata string for the UI."""
+    # Skip metadata for dummy node
+    if node.path == "loading_dummy":
+        return ""
+
     res = f"{node.resolution_w}x{node.resolution_h}"
-    size_mb = node.file_size / (1024**2)
+    # Handle file_size being 0 or None gracefully
+    size_mb = (node.file_size or 0) / (1024**2)
     size_str = f"{size_mb:.2f} MB"
     bit_depth_str = f"{node.bit_depth}-bit"
 
@@ -68,22 +72,26 @@ def _format_metadata_string(node: ResultNode) -> str:
 
 
 class ResultsTreeModel(QAbstractItemModel):
-    """Data model for the results tree view, with asynchronous data fetching."""
+    """
+    Data model for the results tree view.
+    Implements Async Lazy Loading using 'Transform & Append' strategy to prevent view collapse.
+    """
 
     fetch_completed = Signal(QModelIndex)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.db_path: Path | None = None
+        self.db_path: str | None = None
         self.mode: ScanMode | str = ""
         self.groups_data: dict[int, GroupNode] = {}
         self.sorted_group_ids: list[int] = []
         self.check_states: dict[str, Qt.CheckState] = {}
         self.filter_text = ""
-        # Fast lookups
+
         self.path_to_group_id: dict[str, int] = {}
         self.group_id_to_best_path: dict[int, str] = {}
-        self.running_tasks: dict[int, GroupFetcherTask] = {}
+
+        self.pending_fetches: dict[int, QPersistentModelIndex] = {}
 
     def clear(self):
         self.beginResetModel()
@@ -95,106 +103,161 @@ class ResultsTreeModel(QAbstractItemModel):
         self.filter_text = ""
         self.path_to_group_id.clear()
         self.group_id_to_best_path.clear()
-        self.running_tasks.clear()
+        self.pending_fetches.clear()
         self.endResetModel()
 
     def filter(self, text: str):
         self.beginResetModel()
         self.filter_text = text
-        self._load_results_from_db()
         self.endResetModel()
 
-    def load_data(self, payload, mode):
+    def _create_dummy_child(self, group_id: int) -> ResultNode:
+        """Creates a temporary node to display 'Loading...'."""
+        return ResultNode(
+            path="loading_dummy",
+            is_best=False,
+            group_id=group_id,
+            resolution_w=0,
+            resolution_h=0,
+            file_size=0,
+            mtime=0,
+            capture_date=0,
+            distance=0,
+            format_str="",
+            compression_format="",
+            format_details="",
+            has_alpha=False,
+            bit_depth=0,
+            mipmap_count=0,
+            texture_type="",
+            color_space="",
+            found_by="Loading...",
+        )
+
+    def load_data(self, payload: dict, mode: ScanMode):
         self.clear()
         self.beginResetModel()
         self.mode = mode
 
-        db_path_from_payload = None
-        if isinstance(payload, (Path, str)):
-            db_path_from_payload = payload
-        elif isinstance(payload, dict):
-            db_path_from_payload = payload.get("db_path")
+        self.db_path = payload.get("db_path")
+        lazy_summary = payload.get("lazy_summary")
+        full_groups = payload.get("groups_data")
 
-        if db_path_from_payload and Path(db_path_from_payload).exists():
-            self.db_path = Path(db_path_from_payload)
-            self._load_results_from_db()
+        if lazy_summary:
+            for item in lazy_summary:
+                gid = item["group_id"]
+                gn = GroupNode(
+                    name=item["name"],
+                    count=item["count"],
+                    total_size=item["total_size"],
+                    group_id=gid,
+                    fetched=False,
+                    children=[self._create_dummy_child(gid)],
+                )
+                self.groups_data[gid] = gn
+
+            self.sorted_group_ids = sorted(self.groups_data.keys())
+
+        elif full_groups:
+            self._process_full_groups(full_groups)
 
         self.endResetModel()
 
-    def _load_results_from_db(self):
-        if not DUCKDB_AVAILABLE or not self.db_path:
-            return
-        self.groups_data.clear()
-        self.sorted_group_ids.clear()
-        self.path_to_group_id.clear()
-        self.group_id_to_best_path.clear()
+    def _process_full_groups(self, raw_groups: dict):
+        group_id_counter = 1
+        for best_fp, dups in raw_groups.items():
+            # FIX: Safely handle None for file_size using (x or 0)
+            total_size = (best_fp.file_size or 0) + sum((fp.file_size or 0) for fp, _, _ in dups)
+            count = len(dups) + 1
 
-        try:
-            with duckdb.connect(database=str(self.db_path), read_only=True) as conn:
-                group_filter_clause = ""
-                params = []
-                if self.filter_text:
-                    # Filter groups where ANY file matches the text
-                    group_filter_clause = "WHERE group_id IN (SELECT group_id FROM results WHERE path ILIKE ?)"
-                    params.append(f"%{self.filter_text}%")
+            group_name = best_fp.path.stem
+            if best_fp.channel:
+                group_name += f" ({best_fp.channel})"
 
-                group_query = (
-                    f"SELECT group_id, COUNT(*), SUM(file_size) "
-                    f"FROM results {group_filter_clause} "
-                    f"GROUP BY group_id ORDER BY group_id"
+            group_node = GroupNode(
+                name=group_name,
+                count=count,
+                total_size=total_size,
+                group_id=group_id_counter,
+                fetched=True,
+                children=[],
+            )
+
+            children = []
+            # Safely access tuple elements and fallback to 0/Empty strings
+            res_w = best_fp.resolution[0] if best_fp.resolution else 0
+            res_h = best_fp.resolution[1] if best_fp.resolution else 0
+
+            best_node = ResultNode(
+                path=str(best_fp.path),
+                is_best=True,
+                group_id=group_id_counter,
+                resolution_w=res_w or 0,
+                resolution_h=res_h or 0,
+                file_size=best_fp.file_size or 0,
+                mtime=best_fp.mtime or 0.0,
+                capture_date=best_fp.capture_date,
+                format_str=best_fp.format_str or "",
+                compression_format=best_fp.compression_format or "",
+                format_details=best_fp.format_details or "",
+                has_alpha=bool(best_fp.has_alpha),
+                bit_depth=best_fp.bit_depth or 0,
+                mipmap_count=best_fp.mipmap_count or 1,
+                texture_type=best_fp.texture_type or "2D",
+                color_space=best_fp.color_space or "sRGB",
+                found_by=BEST_FILE_METHOD_NAME,
+                channel=best_fp.channel,
+                distance=0,
+            )
+            children.append(best_node)
+            self.path_to_group_id[str(best_fp.path)] = group_id_counter
+            self.group_id_to_best_path[group_id_counter] = str(best_fp.path)
+
+            for dup_fp, score, method in dups:
+                d_res_w = dup_fp.resolution[0] if dup_fp.resolution else 0
+                d_res_h = dup_fp.resolution[1] if dup_fp.resolution else 0
+
+                dup_node = ResultNode(
+                    path=str(dup_fp.path),
+                    is_best=False,
+                    group_id=group_id_counter,
+                    resolution_w=d_res_w or 0,
+                    resolution_h=d_res_h or 0,
+                    file_size=dup_fp.file_size or 0,
+                    mtime=dup_fp.mtime or 0.0,
+                    capture_date=dup_fp.capture_date,
+                    format_str=dup_fp.format_str or "",
+                    compression_format=dup_fp.compression_format or "",
+                    format_details=dup_fp.format_details or "",
+                    has_alpha=bool(dup_fp.has_alpha),
+                    bit_depth=dup_fp.bit_depth or 0,
+                    mipmap_count=dup_fp.mipmap_count or 1,
+                    texture_type=dup_fp.texture_type or "2D",
+                    color_space=dup_fp.color_space or "sRGB",
+                    found_by=method,
+                    distance=score,
+                    channel=dup_fp.channel,
                 )
-                groups = conn.execute(group_query, params).fetchall()
+                children.append(dup_node)
+                self.path_to_group_id[str(dup_fp.path)] = group_id_counter
 
-                for group_id, count, total_size in groups:
-                    # Determine group name from the "Best" file
-                    best_file_row = conn.execute(
-                        "SELECT path, search_context, channel FROM results WHERE group_id = ? AND is_best = TRUE",
-                        [group_id],
-                    ).fetchone()
+            children.sort(key=lambda n: (n.is_best, n.distance), reverse=True)
+            group_node.children = children
+            self.groups_data[group_id_counter] = group_node
+            group_id_counter += 1
 
-                    group_name = "Group"
-                    if best_file_row:
-                        best_path_str, search_context, _ = best_file_row
-                        self.group_id_to_best_path[group_id] = best_path_str
-                        best_path = Path(best_path_str)
-                        group_name = best_path.stem
-
-                        if search_context and search_context.startswith("channel:"):
-                            channel = search_context.split(":", 1)[1]
-                            group_name = f"{best_path.name} ({channel})"
-                        elif search_context:
-                            if search_context.startswith("sample:"):
-                                group_name = f"Sample: {search_context.split(':', 1)[1]}"
-                            elif search_context.startswith("query:"):
-                                group_name = f"Query: '{search_context.split(':', 1)[1]}'"
-                            count -= 1
-                        else:
-                            # Heuristic naming if no explicit context
-                            distinct_channels = conn.execute(
-                                "SELECT DISTINCT channel FROM results WHERE group_id = ?", [group_id]
-                            ).fetchall()
-                            if len(distinct_channels) == 1 and distinct_channels[0][0] is not None:
-                                group_name = f"{best_path.name} ({distinct_channels[0][0]})"
-                            else:
-                                all_paths = conn.execute(
-                                    "SELECT path FROM results WHERE group_id = ?", [group_id]
-                                ).fetchall()
-                                group_name = find_common_base_name([Path(p[0]) for p in all_paths])
-
-                    self.groups_data[group_id] = GroupNode(
-                        name=group_name, count=count, total_size=total_size, group_id=group_id
-                    )
-
-                self.sorted_group_ids = list(self.groups_data.keys())
-        except duckdb.Error as e:
-            app_logger.error(f"Failed to read results from DuckDB: {e}", exc_info=True)
+        self.sorted_group_ids = list(self.groups_data.keys())
 
     def rowCount(self, parent: QModelIndex | None = None) -> int:
         parent = parent or QModelIndex()
         if not parent.isValid():
             return len(self.sorted_group_ids)
-        node: GroupNode | ResultNode = parent.internalPointer()
-        return len(node.children) if isinstance(node, GroupNode) else 0
+
+        node = parent.internalPointer()
+        if isinstance(node, GroupNode):
+            return len(node.children)
+
+        return 0
 
     def columnCount(self, parent: QModelIndex | None = None) -> int:
         return 4
@@ -202,101 +265,155 @@ class ResultsTreeModel(QAbstractItemModel):
     def parent(self, index):
         if not index.isValid():
             return QModelIndex()
-        node: ResultNode | GroupNode = index.internalPointer()
-        if not node or isinstance(node, GroupNode):
+
+        node = index.internalPointer()
+
+        if isinstance(node, GroupNode):
             return QModelIndex()
-        if node.group_id in self.sorted_group_ids:
-            return self.createIndex(self.sorted_group_ids.index(node.group_id), 0, self.groups_data[node.group_id])
+
+        if isinstance(node, ResultNode):
+            group_id = node.group_id
+            if group_id in self.groups_data:
+                try:
+                    row = self.sorted_group_ids.index(group_id)
+                    return self.createIndex(row, 0, self.groups_data[group_id])
+                except ValueError:
+                    pass
         return QModelIndex()
 
     def index(self, row, col, parent: QModelIndex | None = None):
         parent = parent or QModelIndex()
-        if not self.hasIndex(row, col, parent):
-            return QModelIndex()
+
         if not parent.isValid():
-            if row < len(self.sorted_group_ids):
-                return self.createIndex(row, col, self.groups_data[self.sorted_group_ids[row]])
+            if 0 <= row < len(self.sorted_group_ids):
+                group_id = self.sorted_group_ids[row]
+                return self.createIndex(row, col, self.groups_data[group_id])
         else:
-            parent_node: GroupNode = parent.internalPointer()
-            if parent_node and row < len(parent_node.children):
+            parent_node = parent.internalPointer()
+            if isinstance(parent_node, GroupNode) and 0 <= row < len(parent_node.children):
                 return self.createIndex(row, col, parent_node.children[row])
+
         return QModelIndex()
 
     def hasChildren(self, parent: QModelIndex | None = None) -> bool:
         parent = parent or QModelIndex()
         if not parent.isValid():
             return bool(self.groups_data)
-        node: GroupNode = parent.internalPointer()
-        return node and isinstance(node, GroupNode) and node.count > 0
+
+        node = parent.internalPointer()
+        if isinstance(node, GroupNode):
+            return len(node.children) > 0
+        return False
 
     def canFetchMore(self, parent):
         if not parent.isValid():
             return False
-        node: GroupNode = parent.internalPointer()
-        if not node or not isinstance(node, GroupNode):
-            return False
-        return not node.fetched and node.group_id not in self.running_tasks
+        node = parent.internalPointer()
+        return isinstance(node, GroupNode) and not node.fetched and node.group_id not in self.pending_fetches
 
     def fetchMore(self, parent):
         if not self.canFetchMore(parent):
             return
 
-        node: GroupNode = parent.internalPointer()
+        node = parent.internalPointer()
         group_id = node.group_id
 
-        # Launch background task to fetch children
-        task = GroupFetcherTask(self.db_path, group_id, self.mode, parent)
+        self.pending_fetches[group_id] = QPersistentModelIndex(parent)
+
+        task = LanceDBGroupFetcherTask(self.db_path, group_id)
         task.signals.finished.connect(self._on_fetch_finished)
         task.signals.error.connect(self._on_fetch_error)
 
-        self.running_tasks[group_id] = task
         QThreadPool.globalInstance().start(task)
 
-    @Slot(list, int, QModelIndex)
-    def _on_fetch_finished(self, children_dicts: list[dict], group_id: int, parent_index: QModelIndex):
-        if group_id not in self.running_tasks or group_id not in self.groups_data:
+    @Slot(list, int)
+    def _on_fetch_finished(self, children_dicts: list[dict], group_id: int):
+        """
+        Handles completion of data fetching.
+        STRATEGY: Transform the dummy node into the first real node, then append rest.
+        This keeps rowCount >= 1 at all times, preventing collapse.
+        """
+        if group_id not in self.pending_fetches:
             return
 
-        node = self.groups_data[group_id]
-
-        if not children_dicts and node.count > 0:
-            self.remove_group_by_id(group_id)
-            del self.running_tasks[group_id]
+        persistent_index = self.pending_fetches.pop(group_id)
+        if not persistent_index.isValid():
             return
 
-        children = [ResultNode.from_dict(c) for c in children_dicts]
+        parent_index = QModelIndex(persistent_index)
+        node = parent_index.internalPointer()
 
-        # Populate fast lookup
+        if not isinstance(node, GroupNode):
+            return
+
+        children = []
+        for c in children_dicts:
+            try:
+                c["group_id"] = int(c.get("group_id", group_id))
+                c["is_best"] = bool(c.get("is_best", False))
+                c["distance"] = int(float(c.get("distance", 0)))
+                # Safe defaults
+                c["file_size"] = c.get("file_size") or 0
+                c["resolution_w"] = c.get("resolution_w") or 0
+                c["resolution_h"] = c.get("resolution_h") or 0
+                children.append(ResultNode.from_dict(c))
+            except Exception as e:
+                app_logger.warning(f"Error converting row to ResultNode: {e}")
+
+        children.sort(key=lambda n: (n.is_best, n.distance), reverse=True)
+
         for child in children:
             self.path_to_group_id[child.path] = group_id
             if child.is_best:
                 self.group_id_to_best_path[group_id] = child.path
 
-        self.beginInsertRows(parent_index, 0, len(children) - 1)
-        node.children = children
-        node.fetched = True
-        self.endInsertRows()
+        # === FIX START: Transform & Append Strategy ===
 
-        del self.running_tasks[group_id]
+        if not children:
+            # Error or empty group: Just remove dummy
+            self.beginRemoveRows(parent_index, 0, 0)
+            node.children = []
+            node.count = 0
+            node.fetched = True
+            self.endRemoveRows()
+            # Force UI refresh to remove expander
+            self.dataChanged.emit(parent_index, parent_index)
+            self.fetch_completed.emit(parent_index)
+            return
+
+        # 1. Update the Dummy Node (Index 0) to be Real Node #1
+        node.children[0] = children[0]
+        # Notify View that Row 0 changed (Loading... -> Real File Name)
+        self.dataChanged.emit(self.index(0, 0, parent_index), self.index(0, self.columnCount() - 1, parent_index))
+
+        # 2. Insert remaining nodes (Index 1 to N)
+        if len(children) > 1:
+            rest_children = children[1:]
+            self.beginInsertRows(parent_index, 1, len(rest_children))
+            node.children.extend(rest_children)
+            self.endInsertRows()
+
+        node.count = len(node.children)
+        node.fetched = True
+
+        # === FIX END ===
+
         self.fetch_completed.emit(parent_index)
 
     @Slot(str)
-    def _on_fetch_error(self, error_message: str):
-        app_logger.error(f"Background fetch error: {error_message}")
-        # Clean up task tracking
-        for group_id, task in list(self.running_tasks.items()):
-            if task.signals.error is self.sender():
-                del self.running_tasks[group_id]
-                break
+    def _on_fetch_error(self, error_msg: str):
+        app_logger.error(f"Fetch Error: {error_msg}")
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
-        node: GroupNode | ResultNode = index.internalPointer()
+        node = index.internalPointer()
 
         if role == SortRole:
             if isinstance(node, GroupNode):
                 return -1
+            if node.path == "loading_dummy":
+                return -999
             if node.is_best:
                 return 102
             method = node.found_by
@@ -311,10 +428,14 @@ class ResultsTreeModel(QAbstractItemModel):
         if role == Qt.ItemDataRole.DisplayRole:
             return self._get_display_data(index, node)
 
-        if role == Qt.ItemDataRole.CheckStateRole and index.column() == 0 and self.hasChildren():
+        if role == Qt.ItemDataRole.CheckStateRole and index.column() == 0:
+            if isinstance(node, ResultNode) and node.path == "loading_dummy":
+                return None
+
             if isinstance(node, GroupNode):
-                if not node.fetched or not node.children:
+                if not node.fetched:
                     return Qt.CheckState.Unchecked
+
                 checked_count = sum(
                     1 for child in node.children if self.check_states.get(child.path) == Qt.CheckState.Checked
                 )
@@ -327,12 +448,15 @@ class ResultsTreeModel(QAbstractItemModel):
             else:
                 return self.check_states.get(node.path, Qt.CheckState.Unchecked)
 
-        if (role == Qt.ItemDataRole.FontRole and index.column() == 0) and (
-            isinstance(node, GroupNode) or (isinstance(node, ResultNode) and node.is_best)
-        ):
-            font = QFont()
-            font.setBold(True)
-            return font
+        if role == Qt.ItemDataRole.FontRole and index.column() == 0:
+            if isinstance(node, GroupNode) or (isinstance(node, ResultNode) and node.is_best):
+                font = QFont()
+                font.setBold(True)
+                return font
+            if isinstance(node, ResultNode) and node.path == "loading_dummy":
+                font = QFont()
+                font.setItalic(True)
+                return font
 
         if role == Qt.ItemDataRole.BackgroundRole and isinstance(node, ResultNode) and node.is_best:
             return QBrush(QColor(UIConfig.Colors.BEST_FILE_BG))
@@ -348,10 +472,13 @@ class ResultsTreeModel(QAbstractItemModel):
                 f"{node.name} ({node.count} results)" if is_search else f"Group: {node.name} ({node.count} duplicates)"
             )
 
-        # ResultNode
+        if node.path == "loading_dummy":
+            if index.column() == 0:
+                return "Loading data..."
+            return ""
+
         path = Path(node.path)
         col = index.column()
-
         if col == 0:
             display_name = path.name
             if node.channel:
@@ -374,8 +501,11 @@ class ResultsTreeModel(QAbstractItemModel):
         if not (role == Qt.ItemDataRole.CheckStateRole and index.column() == 0):
             return super().setData(index, value, role)
 
-        node: GroupNode | ResultNode = index.internalPointer()
+        node = index.internalPointer()
         if not node:
+            return False
+
+        if isinstance(node, ResultNode) and node.path == "loading_dummy":
             return False
 
         new_check_state = Qt.CheckState(value)
@@ -391,16 +521,14 @@ class ResultsTreeModel(QAbstractItemModel):
                 if node.children:
                     first_child_idx = self.index(0, 0, index)
                     last_child_idx = self.index(len(node.children) - 1, 0, index)
-                    self.dataChanged.emit(first_child_idx, last_child_idx, [Qt.ItemDataRole.CheckStateRole])
+                    self.dataChanged.emit(
+                        first_child_idx,
+                        last_child_idx,
+                        [Qt.ItemDataRole.CheckStateRole],
+                    )
             else:
-                # Lazy fetch if user checks an unexpanded group
-                def apply_state_after_fetch(parent_index: QModelIndex):
-                    if parent_index == index:
-                        self.setData(index, value, role)
-                        self.fetch_completed.disconnect(apply_state_after_fetch)
-
-                self.fetch_completed.connect(apply_state_after_fetch)
                 self.fetchMore(index)
+
         else:
             self.check_states[node.path] = new_check_state
             parent_index = self.parent(index)
@@ -412,10 +540,11 @@ class ResultsTreeModel(QAbstractItemModel):
 
     def flags(self, index):
         flags = super().flags(index)
-        if index.isValid() and index.column() == 0 and self.hasChildren():
+        if index.isValid() and index.column() == 0:
             node = index.internalPointer()
-            if node:
-                flags |= Qt.ItemFlag.ItemIsUserCheckable
+            if isinstance(node, ResultNode) and node.path == "loading_dummy":
+                return flags
+            flags |= Qt.ItemFlag.ItemIsUserCheckable
         return flags
 
     def headerData(self, section, orientation, role):
@@ -432,6 +561,14 @@ class ResultsTreeModel(QAbstractItemModel):
             if group_id in self.groups_data:
                 del self.groups_data[group_id]
             self.endRemoveRows()
+
+    def get_group_children(self, group_id: int) -> list[ResultNode]:
+        """Returns the list of ResultNodes associated with a specific group ID."""
+        if group_id in self.groups_data:
+            node = self.groups_data[group_id]
+            if node.fetched:
+                return node.children
+        return []
 
     def sort_results(self, sort_key: str):
         if not self.groups_data:
@@ -461,10 +598,13 @@ class ResultsTreeModel(QAbstractItemModel):
     def _set_check_state_for_all(self, state_logic_func):
         if not self.groups_data:
             return
+        # Only apply to currently fetched groups to avoid mass-loading everything
         for gid in self.sorted_group_ids:
-            if self.groups_data[gid].fetched:
-                for node in self.groups_data[gid].children:
-                    self.check_states[node.path] = state_logic_func(node)
+            node = self.groups_data[gid]
+            if node.fetched:
+                for child in node.children:
+                    self.check_states[child.path] = state_logic_func(child)
+
         self.dataChanged.emit(self.index(0, 0), self.index(self.rowCount() - 1, self.columnCount() - 1))
 
     def get_link_map_for_paths(self, paths_to_replace: list[Path]) -> dict[Path, Path]:
@@ -483,44 +623,45 @@ class ResultsTreeModel(QAbstractItemModel):
         return [Path(p) for p, s in self.check_states.items() if s == Qt.CheckState.Checked]
 
     def get_summary_text(self) -> str:
-        num_groups, total_items = (
-            len(self.sorted_group_ids),
-            sum(d.count for d in self.groups_data.values()),
-        )
-        if self.filter_text and self.db_path:
-            try:
-                with duckdb.connect(database=str(self.db_path), read_only=True) as conn:
-                    unfiltered_groups = conn.execute("SELECT COUNT(DISTINCT group_id) FROM results").fetchone()[0]
-                    unfiltered_items = conn.execute("SELECT COUNT(*) FROM results WHERE is_best = FALSE").fetchone()[0]
-                    return f"(showing {num_groups} of {unfiltered_groups} Groups, {total_items} of {unfiltered_items} duplicates)"
-            except duckdb.Error:
-                pass
+        num_groups = len(self.sorted_group_ids)
+        # Calculate total duplicates from summary data in GroupNodes (node.count - 1 usually)
+        total_items = sum(max(0, d.count - 1) for d in self.groups_data.values())
+
         return (
-            f"({num_groups} Groups, {total_items} duplicates)"
+            f"({num_groups} Groups, ~{total_items} duplicates)"
             if self.mode == ScanMode.DUPLICATES
-            else f"({total_items} results found)"
+            else f"({sum(d.count for d in self.groups_data.values())} results found)"
         )
 
     def remove_deleted_paths(self, deleted_paths: list[Path]):
-        deleted_set = {str(p) for p in deleted_paths}
+        # Use normcase to handle Windows case-insensitivity correctly
+        deleted_set = {os.path.normcase(str(p)) for p in deleted_paths}
         groups_to_remove = []
 
         for gid, data in self.groups_data.items():
-            if data.fetched:
-                data.children = [f for f in data.children if f.path not in deleted_set]
-                data.count = len(data.children)
+            if not data.fetched:
+                continue
 
-            min_items = 2 if self.mode == ScanMode.DUPLICATES else 1
-            if data.count < min_items:
-                groups_to_remove.append(gid)
-            elif (
-                data.fetched
-                and self.mode == ScanMode.DUPLICATES
-                and not any(f.is_best for f in data.children)
-                and data.children
-            ):
-                # Promote new best if best was deleted
-                data.children[0].is_best = True
+            # Filter children using normalized paths
+            original_count = len(data.children)
+            data.children = [f for f in data.children if os.path.normcase(str(f.path)) not in deleted_set]
+            data.count = len(data.children)
+
+            if data.count != original_count:
+                min_items = 2 if self.mode == ScanMode.DUPLICATES else 1
+                if data.count < min_items:
+                    groups_to_remove.append(gid)
+                elif self.mode == ScanMode.DUPLICATES and not any(f.is_best for f in data.children) and data.children:
+                    # Promote new best if best was deleted
+                    # ResultNode is frozen/slots, so we must replace it
+                    old_best = data.children[0]
+                    new_best = ResultNode(
+                        **{f.name: getattr(old_best, f.name) for f in fields(ResultNode) if f.name != "is_best"},
+                        is_best=True,
+                    )
+                    data.children[0] = new_best
+                    # Update lookup
+                    self.group_id_to_best_path[gid] = new_best.path
 
         for gid in groups_to_remove:
             if gid in self.groups_data:
@@ -528,9 +669,10 @@ class ResultsTreeModel(QAbstractItemModel):
 
         self.sorted_group_ids = [gid for gid in self.sorted_group_ids if gid not in groups_to_remove]
 
+        # Clear check states for deleted paths
         paths_to_clear = list(self.check_states.keys())
         for path_str in paths_to_clear:
-            if path_str in deleted_set:
+            if os.path.normcase(path_str) in deleted_set:
                 del self.check_states[path_str]
 
 
@@ -538,11 +680,14 @@ class ImagePreviewModel(QAbstractListModel):
     """
     Data model for the image preview list.
     Implements ACTIVE TASK CANCELLATION to prevent scroll lag.
+    Receives data directly from the UI panel (which gets it from ResultsTreeModel).
     """
+
+    file_missing = Signal(Path)
 
     def __init__(self, thread_pool: QThreadPool, parent=None):
         super().__init__(parent)
-        self.db_path: Path | None = None
+        # Note: No db_path needed anymore, data comes pre-loaded in `items`
         self.group_id: int = -1
         self.items: list[ResultNode] = []
         self.pixmap_cache: OrderedDict[str, QPixmap] = OrderedDict()
@@ -580,58 +725,16 @@ class ImagePreviewModel(QAbstractListModel):
         for task in self.active_tasks.values():
             task.cancel()
         self.active_tasks.clear()
-        # We don't clear loading_paths here immediately, they are cleared in callbacks
-        # or reset in clear_cache()
 
     def set_items_from_list(self, items: list[ResultNode]):
         self.cancel_all_tasks()
         self.beginResetModel()
-        self.db_path = None
         self.group_id = -1
         self.items = items
         self.pixmap_cache.clear()
         self.loading_paths.clear()
         self.error_paths.clear()
         self.group_base_channel = None
-        self.endResetModel()
-
-    def set_group(self, db_path: Path, group_id: int):
-        self.cancel_all_tasks()
-        self.beginResetModel()
-        self.db_path = db_path
-        self.group_id = group_id
-        self.items.clear()
-        self.pixmap_cache.clear()
-        self.loading_paths.clear()
-        self.error_paths.clear()
-        self.group_base_channel = None
-
-        if DUCKDB_AVAILABLE and self.group_id != -1:
-            try:
-                with duckdb.connect(database=str(self.db_path), read_only=True) as conn:
-                    # Context check
-                    group_context_query = "SELECT search_context FROM results WHERE group_id = ? AND is_best = TRUE"
-                    context_result = conn.execute(group_context_query, [self.group_id]).fetchone()
-                    if context_result and context_result[0] and context_result[0].startswith("channel:"):
-                        self.group_base_channel = context_result[0].split(":", 1)[1]
-
-                    is_search = conn.execute(
-                        "SELECT MAX(search_context) IS NOT NULL FROM results WHERE group_id = ?",
-                        [self.group_id],
-                    ).fetchone()[0]
-
-                    query = "SELECT * FROM results WHERE group_id = ?"
-                    if is_search and not self.group_base_channel:
-                        query += " AND is_best = FALSE"
-                    query += " ORDER BY is_best DESC, distance DESC"
-
-                    cols = [desc[0] for desc in conn.execute(query, [self.group_id]).description]
-                    for row_tuple in conn.execute(query, [self.group_id]).fetchall():
-                        row_dict = dict(zip(cols, row_tuple, strict=False))
-                        if Path(row_dict["path"]).exists():
-                            self.items.append(ResultNode.from_dict(row_dict))
-            except duckdb.Error as e:
-                app_logger.error(f"Failed to load group {self.group_id}: {e}")
         self.endResetModel()
 
     def rowCount(self, parent: QModelIndex | None = None) -> int:
@@ -706,18 +809,23 @@ class ImagePreviewModel(QAbstractListModel):
             self.loading_paths.remove(ui_key)
             if ui_key in self.active_tasks:
                 del self.active_tasks[ui_key]
+
+            if "File not found" in error_msg:
+                for item in self.items:
+                    if str(item.path) in ui_key:
+                        self.file_missing.emit(Path(item.path))
+                        return
+
             self.error_paths[ui_key] = error_msg
             self._emit_data_changed_for_key(ui_key)
 
     def _emit_data_changed_for_key(self, ui_key: str):
         # Reconstruct row from key. Key format: "{path}_{channel or 'full'}"
-        # We iterate to find the matching item. This is fast enough for UI updates.
         for i, item in enumerate(self.items):
             item_key = f"{item.path}_{item.channel or 'full'}"
             if item_key == ui_key:
                 index = self.index(i, 0)
                 self.dataChanged.emit(index, index, [Qt.ItemDataRole.DecorationRole])
-                # One key maps to one row in this model
                 break
 
     def get_row_for_path(self, path: Path) -> int | None:
@@ -788,10 +896,7 @@ class ImageItemDelegate(QStyledItemDelegate):
 
         item_data = index.data(Qt.ItemDataRole.UserRole)
         channel = item_data.channel if item_data else None
-        # Note: The key generation logic is now encapsulated in the model, but the delegate
-        # checks for errors via the model's public property if needed.
-        # For simple display, just checking pixmap is enough.
-        # But to show specific "Error", we need to check model.error_paths
+        # Key must match how model generates it
         cache_key = f"{item_data.path}_{channel or 'full'}"
         error_msg = self.parent().model.error_paths.get(cache_key)
 
@@ -835,7 +940,11 @@ class ImageItemDelegate(QStyledItemDelegate):
         if item_data.channel:
             filename += f" ({item_data.channel})"
 
-        painter.drawText(x, y, self.bold_font_metrics.elidedText(filename, Qt.ElideRight, text_rect.width()))
+        painter.drawText(
+            x,
+            y,
+            self.bold_font_metrics.elidedText(filename, Qt.ElideRight, text_rect.width()),
+        )
 
         y += line_height
         painter.setFont(QFont())
@@ -855,7 +964,11 @@ class ImageItemDelegate(QStyledItemDelegate):
         meta_text = _format_metadata_string(item_data)
         full_text = f"{dist_text}{meta_text}"
 
-        painter.drawText(x, y, self.regular_font_metrics.elidedText(full_text, Qt.ElideRight, text_rect.width()))
+        painter.drawText(
+            x,
+            y,
+            self.regular_font_metrics.elidedText(full_text, Qt.ElideRight, text_rect.width()),
+        )
 
         y += line_height
         painter.drawText(
@@ -888,8 +1001,12 @@ class ResultsProxyModel(QSortFilterProxyModel):
         if not source_index.isValid():
             return False
 
-        node: ResultNode | GroupNode = source_index.internalPointer()
+        node = source_index.internalPointer()
         if not node or isinstance(node, GroupNode):
+            return True
+
+        # Always allow the dummy node to prevent filtering out the loading state
+        if node.path == "loading_dummy":
             return True
 
         if node.is_best or node.found_by in METHOD_DISPLAY_NAMES:
