@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 import numpy as np
-from scipy.sparse import coo_matrix, csgraph
 
 from app.data_models import (
     AnalysisItem,
@@ -26,9 +25,9 @@ from app.data_models import (
 )
 from app.image_io import get_image_metadata
 from app.services.signal_bus import SignalBus
-from app.utils import find_best_in_group
+from app.utils import UnionFind, find_best_in_group
 
-from .engines import LanceDBSimilarityEngine
+from .engines import DuckDBSimilarityEngine
 from .hashing_worker import (
     worker_calculate_hashes_and_meta,
     worker_calculate_perceptual_hashes,
@@ -49,8 +48,7 @@ class EvidenceRecord:
 
 class PrecisionClusterManager:
     """
-    Manages relationships between files using Graph Theory.
-    OPTIMIZED: Uses string keys for performance and Star Topology for precision.
+    Manages relationships between files using Graph Theory (Union-Find).
     """
 
     def __init__(self):
@@ -58,55 +56,34 @@ class PrecisionClusterManager:
         self.evidence_map: dict[tuple[Any, Any], EvidenceRecord] = {}
 
     def add_evidence(self, node1: Any, node2: Any, method: str, confidence: float):
-        """
-        node1/node2 should be simple types (strings) for performance.
-        """
         self.edges.append((node1, node2, method, confidence))
-
-        # Store evidence with a consistent key (sorted strings)
         key = tuple(sorted((str(node1), str(node2))))
-
         if key not in self.evidence_map or method == EvidenceMethod.XXHASH.value:
             self.evidence_map[key] = EvidenceRecord(method, confidence)
 
     def get_final_groups(self, fp_resolver: Callable[[Any], ImageFingerprint | None]) -> dict:
-        """
-        1. Builds Graph -> Connected Components.
-        2. Refines clusters using Star Topology (Leader-based filtering).
-        """
         if not self.edges:
             return {}
 
-        # 1. Map nodes to integers for SciPy (Fastest way)
+        # 1. Find Connected Components using Union-Find
         unique_nodes = set()
         for u, v, _, _ in self.edges:
             unique_nodes.add(u)
             unique_nodes.add(v)
 
-        nodes_list = list(unique_nodes)
-        node_to_idx = {node: i for i, node in enumerate(nodes_list)}
-        n_nodes = len(nodes_list)
+        uf = UnionFind()
+        for u, v, _, _ in self.edges:
+            uf.union(u, v)
 
-        rows = [node_to_idx[u] for u, v, _, _ in self.edges]
-        cols = [node_to_idx[v] for u, v, _, _ in self.edges]
-        data = [1] * len(self.edges)
-
-        # 2. Find Connected Components (Loose Groups)
-        matrix = coo_matrix((data, (rows, cols)), shape=(n_nodes, n_nodes))
-        _, labels = csgraph.connected_components(matrix, connection="weak", directed=False)
-
-        raw_groups = defaultdict(list)
-        for node_idx, label in enumerate(labels):
-            raw_groups[label].append(nodes_list[node_idx])
+        raw_groups_map = uf.get_groups()
 
         final_groups = {}
 
-        # 3. Refine Groups (Star Topology)
-        for members in raw_groups.values():
+        # 2. Refine Groups (Star Topology)
+        for members in raw_groups_map.values():
             if len(members) < 2:
                 continue
 
-            # Resolve fingerprints (String Key -> ImageFingerprint)
             fps_map = {}
             for node in members:
                 fp = fp_resolver(node)
@@ -117,28 +94,28 @@ class PrecisionClusterManager:
                 continue
 
             fingerprints = list(fps_map.values())
-
-            # Determine the "Leader" (Best File)
             best_fp = find_best_in_group(fingerprints)
-
-            # Find the node key corresponding to the best fingerprint
             best_node = next(node for node, fp in fps_map.items() if fp == best_fp)
 
             duplicates = set()
 
-            # Filter: Keep only items directly linked to the Leader
             for node, fp in fps_map.items():
                 if fp == best_fp:
                     continue
 
+                # Check for DIRECT link to the Leader (Best File)
                 key = tuple(sorted((str(best_node), str(node))))
                 evidence = self.evidence_map.get(key)
 
                 if evidence:
+                    # Direct link exists (score >= threshold), add to results
                     score = self._evidence_to_score(evidence)
                     duplicates.add((fp, score, evidence.method))
-                else:
-                    pass
+
+                # STRICT MODE:
+                # The 'else' block for indirect matches has been removed.
+                # If a file is part of the chain but does not directly match
+                # the Best file above the threshold, it is excluded.
 
             if duplicates:
                 final_groups[best_fp] = duplicates
@@ -159,8 +136,8 @@ class ScanContext:
     signals: SignalBus
     stop_event: threading.Event
     scanner_core: Any
-    lancedb_db: Any
-    lancedb_table: Any
+    session_conn: Any
+    vectors_table_name: str
     all_image_fps: dict[Path, ImageFingerprint] = field(default_factory=dict)
     files_to_process: list[Path] = field(default_factory=list)
     items_to_process: list[AnalysisItem] = field(default_factory=list)
@@ -208,21 +185,30 @@ class ExactDuplicateStage(ScanStage):
                     context.all_image_fps[path] = ImageFingerprint(path=path, hashes=np.array([]), **meta)
             return True
 
+        # If we are comparing by channel, we must NOT filter out exact duplicates here.
+        # Why? Because Exact Duplicate check works on the whole file.
+        # Channel split happens LATER. If we remove File B because it's same as File A,
+        # we will never generate R/G/B channels for File B, and AI won't find matches for it per-channel.
+        if context.config.compare_by_channel:
+            app_logger.info("Skipping exact duplicate filtering to ensure all channels are processed.")
+            # Still calculate metadata for everyone
+            for path in context.files_to_process:
+                if path not in context.all_image_fps and (meta := get_image_metadata(path)):
+                    context.all_image_fps[path] = ImageFingerprint(path=path, hashes=np.array([]), **meta)
+            return True
+
         total_files = len(context.files_to_process)
         context.state.update_progress(0, total_files, "Calculating exact file hashes (Multicore)...")
-
         hash_map = defaultdict(list)
 
         with ProcessPoolExecutor(max_workers=context.config.perf.num_workers) as executor:
             futures = {
                 executor.submit(worker_calculate_hashes_and_meta, path): path for path in context.files_to_process
             }
-
             for completed_count, future in enumerate(as_completed(futures), start=1):
                 if context.stop_event.is_set():
                     executor.shutdown(wait=False, cancel_futures=True)
                     return False
-
                 try:
                     result = future.result()
                     if result:
@@ -232,25 +218,18 @@ class ExactDuplicateStage(ScanStage):
                         hash_map[fp.xxhash].append(fp.path)
                 except Exception as e:
                     app_logger.warning(f"Hash calculation error: {e}")
-
                 if completed_count % 100 == 0:
                     context.state.update_progress(completed_count, total_files)
 
-        # Memory Optimization: Use Strings for Cluster Manager keys
         for paths in hash_map.values():
             if not paths:
                 continue
-            rep_path = paths[0]  # Representative
-
+            rep_path = paths[0]
             for other_path in paths[1:]:
-                # Key format: (Path_String, Channel_None)
                 node1 = (str(rep_path), None)
                 node2 = (str(other_path), None)
                 context.cluster_manager.add_evidence(node1, node2, EvidenceMethod.XXHASH.value, 0.0)
-
-        # Filter: Only keep one representative per exact group for further analysis
         context.files_to_process = [paths[0] for paths in hash_map.values() if paths]
-
         app_logger.info(f"ExactDuplicateStage: {len(context.files_to_process)} unique files passed to AI.")
         return not context.stop_event.is_set()
 
@@ -263,27 +242,22 @@ class ItemGenerationStage(ScanStage):
     def run(self, context: ScanContext) -> bool:
         items = []
         cfg = context.config
-
         for path in context.files_to_process:
-            # Ensure fingerprint exists
             if path not in context.all_image_fps:
                 if meta := get_image_metadata(path):
                     context.all_image_fps[path] = ImageFingerprint(path=path, hashes=np.array([]), **meta)
                 else:
                     context.all_skipped_files.append(str(path))
                     continue
-
             if cfg.compare_by_channel and (
                 not cfg.channel_split_tags or any(tag in path.name.lower() for tag in cfg.channel_split_tags)
             ):
                 for channel in cfg.active_channels:
                     items.append(AnalysisItem(path=path, analysis_type=channel))
-
             elif cfg.compare_by_luminance:
                 items.append(AnalysisItem(path=path, analysis_type="Luminance"))
             else:
                 items.append(AnalysisItem(path=path, analysis_type="Composite"))
-
         context.items_to_process = items
         app_logger.info(f"ItemGenerationStage: Generated {len(items)} analysis items.")
         return not context.stop_event.is_set()
@@ -305,7 +279,6 @@ class PerceptualDuplicateStage(ScanStage):
 
         total_items = len(context.items_to_process)
         context.state.update_progress(0, total_items, "Calculating perceptual hashes (Multicore)...")
-
         item_hashes = {}
         worker_func = partial(
             worker_calculate_perceptual_hashes, ignore_solid_channels=context.config.ignore_solid_channels
@@ -313,18 +286,15 @@ class PerceptualDuplicateStage(ScanStage):
 
         with ProcessPoolExecutor(max_workers=context.config.perf.num_workers) as executor:
             futures = {executor.submit(worker_func, item): item for item in context.items_to_process}
-
             for processed_count, future in enumerate(as_completed(futures), start=1):
                 if context.stop_event.is_set():
                     executor.shutdown(wait=False, cancel_futures=True)
                     return False
-
                 try:
                     result = future.result()
                     if result:
                         item_key = AnalysisItem(path=result["path"], analysis_type=result["analysis_type"])
                         item_hashes[item_key] = result
-
                         if fp := context.all_image_fps.get(result["path"]):
                             fp.dhash = result.get("dhash")
                             fp.phash = result.get("phash")
@@ -334,7 +304,6 @@ class PerceptualDuplicateStage(ScanStage):
                             fp.has_alpha = result["precise_meta"]["has_alpha"]
                 except Exception as e:
                     app_logger.warning(f"Perceptual hash error: {e}")
-
                 if processed_count % 50 == 0:
                     context.state.update_progress(processed_count, total_items)
 
@@ -350,7 +319,6 @@ class PerceptualDuplicateStage(ScanStage):
             self._run_bucketing_clustering(
                 context, item_hashes, "whash", EvidenceMethod.WHASH, context.config.whash_threshold
             )
-
         return not context.stop_event.is_set()
 
     def _run_bucketing_clustering(
@@ -362,65 +330,44 @@ class PerceptualDuplicateStage(ScanStage):
         if not items_with_hashes:
             return
 
-        # Convert hashes to a numpy array of uint64 for vectorized processing
         uint64_hashes = np.array(
             [int("".join(row.astype(int).astype(str)), 2) for row in (h.hash.flatten() for _, h in items_with_hashes)],
             dtype=np.uint64,
         )
-
-        num_bands = 4
-        band_size = 16
+        num_bands, band_size = 4, 16
         buckets = [defaultdict(list) for _ in range(num_bands)]
 
-        # Bucket distribution
         for i, h in enumerate(uint64_hashes):
             for band_idx in range(num_bands):
                 key = (h >> (band_idx * band_size)) & 0xFFFF
                 buckets[band_idx][key].append(i)
 
         processed_pairs = set()
-
-        # OPTIMIZED: Vectorized matching within buckets using NumPy
         for bucket_group in buckets:
             for bucket_indices in bucket_group.values():
                 n = len(bucket_indices)
                 if n < 2:
                     continue
-
-                # Create a subset array for the current bucket
                 bucket_hashes = uint64_hashes[bucket_indices]
-
-                # Iterate over elements, comparing pivot vs rest-of-bucket in one go
                 for i in range(n - 1):
                     pivot_val = bucket_hashes[i]
                     pivot_real_idx = bucket_indices[i]
-
-                    # XOR the pivot against all remaining candidates in the bucket
                     candidates_hashes = bucket_hashes[i + 1 :]
                     xor_results = np.bitwise_xor(candidates_hashes, pivot_val)
-
-                    # Calculate Hamming distance (population count)
-                    # int.bit_count() is available in Python 3.10+ and is very fast
                     distances = [int(x).bit_count() for x in xor_results]
-
                     for j, dist in enumerate(distances):
                         if dist <= threshold:
                             candidate_real_idx = bucket_indices[i + 1 + j]
-
                             pair_key = tuple(sorted((pivot_real_idx, candidate_real_idx)))
                             if pair_key in processed_pairs:
                                 continue
                             processed_pairs.add(pair_key)
-
                             item1 = items_with_hashes[pivot_real_idx][0]
                             item2 = items_with_hashes[candidate_real_idx][0]
-
                             ch1 = item1.analysis_type if item1.analysis_type != "Composite" else None
                             ch2 = item2.analysis_type if item2.analysis_type != "Composite" else None
-
                             node1 = (str(item1.path), ch1)
                             node2 = (str(item2.path), ch2)
-
                             context.cluster_manager.add_evidence(node1, node2, method.value, 0.0)
 
 
@@ -430,19 +377,16 @@ class FingerprintGenerationStage(ScanStage):
         return "Phase 5/7: Creating AI fingerprints..."
 
     def run(self, context: ScanContext) -> bool:
-        if not context.config.use_ai:
+        if not context.config.use_ai or not context.items_to_process:
             return True
-        if not context.items_to_process:
-            return True
-
         pipeline_manager = PipelineManager(
             config=context.config,
             state=context.state,
             signals=context.signals,
-            lancedb_table=context.lancedb_table,
+            db_connection=context.session_conn,
+            table_name=context.vectors_table_name,
             stop_event=context.stop_event,
         )
-
         success, skipped = pipeline_manager.run(context)
         context.all_skipped_files.extend(skipped)
         return success
@@ -454,39 +398,6 @@ class DatabaseIndexStage(ScanStage):
         return "Phase 6/7: Optimizing database for fast search..."
 
     def run(self, context: ScanContext) -> bool:
-        if not context.config.use_ai:
-            return True
-        try:
-            table = context.lancedb_table
-            num_rows = table.to_lance().count_rows()
-
-            # OPTIMIZATION: Skip indexing for small datasets (< 50k) or In-Memory DB.
-            # Brute-force vector search is faster than building/querying an index for these sizes.
-            if num_rows < 50000 or context.config.lancedb_in_memory:
-                app_logger.info(
-                    f"Skipping index creation (Rows: {num_rows}, In-Mem: {context.config.lancedb_in_memory})."
-                )
-                return True
-
-            context.signals.log_message.emit(f"Indexing {num_rows} vectors...", "info")
-            num_partitions = min(2048, max(128, int(num_rows**0.5)))
-
-            # Dynamic sub-vectors calculation
-            dim = context.config.model_dim
-            if dim % 96 == 0:
-                sub_vectors = 96
-            elif dim % 64 == 0:
-                sub_vectors = 64
-            elif dim % 32 == 0:
-                sub_vectors = 32
-            else:
-                sub_vectors = dim // 16
-
-            table.create_index(
-                metric="cosine", num_partitions=num_partitions, num_sub_vectors=sub_vectors, replace=True
-            )
-        except Exception as e:
-            app_logger.error(f"Index creation failed: {e}")
         return True
 
 
@@ -498,24 +409,16 @@ class AILinkingStage(ScanStage):
     def run(self, context: ScanContext) -> bool:
         if not context.config.use_ai:
             return True
-
-        sim_engine = LanceDBSimilarityEngine(
-            context.config, context.state, context.signals, context.lancedb_db, context.lancedb_table
+        sim_engine = DuckDBSimilarityEngine(
+            context.config, context.state, context.signals, context.session_conn, context.vectors_table_name
         )
-
         links_found = sim_engine.find_similar_pairs(context.stop_event) or []
-
         for path1, ch1, path2, ch2, dist in links_found:
             if context.stop_event.is_set():
                 return False
-
-            # Optimization: Use raw strings directly from LanceDB
             channel1 = ch1 if ch1 != "RGB" else None
             channel2 = ch2 if ch2 != "RGB" else None
-
             node1 = (path1, channel1)
             node2 = (path2, channel2)
-
             context.cluster_manager.add_evidence(node1, node2, EvidenceMethod.AI.value, dist)
-
         return not context.stop_event.is_set()

@@ -35,9 +35,7 @@ MODELS_DIR = APP_DATA_DIR / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 HF_CACHE_DIR = APP_DATA_DIR / ".hf_cache"
-# Set HF Home before importing transformers to redirect cache
 os.environ["HF_HOME"] = str(HF_CACHE_DIR.resolve())
-# Fix for OpenMP conflict errors
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 # --- File Paths ---
@@ -53,20 +51,11 @@ LOG_FILE = APP_DATA_DIR / "app_log.txt"
 CUSTOM_MODELS_CONFIG_FILE = APP_DATA_DIR / "custom_models.json"
 
 # --- Library Availability Checks ---
-
-# Check for Deep Learning libs (Lazy check via find_spec to avoid load cost)
 DEEP_LEARNING_AVAILABLE = all(importlib.util.find_spec(pkg) for pkg in ["onnxruntime", "transformers", "torch"])
-
-# Image Engines
 OIIO_AVAILABLE = bool(importlib.util.find_spec("OpenImageIO"))
-
-# Database & Utilities
 DUCKDB_AVAILABLE = bool(importlib.util.find_spec("duckdb"))
-LANCEDB_AVAILABLE = bool(importlib.util.find_spec("lancedb"))
-ZSTD_AVAILABLE = bool(importlib.util.find_spec("zstandard"))
 OCIO_AVAILABLE = bool(importlib.util.find_spec("simple_ocio"))
 
-# Robust check for local DirectXTex binary (DDS support)
 try:
     import directxtex_decoder  # noqa: F401
 
@@ -80,7 +69,6 @@ try:
 except (ImportError, NameError):
     PILLOW_AVAILABLE = False
 
-# --- Library Optimizations ---
 if DEEP_LEARNING_AVAILABLE:
     try:
         from transformers import logging as transformers_logging
@@ -129,7 +117,6 @@ ALL_SUPPORTED_EXTENSIONS = sorted(set(_all_ext))
 
 # --- AI Models Configuration ---
 def _get_default_models() -> dict:
-    """Returns the hardcoded, built-in model configurations."""
     return {
         "Fastest (OpenCLIP ViT-B/32)": {
             "hf_name": "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
@@ -180,9 +167,6 @@ def _get_default_models() -> dict:
 
 
 def _load_models_config() -> dict:
-    """
-    Loads model configurations by merging built-in defaults with user-defined custom models.
-    """
     all_models = _get_default_models()
     if CUSTOM_MODELS_CONFIG_FILE.exists():
         try:
@@ -210,7 +194,6 @@ def _load_models_config() -> dict:
 SUPPORTED_MODELS = _load_models_config()
 
 
-# --- UI Configuration and Enums ---
 class UIConfig:
     class Colors:
         SUCCESS = "#4CAF50"
@@ -236,7 +219,6 @@ class UIConfig:
         SORT_OPTIONS: ClassVar[list[str]] = ["By Duplicate Count", "By Size on Disk", "By Filename"]
 
 
-# --- Search Configuration ---
 SEARCH_PRECISION_PRESETS = {
     "Fast": {"nprobes": 8, "refine_factor": 1},
     "Balanced (Default)": {"nprobes": 20, "refine_factor": 3},
@@ -264,7 +246,6 @@ class TonemapMode(Enum):
     ENABLED = "enabled"
 
 
-# --- Data Model and UI Constants ---
 METHOD_DISPLAY_NAMES = {
     "xxHash": "Exact Match",
     "dHash": "Simple Match",

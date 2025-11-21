@@ -3,7 +3,6 @@ import logging
 from pathlib import Path
 from typing import Any
 
-import numba
 import numpy as np
 from PIL import Image
 
@@ -15,23 +14,88 @@ from .base_loader import BaseLoader
 if DIRECTXTEX_AVAILABLE:
     import directxtex_decoder
 
+# --- OPTIONAL NUMBA SUPPORT ---
+try:
+    import numba
+
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+
 app_logger = logging.getLogger("AssetPixelHand.dds_loader")
 
 
-@numba.njit(parallel=True, fastmath=True)
-def _unpremultiply_alpha_numba(arr: np.ndarray) -> np.ndarray:
-    """Performs an 'un-premultiply' operation on a uint8 RGBA NumPy array."""
-    for y in numba.prange(arr.shape[0]):
-        for x in range(arr.shape[1]):
-            alpha = arr[y, x, 3]
-            if alpha > 0:
-                r_new = np.uint16(arr[y, x, 0]) * 255 // alpha
-                g_new = np.uint16(arr[y, x, 1]) * 255 // alpha
-                b_new = np.uint16(arr[y, x, 2]) * 255 // alpha
-                arr[y, x, 0] = min(r_new, 255)
-                arr[y, x, 1] = min(g_new, 255)
-                arr[y, x, 2] = min(b_new, 255)
+# 1. Pure NumPy implementation (Fallback)
+def _unpremultiply_alpha_numpy(arr: np.ndarray) -> np.ndarray:
+    """
+    Optimized Vectorized NumPy implementation.
+    Uses inverse alpha multiplication to avoid 3 separate divisions.
+    Formula: C_new = C_old * (255.0 / Alpha)
+    """
+    # Extract alpha as float to prevent overflow
+    alpha = arr[..., 3].astype(np.float32)
+
+    # Mask for non-zero, non-full alpha (optimization: skip calc for 0 or 255 alpha regions if possible,
+    # but masking is usually faster for general case)
+    mask = (alpha > 0) & (alpha < 255)
+
+    # If no semi-transparent pixels, return early (Huge speedup for standard textures)
+    if not np.any(mask):
+        return arr
+
+    # Pre-calculate inverse alpha factor for masked pixels only
+    # inv_alpha = 255.0 / alpha[mask]
+    # Using division directly on channels might be cleaner for memory if mask is large
+
+    # We process RGB channels in-place where possible
+    for i in range(3):
+        channel = arr[..., i].astype(np.float32)
+
+        # Apply formula: channel * 255 / alpha
+        # Using where=mask to only compute necessary pixels
+        np.divide(channel * 255.0, alpha, out=channel, where=mask)
+
+        # Clip and assign back
+        # Note: using 'out=' in clip isn't always faster due to casting, direct assign is fine
+        arr[..., i] = np.clip(channel, 0, 255).astype(np.uint8)
+
     return arr
+
+
+# 2. Numba implementation (High Performance)
+if NUMBA_AVAILABLE:
+
+    @numba.njit(parallel=True, fastmath=True, cache=True)
+    def _unpremultiply_alpha_numba(arr: np.ndarray) -> np.ndarray:
+        """
+        JIT-compiled parallel implementation.
+        Iterates pixels directly, utilizing CPU L1/L2 cache effectively.
+        """
+        rows = arr.shape[0]
+        cols = arr.shape[1]
+
+        for y in numba.prange(rows):
+            for x in range(cols):
+                alpha = arr[y, x, 3]
+                # Only process semi-transparent pixels
+                if alpha > 0 and alpha < 255:
+                    # Integer math is faster here in C-level code
+                    r = np.uint32(arr[y, x, 0])
+                    g = np.uint32(arr[y, x, 1])
+                    b = np.uint32(arr[y, x, 2])
+
+                    # Multiplication before division for precision
+                    # (color * 255) // alpha
+                    arr[y, x, 0] = min((r * 255) // alpha, 255)
+                    arr[y, x, 1] = min((g * 255) // alpha, 255)
+                    arr[y, x, 2] = min((b * 255) // alpha, 255)
+        return arr
+
+    # Select Numba version
+    _unpremultiply_alpha = _unpremultiply_alpha_numba
+else:
+    # Select NumPy version
+    _unpremultiply_alpha = _unpremultiply_alpha_numpy
 
 
 class DirectXTexLoader(BaseLoader):
@@ -98,14 +162,17 @@ class DirectXTexLoader(BaseLoader):
         rgb, alpha = arr[:, :, :3], arr[:, :, 3]
         alpha_max, rgb_max = np.max(alpha), np.max(rgb)
 
+        # Optimization: Pure emission (Alpha ~0 but Color > 0)
         if alpha_max < 5 and rgb_max > 0:
             arr[:, :, 3] = np.max(rgb, axis=2)
             return Image.fromarray(arr)
 
+        # Optimization: Pure alpha mask (Color ~0)
         if rgb_max == 0 and alpha_max > 0:
             if np.max(alpha) != np.min(alpha):
                 arr[:, :, :3] = alpha[:, :, np.newaxis]
                 arr[:, :, 3] = 255
             return Image.fromarray(arr)
 
-        return Image.fromarray(_unpremultiply_alpha_numba(arr))
+        # Use the selected implementation (Numba or NumPy)
+        return Image.fromarray(_unpremultiply_alpha(arr))

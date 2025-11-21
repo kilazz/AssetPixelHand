@@ -7,7 +7,6 @@ consistency and avoids circular import dependencies.
 
 import json
 import threading
-import uuid
 from dataclasses import dataclass, field, fields
 from enum import Enum, auto
 from pathlib import Path
@@ -113,34 +112,6 @@ class ImageFingerprint:
         if isinstance(other, ImageFingerprint):
             return self.path == other.path and self.channel == other.channel
         return NotImplemented
-
-    def to_lancedb_dict(self, channel: str | None = None) -> dict[str, Any]:
-        """Converts the object to a dictionary suitable for writing to LanceDB."""
-        final_channel = channel or self.channel
-
-        # Ensure vector is a flat list for LanceDB
-        vector_list = self.hashes.tolist() if isinstance(self.hashes, np.ndarray) else self.hashes
-
-        data = {
-            "id": str(uuid.uuid5(uuid.NAMESPACE_URL, str(self.path) + (final_channel or ""))),
-            "vector": vector_list,
-            "path": str(self.path),
-            "resolution_w": int(self.resolution[0]),
-            "resolution_h": int(self.resolution[1]),
-            "file_size": int(self.file_size),
-            "mtime": float(self.mtime),
-            "capture_date": float(self.capture_date) if self.capture_date is not None else None,
-            "format_str": str(self.format_str),
-            "compression_format": str(self.compression_format),
-            "format_details": str(self.format_details),
-            "has_alpha": bool(self.has_alpha),
-            "bit_depth": int(self.bit_depth),
-            "mipmap_count": int(self.mipmap_count),
-            "texture_type": str(self.texture_type),
-            "color_space": str(self.color_space) if self.color_space is not None else None,
-            "channel": final_channel,
-        }
-        return data
 
     @classmethod
     def from_db_row(cls, row: dict) -> "ImageFingerprint":
@@ -265,6 +236,7 @@ class ScanConfig:
 
     # --- All fields WITH a default value MUST come after ---
     ignore_solid_channels: bool = True
+    ai_ignore_alpha: bool = True
 
     # Selected Channels (R, G, B, A)
     active_channels: list[str] = field(default_factory=lambda: ["R", "G", "B", "A"])
@@ -289,6 +261,7 @@ class HashingSettings:
     compare_by_channel: bool = False
     channel_split_tags: str = ""
     ignore_solid_channels: bool = True
+    ai_ignore_alpha: bool = True
 
     # Channel toggles for persistence
     channel_r: bool = True

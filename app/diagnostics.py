@@ -85,17 +85,13 @@ def check_library_imports() -> bool:
         "Data Handling and Vector DB": {
             "numpy": "numpy",
             "duckdb": "duckdb",
-            "lancedb": "lancedb",
             "pyarrow": "pyarrow",
-            "polars": "polars",
         },
         "Image Hashing": {"PIL": "Pillow", "imagehash": "ImageHash", "xxhash": "xxhash"},
-        "Scientific and Math": {"scipy": "scipy"},
         "Advanced Image I/O": {
             "OpenImageIO": "OpenImageIO",
             "simple_ocio": "simple-ocio",
         },
-        "Performance (Optional)": {"zstandard": "zstandard"},
     }
 
     overall_ok = True

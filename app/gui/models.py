@@ -646,9 +646,7 @@ class ImagePreviewModel(QAbstractListModel):
         path_str = item.path
         channel_to_load = item.channel
 
-        # Composite key for caching (Path + Channel + Tonemap + Size)
-        # Actually, cache key is generated inside loader, but we need a unique key for UI tracking
-        # The simple key (path + channel) is enough for the view model to track active loads for this row
+        # Unique key for this specific UI item (path + channel)
         cache_key = f"{path_str}_{channel_to_load or 'full'}"
 
         if role == Qt.ItemDataRole.UserRole:
@@ -673,6 +671,7 @@ class ImagePreviewModel(QAbstractListModel):
                     on_finish_slot="_on_image_loaded",
                     on_error_slot="_on_image_error",
                     channel_to_load=channel_to_load,
+                    ui_key=cache_key,  # Pass the unique key to the loader
                 )
 
                 # Track the task for cancellation
@@ -682,47 +681,44 @@ class ImagePreviewModel(QAbstractListModel):
         return None
 
     @Slot(str, QImage)
-    def _on_image_loaded(self, path_str: str, q_img: QImage):
-        # Find key (lazy match since we don't pass the full key back from loader for simplicity)
-        # We could pass it, but path_str is unique enough per file
-        # Need to handle channel distinction if multiple channels of same file are loaded simultaneously?
-        # For safety, we iterate loading_paths.
-
-        keys_to_remove = [k for k in self.loading_paths if k.startswith(path_str)]
-
-        for key in keys_to_remove:
-            self.loading_paths.remove(key)
-            if key in self.active_tasks:
-                del self.active_tasks[key]
+    def _on_image_loaded(self, ui_key: str, q_img: QImage):
+        """
+        Slot called when an image finishes loading.
+        ui_key is the unique cache key (path_channel) passed to the loader.
+        """
+        if ui_key in self.loading_paths:
+            self.loading_paths.remove(ui_key)
+            if ui_key in self.active_tasks:
+                del self.active_tasks[ui_key]
 
             if not q_img.isNull():
                 pixmap = QPixmap.fromImage(q_img)
-                self.pixmap_cache[key] = pixmap
+                self.pixmap_cache[ui_key] = pixmap
                 if len(self.pixmap_cache) > self.CACHE_SIZE_LIMIT:
                     self.pixmap_cache.popitem(last=False)
 
-        if keys_to_remove:
-            self._emit_data_changed_for_path(path_str)
+            # Refresh only the specific row associated with this key
+            self._emit_data_changed_for_key(ui_key)
 
     @Slot(str, str)
-    def _on_image_error(self, path_str: str, error_msg: str):
-        keys_to_remove = [k for k in self.loading_paths if k.startswith(path_str)]
-        for key in keys_to_remove:
-            self.loading_paths.remove(key)
-            if key in self.active_tasks:
-                del self.active_tasks[key]
-            self.error_paths[key] = error_msg
+    def _on_image_error(self, ui_key: str, error_msg: str):
+        if ui_key in self.loading_paths:
+            self.loading_paths.remove(ui_key)
+            if ui_key in self.active_tasks:
+                del self.active_tasks[ui_key]
+            self.error_paths[ui_key] = error_msg
+            self._emit_data_changed_for_key(ui_key)
 
-        if keys_to_remove:
-            self._emit_data_changed_for_path(path_str)
-
-    def _emit_data_changed_for_path(self, path_str: str):
+    def _emit_data_changed_for_key(self, ui_key: str):
+        # Reconstruct row from key. Key format: "{path}_{channel or 'full'}"
+        # We iterate to find the matching item. This is fast enough for UI updates.
         for i, item in enumerate(self.items):
-            if item.path == path_str:
+            item_key = f"{item.path}_{item.channel or 'full'}"
+            if item_key == ui_key:
                 index = self.index(i, 0)
                 self.dataChanged.emit(index, index, [Qt.ItemDataRole.DecorationRole])
-                # Continue searching? A file might appear multiple times if channels differ?
-                # ResultNode structure usually means 1 row per item.
+                # One key maps to one row in this model
+                break
 
     def get_row_for_path(self, path: Path) -> int | None:
         path_str = str(path)
@@ -792,6 +788,10 @@ class ImageItemDelegate(QStyledItemDelegate):
 
         item_data = index.data(Qt.ItemDataRole.UserRole)
         channel = item_data.channel if item_data else None
+        # Note: The key generation logic is now encapsulated in the model, but the delegate
+        # checks for errors via the model's public property if needed.
+        # For simple display, just checking pixmap is enough.
+        # But to show specific "Error", we need to check model.error_paths
         cache_key = f"{item_data.path}_{channel or 'full'}"
         error_msg = self.parent().model.error_paths.get(cache_key)
 

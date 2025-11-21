@@ -7,11 +7,12 @@ import inspect
 import io
 import logging
 import os
+import threading
+import time
 from pathlib import Path
 
 import send2trash
 from PIL import Image
-from PIL.ImageQt import ImageQt
 from PySide6.QtCore import (
     Q_ARG,
     QMetaObject,
@@ -40,12 +41,13 @@ if DUCKDB_AVAILABLE:
 
 app_logger = logging.getLogger("AssetPixelHand.gui.tasks")
 
+# Global lock to prevent race conditions in Pillow's C-extensions.
+_PILLOW_LOCK = threading.Lock()
+
 
 class ModelConverter(QRunnable):
     """
     A task to download, convert, and cache a HuggingFace model to ONNX format.
-    Refactored to import torch/transformers ONLY when running, allowing
-    the main app to start even if these libraries are missing (if models exist).
     """
 
     class Signals(QObject):
@@ -62,7 +64,6 @@ class ModelConverter(QRunnable):
         self.signals = self.Signals()
 
     def run(self):
-        # Lazy Import: Check dependencies only when task starts
         if not DEEP_LEARNING_AVAILABLE:
             self.signals.finished.emit(False, "Deep learning libraries (PyTorch, Transformers) not found.")
             return
@@ -71,17 +72,15 @@ class ModelConverter(QRunnable):
             import torch
             from PIL import Image
 
-            from app.model_adapter import get_model_adapter  # Lazy import to avoid top-level dependency
+            from app.model_adapter import get_model_adapter
 
             adapter = get_model_adapter(self.hf_model_name)
 
-            # Temporary env var for HF
             original_progress_bar_setting = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
             target_dir = self._setup_directories(MODELS_DIR, adapter)
 
-            # Check if model already exists
             vision_exists = (target_dir / "visual.onnx").exists()
             text_exists = (target_dir / "text.onnx").exists()
 
@@ -104,7 +103,6 @@ class ModelConverter(QRunnable):
 
             use_dynamo = self.model_info.get("use_dynamo", False)
 
-            # Export Logic
             if use_dynamo:
                 self.signals.log.emit("Using modern Dynamo exporter for this model.", "info")
                 self._export_with_dynamo(model, processor, target_dir, torch, Image, adapter)
@@ -119,7 +117,6 @@ class ModelConverter(QRunnable):
             app_logger.error(msg, exc_info=True)
             self.signals.finished.emit(False, str(e))
         finally:
-            # Restore env var
             if original_progress_bar_setting is None:
                 if "HF_HUB_DISABLE_PROGRESS_BARS" in os.environ:
                     del os.environ["HF_HUB_DISABLE_PROGRESS_BARS"]
@@ -227,8 +224,7 @@ class ModelConverter(QRunnable):
 class ImageLoader(QRunnable):
     """
     A cancellable task to load an image in a background thread for the UI.
-    Aggressively checks 'is_cancelled' to improve scroll performance in
-    large lists (Scroll Thrashing prevention).
+    Uses robust QImage conversion to avoid RGB/BGR channel swapping issues.
     """
 
     def __init__(
@@ -242,6 +238,7 @@ class ImageLoader(QRunnable):
         on_finish_slot=None,
         on_error_slot=None,
         channel_to_load: str | None = None,
+        ui_key: str | None = None,  # Added unique identifier for the UI row
     ):
         super().__init__()
         self.setAutoDelete(True)
@@ -255,6 +252,8 @@ class ImageLoader(QRunnable):
         self.on_finish_slot = on_finish_slot
         self.on_error_slot = on_error_slot
         self.channel_to_load = channel_to_load
+        # If no UI key provided, fallback to path (legacy behavior)
+        self.ui_key = ui_key if ui_key is not None else path_str
 
     def cancel(self):
         """Mark the task as cancelled. It will abort as soon as possible."""
@@ -269,12 +268,18 @@ class ImageLoader(QRunnable):
             if self.is_cancelled:
                 return
 
+            # === THROTTLING for Rapid Resizing ===
+            time.sleep(0.02)
+
+            if self.is_cancelled:
+                return
+
             pil_img = None
             cache_key = get_thumbnail_cache_key(
                 self.path_str, self.mtime, self.target_size, self.tonemap_mode, self.channel_to_load
             )
 
-            # 1. Check Cache
+            # 1. Check Cache (Thread-safe operations)
             if self.use_cache:
                 if self.is_cancelled:
                     return
@@ -289,97 +294,111 @@ class ImageLoader(QRunnable):
             if self.is_cancelled:
                 return
 
-            # 2. Load from Disk (Heavy IO/CPU)
+            # 2. Load from Disk
             if pil_img is None:
-                # Heuristic: Check metadata first to decide shrinking
-                metadata = get_image_metadata(Path(self.path_str))
+                try:
+                    metadata = get_image_metadata(Path(self.path_str))
+                except Exception:
+                    metadata = None
+
                 shrink = 1
                 if metadata and self.target_size:
                     width, height = metadata["resolution"]
-                    # Optimization: Use loader's shrink capability (e.g. jpeg header, pyvips thumbnail)
                     if width > self.target_size * 1.5 or height > self.target_size * 1.5:
                         shrink_w = width / (self.target_size * 1.5)
                         shrink_h = height / (self.target_size * 1.5)
                         shrink = max(1, int(min(shrink_w, shrink_h)))
-                        # Round to nearest power of 2 for some loaders if needed, or just int
                         if shrink > 1:
                             shrink = 1 << (shrink - 1).bit_length()
 
                 if self.is_cancelled:
                     return
 
-                pre_shrunk_img = load_image(
-                    self.path_str,
-                    tonemap_mode=self.tonemap_mode,
-                    shrink=shrink,
-                )
-
-                if self.is_cancelled:
-                    return
-
-                if pre_shrunk_img:
-                    # 3. Post-Processing (Channel Extraction / Final Resize)
-                    if self.channel_to_load:
-                        pre_shrunk_img = pre_shrunk_img.convert("RGBA")
-                        channels = pre_shrunk_img.split()
-                        channel_map = {"R": 0, "G": 1, "B": 2, "A": 3}
-                        channel_index = channel_map.get(self.channel_to_load)
-
-                        if channel_index is not None and channel_index < len(channels):
-                            single_channel = channels[channel_index]
-                            pil_img = Image.merge("RGB", (single_channel, single_channel, single_channel))
-                        else:
-                            pil_img = pre_shrunk_img.convert("RGB")
-                    else:
-                        pil_img = pre_shrunk_img.convert("RGBA")
-
+                with _PILLOW_LOCK:
                     if self.is_cancelled:
                         return
 
-                    if self.target_size:
-                        pil_img.thumbnail((self.target_size, self.target_size), Image.Resampling.LANCZOS)
+                    try:
+                        pre_shrunk_img = load_image(
+                            self.path_str,
+                            tonemap_mode=self.tonemap_mode,
+                            shrink=shrink,
+                        )
+                    except Exception as e:
+                        app_logger.warning(f"Failed to load image inside lock: {e}")
+                        pre_shrunk_img = None
 
-                    # 4. Save to Cache
-                    if self.use_cache and not self.is_cancelled:
+                    if pre_shrunk_img:
+                        # 3. Post-Processing
                         try:
-                            buffer = io.BytesIO()
-                            pil_img.save(buffer, "WEBP", quality=90)
-                            thumbnail_cache.put(cache_key, buffer.getvalue())
+                            if self.channel_to_load:
+                                pre_shrunk_img = pre_shrunk_img.convert("RGBA")
+                                channels = pre_shrunk_img.split()
+                                channel_map = {"R": 0, "G": 1, "B": 2, "A": 3}
+                                channel_index = channel_map.get(self.channel_to_load)
+
+                                if channel_index is not None and channel_index < len(channels):
+                                    single_channel = channels[channel_index]
+                                    pil_img = Image.merge("RGB", (single_channel, single_channel, single_channel))
+                                else:
+                                    pil_img = pre_shrunk_img.convert("RGB")
+                            else:
+                                pil_img = pre_shrunk_img.convert("RGBA")
+
+                            if self.target_size:
+                                pil_img.thumbnail((self.target_size, self.target_size), Image.Resampling.BILINEAR)
+
+                            # 4. Save to Cache
+                            if self.use_cache and not self.is_cancelled:
+                                try:
+                                    buffer = io.BytesIO()
+                                    pil_img.save(buffer, "WEBP", quality=90)
+                                    thumbnail_cache.put(cache_key, buffer.getvalue())
+                                except Exception as e:
+                                    app_logger.warning(f"Cache write failed for {self.path_str}: {e}")
                         except Exception as e:
-                            app_logger.warning(f"Cache write failed for {self.path_str}: {e}")
+                            app_logger.error(f"Error during image processing: {e}")
+                            pil_img = None
 
             if self.is_cancelled:
                 return
 
             # 5. Emit Result to GUI
-            if self.receiver and self.on_finish_slot:
-                if pil_img:
-                    q_img = ImageQt(pil_img)
-                    QMetaObject.invokeMethod(
-                        self.receiver,
-                        self.on_finish_slot,
-                        Qt.ConnectionType.QueuedConnection,
-                        Q_ARG(str, self.path_str),
-                        Q_ARG(QImage, q_img),
-                    )
-                elif self.on_error_slot:
-                    QMetaObject.invokeMethod(
-                        self.receiver,
-                        self.on_error_slot,
-                        Qt.ConnectionType.QueuedConnection,
-                        Q_ARG(str, self.path_str),
-                        Q_ARG(str, "Image loader returned None."),
-                    )
+            if self.receiver and self.on_finish_slot and pil_img:
+                # Force RGBA for Qt safety
+                if pil_img.mode != "RGBA":
+                    pil_img = pil_img.convert("RGBA")
+
+                # Manual conversion for safe memory ownership
+                data = pil_img.tobytes("raw", "RGBA")
+                q_img_view = QImage(data, pil_img.width, pil_img.height, QImage.Format_RGBA8888)
+                q_img = q_img_view.copy()
+
+                QMetaObject.invokeMethod(
+                    self.receiver,
+                    self.on_finish_slot,
+                    Qt.ConnectionType.QueuedConnection,
+                    # RETURN THE UI_KEY, NOT JUST THE PATH
+                    Q_ARG(str, self.ui_key),
+                    Q_ARG(QImage, q_img),
+                )
+            elif self.receiver and self.on_error_slot:
+                QMetaObject.invokeMethod(
+                    self.receiver,
+                    self.on_error_slot,
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(str, self.ui_key),
+                    Q_ARG(str, "Image loader returned None."),
+                )
 
         except Exception as e:
             if not self.is_cancelled and self.receiver and self.on_error_slot:
-                # Don't log "cancel" errors
                 app_logger.error(f"ImageLoader crashed for {self.path_str}", exc_info=True)
                 QMetaObject.invokeMethod(
                     self.receiver,
                     self.on_error_slot,
                     Qt.ConnectionType.QueuedConnection,
-                    Q_ARG(str, self.path_str),
+                    Q_ARG(str, self.ui_key),
                     Q_ARG(str, f"Loader error: {e}"),
                 )
 
@@ -409,9 +428,7 @@ class GroupFetcherTask(QRunnable):
 
         try:
             with duckdb.connect(database=str(self.db_path), read_only=True) as conn:
-                # Fetch items in group
                 query = "SELECT * FROM results WHERE group_id = ? ORDER BY is_best DESC, distance DESC"
-                # Using fetchall immediately to close cursor quickly
                 result_proxy = conn.execute(query, [self.group_id])
                 cols = [desc[0] for desc in result_proxy.description]
                 rows = result_proxy.fetchall()
@@ -419,16 +436,13 @@ class GroupFetcherTask(QRunnable):
                 children = []
                 for row_tuple in rows:
                     child_dict = dict(zip(cols, row_tuple, strict=False))
-                    # Stale check
                     if Path(child_dict["path"]).exists():
                         dist_val = child_dict.get("distance")
                         child_dict["distance"] = int(dist_val) if dist_val is not None else -1
                         children.append(child_dict)
 
-                # Post-process for search mode
                 is_search = self.mode in [ScanMode.TEXT_SEARCH, ScanMode.SAMPLE_SEARCH]
                 if is_search and children and children[0].get("is_best"):
-                    # In search mode, the "Best" item is the query itself (dummy), remove it from view
                     children.pop(0)
 
                 self.signals.finished.emit(children, self.group_id, self.parent)

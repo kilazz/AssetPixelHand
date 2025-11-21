@@ -1,46 +1,38 @@
 # app/core/scanner.py
 """
-Main orchestrator for the scanning process. This module contains the core logic
-for controlling the scanner's lifecycle via a dedicated thread.
+Main orchestrator for the scanning process.
 """
 
-import hashlib
+import contextlib
 import logging
-import shutil
 import threading
 import time
 
-import pyarrow as pa
 from PySide6.QtCore import QObject, QThread, Slot
 
 from app.cache import setup_caches, teardown_caches
-from app.constants import CACHE_DIR, DB_TABLE_NAME, DUCKDB_AVAILABLE, LANCEDB_AVAILABLE
+from app.constants import DUCKDB_AVAILABLE
 from app.core.strategies import FindDuplicatesStrategy, SearchStrategy
-from app.data_models import FINGERPRINT_FIELDS, ScanConfig, ScanMode, ScanState
+from app.data_models import ScanConfig, ScanMode, ScanState
 from app.services.signal_bus import APP_SIGNAL_BUS
 
-if LANCEDB_AVAILABLE:
-    import lancedb
 if DUCKDB_AVAILABLE:
-    pass
+    import duckdb
 
 app_logger = logging.getLogger("AssetPixelHand.scanner")
 
 
 class ScannerCore(QObject):
-    """The main business logic orchestrator for the entire scanning process."""
-
     def __init__(self, config: ScanConfig, state: ScanState):
         super().__init__()
         self.config, self.state = config, state
-        self.db: lancedb.DB | None = None
-        self.table: lancedb.table.Table | None = None
+        self.session_conn = None
+        self.vectors_table_name = "session_vectors"
         self.scan_has_finished = False
         self.all_skipped_files: list[str] = []
-        self.all_image_fps = {}  # Add this to hold fingerprints in search mode
+        self.all_image_fps = {}
 
     def run(self, stop_event: threading.Event):
-        """Main entry point for the scanner logic, executed in a separate thread."""
         self.scan_has_finished = False
         start_time = time.time()
         self.all_skipped_files.clear()
@@ -49,7 +41,7 @@ class ScannerCore(QObject):
         try:
             setup_caches(self.config)
 
-            if not self._setup_lancedb():
+            if not self._setup_session_db():
                 return
 
             strategy_map = {
@@ -71,50 +63,38 @@ class ScannerCore(QObject):
                 app_logger.error(f"Critical scan error: {e}", exc_info=True)
                 APP_SIGNAL_BUS.scan_error.emit(f"Scan aborted due to critical error: {e}")
         finally:
+            self._teardown_session_db()
             teardown_caches()
             total_duration = time.time() - start_time
             app_logger.info("Scan process finished.")
             if stop_event.is_set() and not self.scan_has_finished:
                 self._finalize_scan(None, 0, None, total_duration, self.all_skipped_files)
 
-    def _setup_lancedb(self) -> bool:
+    def _setup_session_db(self) -> bool:
+        if not DUCKDB_AVAILABLE:
+            APP_SIGNAL_BUS.scan_error.emit("DuckDB not available.")
+            return False
         try:
-            folder_hash = hashlib.md5(str(self.config.folder_path).encode()).hexdigest()
-            sanitized_model = self.config.model_name.replace("/", "_").replace("-", "_")
-            db_name = f"lancedb_{folder_hash}_{sanitized_model}"
-            db_path = CACHE_DIR / db_name
-
-            if self.config.lancedb_in_memory:
-                APP_SIGNAL_BUS.log_message.emit("Using in-memory vector database.", "info")
-                if db_path.exists():
-                    shutil.rmtree(db_path)
-            else:
-                APP_SIGNAL_BUS.log_message.emit("Using on-disk vector database.", "info")
-
-            db_path.mkdir(parents=True, exist_ok=True)
-            self.db = lancedb.connect(str(db_path))
-
-            schema_fields = [
-                pa.field("id", pa.string()),
-                pa.field("vector", pa.list_(pa.float32(), self.config.model_dim)),
-            ]
-            for name, types in FINGERPRINT_FIELDS.items():
-                schema_fields.append(pa.field(name, types["pyarrow"]))
-
-            schema = pa.schema(schema_fields)
-
-            table_name = DB_TABLE_NAME
-            # Always ensure a clean table for each scan.
-            # This is the most robust approach.
-            if table_name in self.db.table_names():
-                self.db.drop_table(table_name)
-
-            self.table = self.db.create_table(table_name, schema=schema)
+            self.session_conn = duckdb.connect(":memory:")
+            dim = self.config.model_dim
+            self.session_conn.execute(f"""
+                CREATE TABLE {self.vectors_table_name} (
+                    path VARCHAR,
+                    channel VARCHAR,
+                    vector FLOAT[{dim}]
+                )
+            """)
             return True
         except Exception as e:
-            app_logger.error(f"Failed to initialize LanceDB: {e}", exc_info=True)
-            APP_SIGNAL_BUS.scan_error.emit(f"Failed to initialize vector database: {e}")
+            app_logger.error(f"Failed to initialize session DB: {e}")
+            APP_SIGNAL_BUS.scan_error.emit(f"Database init error: {e}")
             return False
+
+    def _teardown_session_db(self):
+        if self.session_conn:
+            with contextlib.suppress(Exception):
+                self.session_conn.close()
+            self.session_conn = None
 
     def _check_stop_or_empty(
         self,
@@ -124,7 +104,6 @@ class ScannerCore(QObject):
         payload: any,
         start_time: float,
     ) -> bool:
-        """Checks if the scan should terminate due to cancellation or lack of files."""
         duration = time.time() - start_time
         if stop_event.is_set():
             self.state.set_phase("Scan cancelled.", 0.0)
@@ -138,7 +117,6 @@ class ScannerCore(QObject):
         return False
 
     def _finalize_scan(self, payload, num_found, mode, duration, skipped_files):
-        """Emits the final 'finished' signal to the GUI."""
         if not self.scan_has_finished:
             time_str = f"{int(duration // 60)}m {int(duration % 60)}s" if duration > 0 else "less than a second"
             log_msg = (
@@ -152,19 +130,13 @@ class ScannerCore(QObject):
 
 
 class ScannerController(QObject):
-    """Manages the lifecycle of the scanner thread."""
-
     def __init__(self):
         super().__init__()
         self.scan_thread: QThread | None = None
         self.scanner_core: ScannerCore | None = None
-
         self.scan_state: ScanState = ScanState()
-
         self.stop_event = threading.Event()
         self.config: ScanConfig | None = None
-
-        # Connect to the global signal bus
         APP_SIGNAL_BUS.scan_requested.connect(self.start_scan)
         APP_SIGNAL_BUS.scan_cancellation_requested.connect(self.cancel_scan)
 
@@ -175,19 +147,14 @@ class ScannerController(QObject):
     def start_scan(self, config: ScanConfig):
         if self.is_running():
             return
-
         self.config = config
-
         self.scan_state.reset()
-
         self.stop_event = threading.Event()
         self.scan_thread = QThread()
         self.scanner_core = ScannerCore(config, self.scan_state)
         self.scanner_core.moveToThread(self.scan_thread)
-
         APP_SIGNAL_BUS.scan_finished.connect(self.scan_thread.quit)
         APP_SIGNAL_BUS.scan_error.connect(self.scan_thread.quit)
-
         self.scan_thread.started.connect(lambda: self.scanner_core.run(self.stop_event))
         self.scan_thread.finished.connect(self._on_scan_thread_finished)
         self.scan_thread.start()

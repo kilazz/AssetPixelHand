@@ -19,6 +19,43 @@ from app.constants import APP_DATA_DIR, CACHE_DIR, MODELS_DIR, SUPPORTED_MODELS
 utils_logger = logging.getLogger("AssetPixelHand.utils")
 
 
+class UnionFind:
+    """
+    A simple and efficient Union-Find (Disjoint Set Union) implementation.
+    Replaces scipy.sparse.csgraph.connected_components for grouping duplicates.
+    """
+
+    def __init__(self):
+        self.parent = {}
+
+    def find(self, i):
+        if i not in self.parent:
+            self.parent[i] = i
+            return i
+        path = []
+        root = i
+        while self.parent[root] != root:
+            path.append(root)
+            root = self.parent[root]
+        for node in path:
+            self.parent[node] = root
+        return root
+
+    def union(self, i, j):
+        root_i = self.find(i)
+        root_j = self.find(j)
+        if root_i != root_j:
+            self.parent[root_j] = root_i
+
+    def get_groups(self) -> dict:
+        """Returns a dictionary mapping representative ID to list of member IDs."""
+        groups = {}
+        for i in self.parent:
+            root = self.find(i)
+            groups.setdefault(root, []).append(i)
+        return groups
+
+
 class SizeLimitedLRUCache:
     """A thread-safe, size-limited LRU cache for function results based on memory footprint."""
 
@@ -31,10 +68,7 @@ class SizeLimitedLRUCache:
     def __call__(self, func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            # A simple key based on function arguments. More complex keys may be needed
-            # for objects that don't have a stable string representation.
             key = str(args) + str(kwargs)
-
             with self.lock:
                 if key in self.cache:
                     self.cache.move_to_end(key)
@@ -43,7 +77,6 @@ class SizeLimitedLRUCache:
             result = func(*args, **kwargs)
 
             if result and hasattr(result, "width") and hasattr(result, "height"):
-                # Heuristic for Pillow Image size in memory
                 item_size = result.width * result.height * len(result.getbands())
                 with self.lock:
                     while self.current_size + item_size > self.max_size and self.cache:
@@ -63,12 +96,11 @@ def find_best_in_group(group: list) -> any:
         raise ValueError("Input group cannot be empty.")
 
     def get_format_score(fp) -> int:
-        """Assigns a quality score to common image formats."""
         fmt = str(getattr(fp, "format_str", "")).upper()
         if fmt in ["PNG", "BMP", "TIFF", "TIF", "EXR"]:
-            return 2  # Lossless or high-quality formats
+            return 2
         if fmt in ["JPEG", "JPG", "WEBP", "AVIF", "TGA"]:
-            return 1  # Good lossy or common formats
+            return 1
         return 0
 
     return max(
@@ -77,13 +109,13 @@ def find_best_in_group(group: list) -> any:
             getattr(fp, "resolution", (0, 0))[0] * getattr(fp, "resolution", (0, 0))[1],
             get_format_score(fp),
             getattr(fp, "file_size", 0),
+            -len(str(fp.path.name)),
             -(getattr(fp, "capture_date", 0) or 0),
         ),
     )
 
 
 def find_common_base_name(paths: list[Path]) -> str:
-    """Finds the longest common starting substring for a list of file paths' stems."""
     if not paths:
         return ""
     stems = [p.stem for p in paths]
@@ -100,22 +132,14 @@ def find_common_base_name(paths: list[Path]) -> str:
 
 
 def is_onnx_model_cached(onnx_model_name: str) -> bool:
-    """Checks if a given ONNX model is fully cached and ready to use,
-    including both vision and text models if applicable.
-    """
     model_path = MODELS_DIR / onnx_model_name
     if not (model_path.exists() and (model_path / "visual.onnx").exists()):
         return False
-
     cfg = next((c for c in SUPPORTED_MODELS.values() if onnx_model_name.startswith(c["onnx_name"])), None)
-
-    # This single line replaces the previous if/return False/return True block.
-    # It returns True unless the specific failure condition is met.
     return not (cfg and cfg.get("supports_text_search") and not (model_path / "text.onnx").exists())
 
 
 def _clear_directory(dir_path: Path) -> bool:
-    """A private helper to safely remove and recreate a directory."""
     if not dir_path.exists():
         return True
     try:
@@ -128,22 +152,18 @@ def _clear_directory(dir_path: Path) -> bool:
 
 
 def clear_scan_cache() -> bool:
-    """Clears the temporary scan data cache directory."""
     return _clear_directory(CACHE_DIR)
 
 
 def clear_models_cache() -> bool:
-    """Clears the downloaded AI models directory."""
     return _clear_directory(MODELS_DIR)
 
 
 def clear_all_app_data() -> bool:
-    """Clears the entire application data directory."""
     return _clear_directory(APP_DATA_DIR)
 
 
 def check_link_support(folder_path: Path) -> dict[str, bool]:
-    """Checks if the filesystem at a given path supports hardlinks and reflinks (CoW)."""
     support = {"hardlink": True, "reflink": False}
     if not (folder_path.is_dir() and hasattr(os, "reflink")):
         return support

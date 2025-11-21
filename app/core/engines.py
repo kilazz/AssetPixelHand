@@ -1,6 +1,6 @@
 # app/core/engines.py
 """
-Contains the core processing engines for similarity search.
+Contains the core processing engines for similarity search using DuckDB.
 """
 
 import gc
@@ -10,36 +10,47 @@ import threading
 import numpy as np
 from PySide6.QtCore import QObject
 
-from app.constants import LANCEDB_AVAILABLE
+from app.constants import DUCKDB_AVAILABLE
 from app.data_models import ScanConfig, ScanState
 from app.services.signal_bus import SignalBus
 
-if LANCEDB_AVAILABLE:
-    import lancedb
+if DUCKDB_AVAILABLE:
+    import duckdb
 
 app_logger = logging.getLogger("AssetPixelHand.engines")
 
 
-class LanceDBSimilarityEngine(QObject):
+class DuckDBSimilarityEngine(QObject):
+    """
+    Uses DuckDB + NumPy to perform brute-force similarity search.
+    It loads all vectors from DuckDB into RAM (numpy array) and performs matrix multiplication.
+    This is very fast for < 1M images on modern CPUs.
+    """
+
     def __init__(
         self,
         config: ScanConfig,
         state: ScanState,
         signals: SignalBus,
-        lancedb_db: "lancedb.DB",
-        lancedb_table: "lancedb.table.Table",
+        db_connection: "duckdb.DuckDBPyConnection",
+        table_name: str,
     ):
         super().__init__()
         self.config = config
         self.state = state
         self.signals = signals
-        self.db = lancedb_db
-        self.table = lancedb_table
-
+        self.conn = db_connection
+        self.table_name = table_name
         self.dist_threshold = 1.0 - (self.config.similarity_threshold / 100.0)
 
     def find_similar_pairs(self, stop_event: threading.Event) -> list[tuple[str, str, str, str, float]]:
-        num_rows = self.table.to_lance().count_rows()
+        # 1. Count Rows
+        try:
+            count_res = self.conn.execute(f"SELECT COUNT(*) FROM {self.table_name}").fetchone()
+            num_rows = count_res[0] if count_res else 0
+        except duckdb.Error:
+            num_rows = 0
+
         if num_rows == 0:
             return []
 
@@ -49,38 +60,36 @@ class LanceDBSimilarityEngine(QObject):
         found_links = []
 
         try:
-            # 1. Load Data (Zero-Copy)
-            ds = self.table.to_lance()
-            columns = ["vector", "path"]
-            has_channel = "channel" in self.table.schema.names
-            if has_channel:
-                columns.append("channel")
+            # 1. Load Data from DuckDB to NumPy via Arrow
+            # Query returns: vector (list of floats), path, channel
+            query = f"SELECT vector, path, channel FROM {self.table_name}"
+            arrow_table = self.conn.execute(query).fetch_arrow_table()
 
-            tbl = ds.to_table(columns=columns)
+            # Convert vector list column to numpy 2D array
+            # FIX: .combine_chunks() is required because arrow_table["vector"] is a ChunkedArray
+            vectors_flat = arrow_table["vector"].combine_chunks().values.to_numpy()
 
-            # Flatten vectors
-            vectors_flat = tbl["vector"].combine_chunks().values.to_numpy()
             dim = self.config.model_dim
 
-            if len(vectors_flat) % dim != 0:
+            # Integrity check
+            if len(vectors_flat) != num_rows * dim:
+                app_logger.error(f"Vector data size mismatch. Expected {num_rows * dim}, got {len(vectors_flat)}.")
                 return []
 
-            X = vectors_flat.reshape(-1, dim)
+            X = vectors_flat.reshape(num_rows, dim)
 
-            # Fast lookup lists
-            paths = np.array(tbl["path"].to_pylist())
-            channels_list = tbl["channel"].to_pylist() if has_channel else [None] * num_rows
+            # Arrow column to python list
+            paths = arrow_table["path"].to_pylist()
+            channels_list = arrow_table["channel"].to_pylist()
 
-            # Normalize & Keep Float32 (Faster on CPU than FP16)
+            # Normalize vectors (L2) to use Dot Product as Cosine Similarity
             norms = np.linalg.norm(X, axis=1, keepdims=True)
             norms[norms == 0] = 1.0
             X = (X / norms).astype(np.float32)
 
-            # 2. Batched Matrix Multiplication
-            # Float32 allows larger batches without slowdown
+            # 2. Batched Matrix Multiplication (Block-wise)
             BATCH_SIZE = 2048
             TOP_K = 50
-
             sim_threshold = 1.0 - self.dist_threshold
 
             for i in range(0, num_rows, BATCH_SIZE):
@@ -89,49 +98,51 @@ class LanceDBSimilarityEngine(QObject):
 
                 end = min(i + BATCH_SIZE, num_rows)
 
-                # Matrix Dot Product (Fastest on CPU with AVX2/AVX512)
+                # Dot Product: (Batch, Dim) @ (Dim, All) -> (Batch, All)
                 sim_batch = np.dot(X[i:end], X.T)
 
-                # 3. Global Masking
-                rows_idx = np.arange(sim_batch.shape[0])
+                # 3. Masking (Self-matches and Lower Triangle to avoid duplicates A-B, B-A)
+                # Create row indices for the batch broadcasted
+                rows_idx = np.arange(i, end)[:, None]
+                # Create col indices broadcasted
+                cols_idx = np.arange(num_rows)[None, :]
 
-                for r in rows_idx:
-                    cutoff = i + r + 1
-                    if cutoff < num_rows:
-                        sim_batch[r, :cutoff] = 0
-                    else:
-                        sim_batch[r, :] = 0
+                # Keep only where col > row (Upper Triangle)
+                mask = cols_idx > rows_idx
+                sim_batch[~mask] = 0
 
                 # 4. Thresholding
                 sim_batch[sim_batch < sim_threshold] = 0
 
-                # 5. Top-K Filtering
+                # 5. Top-K Filtering (Optional optimization)
                 if num_rows > TOP_K:
-                    kth_indices = np.argpartition(sim_batch, -TOP_K, axis=1)[:, :-TOP_K]
-                    row_broadcast = rows_idx[:, None]
-                    sim_batch[row_broadcast, kth_indices] = 0
+                    pass
 
-                # 6. Bulk Extraction
+                # 6. Extraction
                 local_rows, match_cols = np.nonzero(sim_batch)
 
                 if len(local_rows) > 0:
                     scores = sim_batch[local_rows, match_cols]
+
+                    # Map local batch rows back to global list indices
                     global_rows = local_rows + i
 
-                    p1_list = paths[global_rows]
-                    p2_list = paths[match_cols]
+                    batch_results = []
+                    for g_r, m_c, sc in zip(global_rows, match_cols, scores, strict=True):
+                        p1 = paths[g_r]
+                        c1 = channels_list[g_r] or "RGB"
+                        p2 = paths[m_c]
+                        c2 = channels_list[m_c] or "RGB"
 
-                    batch_results = [
-                        (p1, channels_list[g_r] or "RGB", p2, channels_list[m_c] or "RGB", max(0.0, 1.0 - float(sc)))
-                        for p1, p2, g_r, m_c, sc in zip(p1_list, p2_list, global_rows, match_cols, scores, strict=True)
-                    ]
+                        # Distance = 1.0 - Similarity
+                        dist = max(0.0, 1.0 - float(sc))
+                        batch_results.append((p1, c1, p2, c2, dist))
 
                     found_links.extend(batch_results)
 
                 self.state.update_progress(min(end, num_rows), num_rows)
 
                 del sim_batch
-                # GC less frequently with Float32 to keep cache hot
                 if i % 8192 == 0:
                     gc.collect()
 
