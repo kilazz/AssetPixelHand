@@ -34,7 +34,7 @@ from app.constants import (
 )
 from app.data_models import GroupNode, ResultNode, ScanMode
 from app.gui.tasks import ImageLoader, LanceDBGroupFetcherTask
-from app.gui.widgets import AlphaBackgroundWidget
+from app.gui.widgets import PaintUtilsMixin
 
 if TYPE_CHECKING:
     from app.view_models import ImageComparerState
@@ -168,7 +168,6 @@ class ResultsTreeModel(QAbstractItemModel):
     def _process_full_groups(self, raw_groups: dict):
         group_id_counter = 1
         for best_fp, dups in raw_groups.items():
-            # Safely handle None for file_size using (x or 0)
             total_size = (best_fp.file_size or 0) + sum((fp.file_size or 0) for fp, _, _ in dups)
             count = len(dups) + 1
 
@@ -834,7 +833,7 @@ class ImagePreviewModel(QAbstractListModel):
         return None
 
 
-class ImageItemDelegate(QStyledItemDelegate):
+class ImageItemDelegate(QStyledItemDelegate, PaintUtilsMixin):
     """Custom delegate for rendering items in the ImagePreviewModel with Channel Hover Preview."""
 
     def __init__(self, preview_size: int, state: "ImageComparerState", parent=None):
@@ -922,7 +921,7 @@ class ImageItemDelegate(QStyledItemDelegate):
         if self.is_transparency_enabled:
             painter.drawPixmap(
                 thumb_rect.topLeft(),
-                AlphaBackgroundWidget._get_checkered_pixmap(thumb_rect.size(), self.bg_alpha),
+                self.get_checkered_pixmap(thumb_rect.size(), self.bg_alpha),
             )
 
         # Get original pixmap

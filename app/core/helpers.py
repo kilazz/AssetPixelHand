@@ -14,10 +14,13 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from PySide6.QtCore import QObject, QRunnable, Signal
 
-from app.constants import VISUALS_DIR, TonemapMode
-from app.data_models import DuplicateResults, ScanConfig, ScanState
+from app.constants import LANCEDB_AVAILABLE, VISUALS_DIR, TonemapMode
+from app.data_models import DuplicateResults, ImageFingerprint, ScanConfig, ScanState
 from app.image_io import load_image
 from app.services.signal_bus import SignalBus
+
+if LANCEDB_AVAILABLE:
+    import lancedb
 
 app_logger = logging.getLogger("AssetPixelHand.scanner_helpers")
 
@@ -110,14 +113,29 @@ class VisualizationTask(QRunnable):
         finished = Signal()
         progress = Signal(str, int, int)
 
-    def __init__(self, groups: DuplicateResults, config: ScanConfig):
+    def __init__(
+        self,
+        groups: DuplicateResults | None,
+        db_uri: str | None,
+        config: ScanConfig,
+    ):
         super().__init__()
         self.setAutoDelete(True)
         self.groups = groups
+        self.db_uri = db_uri
         self.config = config
         self.signals = self.Signals()
 
     def run(self):
+        # If groups data is missing (Lazy Loading optimization), reconstruct it from DB
+        if not self.groups and self.db_uri and LANCEDB_AVAILABLE:
+            self.groups = self._reconstruct_groups_from_db()
+
+        if not self.groups:
+            app_logger.warning("VisualizationTask: No groups to visualize.")
+            self.signals.finished.emit()
+            return
+
         if VISUALS_DIR.exists():
             shutil.rmtree(VISUALS_DIR)
         VISUALS_DIR.mkdir(parents=True, exist_ok=True)
@@ -132,6 +150,7 @@ class VisualizationTask(QRunnable):
             font = ImageFont.load_default()
             font_bold = ImageFont.load_default()
 
+        # Sort groups by size (count of items)
         sorted_groups = sorted(self.groups.items(), key=lambda item: len(item[1]), reverse=True)
         report_count = 0
 
@@ -279,6 +298,61 @@ class VisualizationTask(QRunnable):
 
         app_logger.info(f"Saved {report_count} visualization files to '{VISUALS_DIR}'.")
         self.signals.finished.emit()
+
+    def _reconstruct_groups_from_db(self) -> DuplicateResults:
+        """
+        Reads the 'scan_results' table from LanceDB and reconstructs the
+        DuplicateResults dictionary structure for visualization.
+        """
+        reconstructed: DuplicateResults = {}
+
+        try:
+            # Import Polars locally to avoid circular imports if placed at top level,
+            # or just to ensure it's available for this specific operation.
+            import polars as pl
+
+            db = lancedb.connect(self.db_uri)
+            if "scan_results" not in db.table_names():
+                return {}
+
+            table = db.open_table("scan_results")
+
+            # Use to_arrow() -> from_arrow() to bypass the LanceDB/Polars batch_size bug
+            # This loads data into memory safely via Arrow first.
+            arrow_table = table.to_arrow()
+            df = pl.from_arrow(arrow_table)
+
+            # Group by 'group_id'
+            # Polars groupby is fast
+            grouped = df.partition_by("group_id", as_dict=True)
+
+            for _group_id, group_df in grouped.items():
+                # Sort so best is first (usually is_best=True)
+                rows = group_df.to_dicts()
+
+                best_row = next((r for r in rows if r["is_best"]), None)
+                if not best_row:
+                    continue
+
+                best_fp = ImageFingerprint.from_db_row(best_row)
+                duplicates = set()
+
+                for row in rows:
+                    if row["is_best"]:
+                        continue
+
+                    dup_fp = ImageFingerprint.from_db_row(row)
+                    score = int(row["distance"])
+                    method = row["found_by"]
+                    duplicates.add((dup_fp, score, method))
+
+                if duplicates:
+                    reconstructed[best_fp] = duplicates
+
+        except Exception as e:
+            app_logger.error(f"Failed to reconstruct groups from DB for visualization: {e}")
+
+        return reconstructed
 
     def _wrap_path(self, path_str: str, width: int, font: ImageFont.FreeTypeFont) -> str:
         if font.getlength(path_str) <= width:

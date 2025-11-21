@@ -3,12 +3,10 @@
 Contains QRunnable tasks for performing background operations without freezing the GUI.
 """
 
-import contextlib  # <--- ADDED THIS IMPORT
 import inspect
 import io
 import logging
 import os
-import shutil
 from pathlib import Path
 
 import send2trash
@@ -26,16 +24,16 @@ from PySide6.QtGui import QImage
 
 from app.cache import get_thumbnail_cache_key, thumbnail_cache
 from app.constants import (
-    APP_TEMP_DIR,
     DEEP_LEARNING_AVAILABLE,
-    FP16_MODEL_SUFFIX,
     LANCEDB_AVAILABLE,
     MODELS_DIR,
     QuantizationMode,
     TonemapMode,
 )
+from app.core.model_optimizer import optimize_model_post_export
 from app.data_models import FileOperation
 from app.image_io import get_image_metadata, load_image
+from app.utils import get_model_folder_name
 
 app_logger = logging.getLogger("AssetPixelHand.gui.tasks")
 
@@ -43,7 +41,7 @@ app_logger = logging.getLogger("AssetPixelHand.gui.tasks")
 class ModelConverter(QRunnable):
     """
     A task to download, convert, and cache a HuggingFace model to ONNX format.
-    Supports FP32, FP16, and INT8 (Dynamic Quantization).
+    Handles FP32 export, FP16 conversion, and triggers INT8 quantization.
     """
 
     class Signals(QObject):
@@ -72,9 +70,6 @@ class ModelConverter(QRunnable):
 
         try:
             import torch
-
-            # For INT8
-            from onnxruntime.quantization import QuantType, quant_pre_process, quantize_dynamic
             from PIL import Image
 
             from app.model_adapter import get_model_adapter
@@ -87,7 +82,7 @@ class ModelConverter(QRunnable):
 
             target_dir = self._setup_directories(MODELS_DIR, adapter)
 
-            # Check if model exists
+            # Check if model exists (visual.onnx is the key indicator)
             if (target_dir / "visual.onnx").exists():
                 self.signals.log.emit(f"Model '{target_dir.name}' already exists in cache.", "info")
                 self.signals.finished.emit(True, "Model already exists.")
@@ -101,7 +96,8 @@ class ModelConverter(QRunnable):
             processor = ProcessorClass.from_pretrained(self.hf_model_name)
             model = ModelClass.from_pretrained(self.hf_model_name)
 
-            # For INT8 we export FP32 first. For FP16 we cast immediately.
+            # Determine if we need to cast to FP16 before export
+            # Note: For INT8, we export FP32 first, then quantize.
             export_fp16 = self.quant_mode == QuantizationMode.FP16
 
             if export_fp16:
@@ -120,71 +116,11 @@ class ModelConverter(QRunnable):
             else:
                 self._export_with_legacy(model, processor, target_dir, torch, Image, adapter, export_fp16)
 
-            # --- INT8 POST-PROCESSING ---
+            # --- Post-Export Optimization (INT8) ---
+            # This logic is now delegated to the core module
             if self.quant_mode == QuantizationMode.INT8:
-                self.signals.log.emit("Optimizing and Quantizing (INT8)...", "info")
-
-                # Suppress quantization spam
-                logging.getLogger("onnxruntime.quantization").setLevel(logging.WARNING)
-                logging.getLogger("root").setLevel(logging.WARNING)
-
-                # Helper function for Preprocess + Quantize with Fallback
-                def process_int8(final_path: Path):
-                    if not final_path.exists():
-                        return
-
-                    # Use APP_TEMP_DIR for intermediate files
-                    temp_filename_base = f"{final_path.parent.name}_{final_path.stem}"
-                    temp_fp32 = APP_TEMP_DIR / f"{temp_filename_base}_fp32_temp.onnx"
-                    temp_preproc = APP_TEMP_DIR / f"{temp_filename_base}_preproc_temp.onnx"
-
-                    # 1. Move exported FP32 model to dedicated temp folder
-                    shutil.move(str(final_path), str(temp_fp32))
-
-                    input_for_quantization = str(temp_fp32)
-
-                    try:
-                        # 2. Try Shape Inference & Pre-processing
-                        quant_pre_process(
-                            input_model_path=str(temp_fp32),
-                            output_model_path=str(temp_preproc),
-                            skip_optimization=False,
-                            save_as_external_data=True,
-                            all_tensors_to_one_file=True,
-                        )
-                        input_for_quantization = str(temp_preproc)
-                    except Exception as e:
-                        app_logger.warning(f"INT8 Pre-processing failed, skipping optimization. Error: {e}")
-                        pass
-
-                    try:
-                        # 3. Run Dynamic Quantization (Result goes back to final_path in models dir)
-                        quantize_dynamic(
-                            model_input=input_for_quantization,
-                            model_output=str(final_path),
-                            weight_type=QuantType.QUInt8,
-                        )
-                    finally:
-                        # Cleanup temps in app_data/temp
-                        if temp_fp32.exists():
-                            temp_fp32.unlink()
-                        if temp_preproc.exists():
-                            temp_preproc.unlink()
-
-                        # Cleanup external data if ONNX created it
-                        # Use contextlib.suppress instead of try-except-pass
-                        for external_data in APP_TEMP_DIR.glob(f"{temp_filename_base}*"):
-                            with contextlib.suppress(OSError):
-                                external_data.unlink()
-
-                # Process Vision Model
-                process_int8(visual_out_path)
-
-                # Process Text Model (if present)
-                process_int8(text_out_path)
-
-                # Restore logging levels
-                logging.getLogger("root").setLevel(logging.INFO)
+                self.signals.log.emit("Optimizing and Quantizing to INT8...", "info")
+                optimize_model_post_export(visual_out_path, text_out_path, self.quant_mode)
 
             self.signals.finished.emit(True, "Model prepared successfully.")
 
@@ -200,15 +136,12 @@ class ModelConverter(QRunnable):
                 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = original_progress_bar_setting
 
     def _setup_directories(self, models_dir: Path, adapter) -> Path:
-        target_dir_name = self.onnx_name_base
-        if self.quant_mode == QuantizationMode.FP16:
-            target_dir_name += FP16_MODEL_SUFFIX
-        elif self.quant_mode == QuantizationMode.INT8:
-            target_dir_name += "_int8"
-
+        # Use centralized naming logic to match config_builder
+        target_dir_name = get_model_folder_name(self.onnx_name_base, self.quant_mode)
         target_dir = models_dir / target_dir_name
         target_dir.mkdir(parents=True, exist_ok=True)
 
+        # Save processor config for future use
         ProcessorClass = adapter.get_processor_class()
         processor = ProcessorClass.from_pretrained(self.hf_model_name)
         processor.save_pretrained(target_dir)

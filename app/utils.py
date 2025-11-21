@@ -14,7 +14,14 @@ from collections import OrderedDict
 from functools import wraps
 from pathlib import Path
 
-from app.constants import APP_DATA_DIR, CACHE_DIR, MODELS_DIR, SUPPORTED_MODELS
+from app.constants import (
+    APP_DATA_DIR,
+    CACHE_DIR,
+    FP16_MODEL_SUFFIX,
+    MODELS_DIR,
+    SUPPORTED_MODELS,
+    QuantizationMode,
+)
 
 utils_logger = logging.getLogger("AssetPixelHand.utils")
 
@@ -184,3 +191,14 @@ def check_link_support(folder_path: Path) -> dict[str, bool]:
         dest.unlink(missing_ok=True)
 
     return support
+
+
+def get_model_folder_name(onnx_base_name: str, quant_mode: QuantizationMode) -> str:
+    """
+    Centralized logic for model folder naming based on quantization mode.
+    """
+    if quant_mode == QuantizationMode.FP16:
+        return f"{onnx_base_name}{FP16_MODEL_SUFFIX}"
+    elif quant_mode == QuantizationMode.INT8:
+        return f"{onnx_base_name}_int8"
+    return onnx_base_name

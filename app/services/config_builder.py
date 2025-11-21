@@ -7,8 +7,9 @@ ScanConfig object from the application's settings and current scan context.
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from app.constants import FP16_MODEL_SUFFIX, SUPPORTED_MODELS, QuantizationMode
+from app.constants import SUPPORTED_MODELS, QuantizationMode
 from app.data_models import AppSettings, PerformanceConfig, ScanConfig, ScanMode
+from app.utils import get_model_folder_name
 
 if TYPE_CHECKING:
     pass
@@ -84,7 +85,7 @@ class ScanConfigBuilder:
             whash_threshold=self.settings.hashing.whash_threshold,
             compare_by_luminance=self.settings.hashing.compare_by_luminance,
             compare_by_channel=self.settings.hashing.compare_by_channel,
-            # --- Disable In-Memory mode permanently ---
+            # --- Disable In-Memory mode permanently for scalability ---
             lancedb_in_memory=False,
             save_visuals=self.settings.visuals.save,
             max_visuals=int(self.settings.visuals.max_count),
@@ -124,16 +125,16 @@ class ScanConfigBuilder:
         """Determines the correct ONNX model name based on UI selections."""
         model_info = SUPPORTED_MODELS.get(self.settings.model_key, next(iter(SUPPORTED_MODELS.values())))
         quant_mode_str = self.settings.performance.quantization_mode
+
+        # Safe conversion from string to Enum
         quant_mode = next(
             (q for q in QuantizationMode if q.value == quant_mode_str),
             QuantizationMode.FP16,
         )
 
-        onnx_name = model_info["onnx_name"]
-        if quant_mode == QuantizationMode.FP16:
-            onnx_name += FP16_MODEL_SUFFIX
-        elif quant_mode == QuantizationMode.INT8:
-            onnx_name += "_int8"
+        # Use the centralized utility to determine the correct folder name (e.g., "_int8", "_fp16")
+        onnx_name = get_model_folder_name(model_info["onnx_name"], quant_mode)
+
         return model_info, onnx_name
 
     def _build_performance_config(self) -> PerformanceConfig:

@@ -43,15 +43,10 @@ from app.utils import (
 )
 
 from .dialogs import ModelConversionDialog, ScanStatisticsDialog, SkippedFilesDialog
-from .panels import (
-    ImageViewerPanel,
-    LogPanel,
-    OptionsPanel,
-    PerformancePanel,
-    ResultsPanel,
-    ScanOptionsPanel,
-    SystemStatusPanel,
-)
+from .options_panel import OptionsPanel, PerformancePanel, ScanOptionsPanel
+from .results_panel import ResultsPanel
+from .status_panel import LogPanel, SystemStatusPanel
+from .viewer_panel import ImageViewerPanel
 
 app_logger = logging.getLogger("AssetPixelHand.gui.main")
 
@@ -238,7 +233,6 @@ class App(QMainWindow):
             return
 
         results_model = self.results_panel.results_model
-        # Note: We no longer check for db_path here, as data is in memory.
 
         source_index = self.results_panel.proxy_model.mapToSource(proxy_indexes[0])
         if not source_index.isValid():
@@ -343,7 +337,12 @@ class App(QMainWindow):
         model_info = self.options_panel.get_selected_model_info()
         quant_mode = self.performance_panel.get_selected_quantization()
         dialog = ModelConversionDialog(
-            model_key, model_info["hf_name"], model_info["onnx_name"], quant_mode, model_info, self
+            model_key,
+            model_info["hf_name"],
+            model_info["onnx_name"],
+            quant_mode,
+            model_info,
+            self,
         )
         return bool(dialog.exec())
 
@@ -366,8 +365,6 @@ class App(QMainWindow):
 
     @Slot(object, int, object, float, list)
     def on_scan_complete(self, payload, num_found, mode, duration, skipped):
-        # Tracemalloc block removed for performance optimization
-
         if not mode:
             app_logger.warning("Scan was cancelled by the user.")
             self.on_scan_end()
@@ -376,6 +373,9 @@ class App(QMainWindow):
         time_str = f"{int(duration // 60)}m {int(duration % 60)}s" if duration > 0 else "less than a second"
         data_to_display = payload if isinstance(payload, dict) else {}
         groups_data = data_to_display.get("groups_data")
+
+        # Retrieve DB path for visualization
+        db_uri = data_to_display.get("db_path")
 
         log_msg = f"Finished! Found {num_found} {'similar items' if mode == ScanMode.DUPLICATES else 'results'} in {time_str}."
         APP_SIGNAL_BUS.log_message.emit(log_msg, "success")
@@ -404,10 +404,17 @@ class App(QMainWindow):
             APP_SIGNAL_BUS.log_message.emit(f"{len(skipped)} files were skipped due to errors.", "warning")
             SkippedFilesDialog(skipped, self).exec()
 
-        if groups_data and self.controller.config and self.controller.config.save_visuals:
-            if self.stats_dialog:
-                self.stats_dialog.switch_to_visualization_mode()
-            self._start_visualization_task(groups_data)
+        # Pass db_uri to visualization task
+        if groups_data or (num_found > 0 and db_uri):
+            if self.controller.config and self.controller.config.save_visuals:
+                if self.stats_dialog:
+                    self.stats_dialog.switch_to_visualization_mode()
+                self._start_visualization_task(groups_data, db_uri)
+            else:
+                # Just finish if visuals are disabled
+                if self.stats_dialog:
+                    self.stats_dialog.scan_finished(payload, num_found, mode, duration, skipped)
+                self.on_scan_end()
         else:
             if self.stats_dialog:
                 self.stats_dialog.scan_finished(payload, num_found, mode, duration, skipped)
@@ -429,14 +436,15 @@ class App(QMainWindow):
         self.set_ui_scan_state(is_scanning=False)
         self.results_panel.set_enabled_state(self.results_panel.results_model.rowCount() > 0)
 
-    def _start_visualization_task(self, groups_data):
+    def _start_visualization_task(self, groups_data, db_uri):
         APP_SIGNAL_BUS.log_message.emit("Starting to generate visualization files...", "info")
         if not self.controller.config:
             APP_SIGNAL_BUS.log_message.emit("Cannot start visualization: scan config is missing.", "error")
             self.on_scan_end()
             return
 
-        task = VisualizationTask(groups_data, self.controller.config)
+        # Pass db_uri to task to handle lazy loading if groups_data is None
+        task = VisualizationTask(groups_data, db_uri, self.controller.config)
         if self.stats_dialog:
             task.signals.progress.connect(self.stats_dialog.update_visualization_progress)
         task.signals.finished.connect(self._on_save_visuals_finished)
@@ -524,7 +532,11 @@ class App(QMainWindow):
         self.settings_manager.save()
         thumbnail_cache.close()
         if QThreadPool.globalInstance().activeThreadCount() > 0:
-            QMessageBox.warning(self, "Operation in Progress", "Please wait for background operations to complete.")
+            QMessageBox.warning(
+                self,
+                "Operation in Progress",
+                "Please wait for background operations to complete.",
+            )
             event.ignore()
             return
         if self.controller.is_running():
