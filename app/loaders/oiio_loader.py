@@ -15,6 +15,15 @@ from .base_loader import BaseLoader
 if OIIO_AVAILABLE:
     import OpenImageIO as oiio
 
+    # Limit OIIO's global tile cache to 512 MB.
+    # By default, OIIO can use half of the physical RAM, which causes
+    # massive usage spikes when scanning thousands of large textures.
+    try:
+        oiio.attribute("max_memory_MB", 512.0)
+        oiio.attribute("autotile", 64)  # Smaller tiles = less memory fragmentation
+    except Exception:
+        pass
+
 app_logger = logging.getLogger("AssetPixelHand.oiio_loader")
 
 
@@ -112,6 +121,7 @@ class OIIOLoader(BaseLoader):
             app_logger.error(f"OIIO load failed for {path}: {e}")
             return None
         finally:
+            # Ensure resources are released immediately
             inp.close()
 
     def get_metadata(self, path: Path, stat_result: Any) -> dict | None:

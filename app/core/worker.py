@@ -1,6 +1,7 @@
 # app/core/worker.py
 """
 Contains worker functions for parallel computation (Preprocessing and Inference).
+Optimized for high throughput with Heuristic Loading and Bilinear Resampling.
 """
 
 import gc
@@ -30,7 +31,7 @@ from app.constants import (
     FP16_MODEL_SUFFIX,
     MODELS_DIR,
 )
-from app.image_io import get_image_metadata, load_image
+from app.image_io import load_image
 
 if TYPE_CHECKING:
     from app.data_models import AnalysisItem
@@ -58,7 +59,10 @@ class InferenceEngine:
         from transformers import AutoProcessor
 
         model_dir = MODELS_DIR / model_name
-        self.processor = AutoProcessor.from_pretrained(model_dir)
+
+        # FIX: Explicitly convert Path to string for transformers compatibility
+        self.processor = AutoProcessor.from_pretrained(str(model_dir))
+
         self.is_fp16 = FP16_MODEL_SUFFIX in model_name.lower()
 
         # Extract input size from config
@@ -164,6 +168,7 @@ class ModelManager:
             from transformers import AutoProcessor
 
             model_dir = MODELS_DIR / requested_model
+            # FIX: Explicit string conversion
             self.preprocessor = AutoProcessor.from_pretrained(str(model_dir))
 
             self.current_model_name = requested_model
@@ -230,25 +235,33 @@ def _read_and_process_batch_for_ai(
     skipped_tuples = []
     ignore_solid_channels = simple_config.get("ignore_solid_channels", True)
 
-    target_w, target_h = input_size
+    # Standard AI Input size is usually 224x224 or 384x384.
+    # Large textures (4K) need heavy downscaling.
 
     for item in items:
         path = Path(item.path)
         analysis_type = item.analysis_type
 
         try:
-            # 1. Pre-calc shrink factor
-            # Loading a 4K image just to resize to 224x224 is wasteful.
-            # We use loaders that support shrink-on-load (like PyVips or Pillow draft)
-            meta = get_image_metadata(path)
-            shrink = 1
-            if meta:
-                orig_w, orig_h = meta["resolution"]
-                if orig_w > target_w * 2 or orig_h > target_h * 2:
-                    ratio = min(orig_w / target_w, orig_h / target_h)
-                    shrink = max(1, int(ratio))
+            # 1. Heuristic Shrink (Optimization)
+            # Reading metadata with OIIO/DirectXTex is slow. OS stat is fast.
+            # We guess the shrink factor based on file size.
+            # > 50MB -> shrink 8
+            # > 10MB -> shrink 4
+            # > 2MB  -> shrink 2
+            try:
+                file_size = path.stat().st_size
+                shrink = 1
+                if file_size > 50 * 1024 * 1024:
+                    shrink = 8
+                elif file_size > 10 * 1024 * 1024:
+                    shrink = 4
+                elif file_size > 2 * 1024 * 1024:
+                    shrink = 2
+            except OSError:
+                shrink = 1
 
-            # 2. Load Image
+            # 2. Load Image with "Smart Shrink"
             pil_image = load_image(path, shrink=shrink)
 
             if not pil_image:
@@ -274,8 +287,7 @@ def _read_and_process_batch_for_ai(
                         if max_val < 5 or min_val > 250:
                             continue
 
-                        # Check 2: Robust average check (handles 99% solid with some noise/artifacts)
-                        # This catches cases where min_val is 0 but the image is 99.9% white.
+                        # Check 2: Robust average check
                         stat = ImageStat.Stat(channel_img)
                         mean_val = stat.mean[0]
                         if mean_val < 5 or mean_val > 250:
@@ -298,9 +310,10 @@ def _read_and_process_batch_for_ai(
                     processed_image = pil_image.convert("RGB")
                 channel_name = None
 
-            # 3. Final Resize
+            # 3. Final Resize (Optimization: BILINEAR)
             if processed_image:
                 if processed_image.size != input_size:
+                    # BILINEAR is 3x faster than LANCZOS and sufficient for Neural Networks
                     processed_image = processed_image.resize(input_size, Image.Resampling.BILINEAR)
 
                 images.append(processed_image)
@@ -338,7 +351,7 @@ def worker_preprocess_threaded(
         return
 
     try:
-        # HuggingFace Processor runs here (CPU bound)
+        # HuggingFace Processor runs here (CPU bound, mostly normalization)
         batch_dict = manager.preprocessor(images=images, return_tensors="np")
         pixel_values = batch_dict.pixel_values.astype(dtype)
         output_queue.put((pixel_values, successful_paths_with_channels, skipped_tuples))
@@ -359,6 +372,7 @@ def run_inference_direct(pixel_values: np.ndarray, paths_with_channels: list) ->
 
     try:
         io_binding = engine.visual_session.io_binding()
+        # Ensure inputs are on CPU for binding
         io_binding.bind_cpu_input("pixel_values", pixel_values)
         io_binding.bind_output("image_embeds")
 

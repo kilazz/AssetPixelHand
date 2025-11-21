@@ -35,17 +35,12 @@ def _unpremultiply_alpha_numpy(arr: np.ndarray) -> np.ndarray:
     # Extract alpha as float to prevent overflow
     alpha = arr[..., 3].astype(np.float32)
 
-    # Mask for non-zero, non-full alpha (optimization: skip calc for 0 or 255 alpha regions if possible,
-    # but masking is usually faster for general case)
+    # Mask for non-zero, non-full alpha
     mask = (alpha > 0) & (alpha < 255)
 
-    # If no semi-transparent pixels, return early (Huge speedup for standard textures)
+    # If no semi-transparent pixels, return early
     if not np.any(mask):
         return arr
-
-    # Pre-calculate inverse alpha factor for masked pixels only
-    # inv_alpha = 255.0 / alpha[mask]
-    # Using division directly on channels might be cleaner for memory if mask is large
 
     # We process RGB channels in-place where possible
     for i in range(3):
@@ -56,7 +51,6 @@ def _unpremultiply_alpha_numpy(arr: np.ndarray) -> np.ndarray:
         np.divide(channel * 255.0, alpha, out=channel, where=mask)
 
         # Clip and assign back
-        # Note: using 'out=' in clip isn't always faster due to casting, direct assign is fine
         arr[..., i] = np.clip(channel, 0, 255).astype(np.uint8)
 
     return arr
@@ -105,48 +99,67 @@ class DirectXTexLoader(BaseLoader):
         if not DIRECTXTEX_AVAILABLE:
             return None
 
-        decoded = directxtex_decoder.decode_dds(path.read_bytes())
-        numpy_array, dtype = decoded["data"], decoded["data"].dtype
+        # Note: directxtex_decoder python binding usually loads the main image surface.
+        # Shrink optimization happens after loading for this specific library wrapper
+        # unless specific bindings for skipping mips exist.
+        try:
+            decoded = directxtex_decoder.decode_dds(path.read_bytes())
+            numpy_array, dtype = decoded["data"], decoded["data"].dtype
 
-        pil_image = None
-        if np.issubdtype(dtype, np.floating):
-            if tonemap_mode == TonemapMode.ENABLED.value:
-                pil_image = Image.fromarray(tonemap_float_array(numpy_array.astype(np.float32)))
-            else:
-                pil_image = Image.fromarray((np.clip(numpy_array, 0.0, 1.0) * 255).astype(np.uint8))
-        elif np.issubdtype(dtype, np.uint16):
-            pil_image = Image.fromarray((numpy_array // 257).astype(np.uint8))
-        elif np.issubdtype(dtype, np.signedinteger):
-            info = np.iinfo(dtype)
-            norm = (numpy_array.astype(np.float32) - info.min) / (info.max - info.min)
-            pil_image = Image.fromarray((norm * 255).astype(np.uint8))
-        elif np.issubdtype(dtype, np.uint8):
-            pil_image = Image.fromarray(numpy_array)
+            pil_image = None
+            if np.issubdtype(dtype, np.floating):
+                # Handle Float (HDR)
+                if tonemap_mode == TonemapMode.ENABLED.value:
+                    pil_image = Image.fromarray(tonemap_float_array(numpy_array.astype(np.float32)))
+                else:
+                    pil_image = Image.fromarray((np.clip(numpy_array, 0.0, 1.0) * 255).astype(np.uint8))
+            elif np.issubdtype(dtype, np.uint16):
+                # Handle 16-bit Int
+                pil_image = Image.fromarray((numpy_array // 257).astype(np.uint8))
+            elif np.issubdtype(dtype, np.signedinteger):
+                # Handle Signed Int
+                info = np.iinfo(dtype)
+                norm = (numpy_array.astype(np.float32) - info.min) / (info.max - info.min)
+                pil_image = Image.fromarray((norm * 255).astype(np.uint8))
+            elif np.issubdtype(dtype, np.uint8):
+                # Handle Standard 8-bit
+                pil_image = Image.fromarray(numpy_array)
 
-        if pil_image is None:
-            raise TypeError(f"Unhandled NumPy dtype from DirectXTex decoder: {dtype}")
+            if pil_image is None:
+                raise TypeError(f"Unhandled NumPy dtype from DirectXTex decoder: {dtype}")
 
-        return self._handle_alpha_logic(pil_image)
+            # Resize if shrink requested (since we couldn't skip load)
+            if shrink > 1:
+                pil_image.thumbnail((pil_image.width // shrink, pil_image.height // shrink), Image.Resampling.NEAREST)
+
+            return self._handle_alpha_logic(pil_image)
+
+        except Exception as e:
+            app_logger.warning(f"DirectXTex decode failed for {path.name}: {e}")
+            return None
 
     def get_metadata(self, path: Path, stat_result: Any) -> dict | None:
         if not DIRECTXTEX_AVAILABLE:
             return None
 
-        dxt_meta = directxtex_decoder.get_dds_metadata(path.read_bytes())
-        return {
-            "resolution": (dxt_meta["width"], dxt_meta["height"]),
-            "file_size": stat_result.st_size,
-            "mtime": stat_result.st_mtime,
-            "format_str": "DDS",
-            "compression_format": dxt_meta["format_str"],
-            "format_details": "DXGI",
-            "has_alpha": self._get_alpha_from_format_str(dxt_meta["format_str"]),
-            "capture_date": None,
-            "bit_depth": 8,
-            "mipmap_count": dxt_meta["mip_levels"],
-            "texture_type": "Cubemap" if dxt_meta["is_cubemap"] else ("3D" if dxt_meta["is_3d"] else "2D"),
-            "color_space": "sRGB",
-        }
+        try:
+            dxt_meta = directxtex_decoder.get_dds_metadata(path.read_bytes())
+            return {
+                "resolution": (dxt_meta["width"], dxt_meta["height"]),
+                "file_size": stat_result.st_size,
+                "mtime": stat_result.st_mtime,
+                "format_str": "DDS",
+                "compression_format": dxt_meta["format_str"],
+                "format_details": "DXGI",
+                "has_alpha": self._get_alpha_from_format_str(dxt_meta["format_str"]),
+                "capture_date": None,
+                "bit_depth": 8,
+                "mipmap_count": dxt_meta["mip_levels"],
+                "texture_type": "Cubemap" if dxt_meta["is_cubemap"] else ("3D" if dxt_meta["is_3d"] else "2D"),
+                "color_space": "sRGB",
+            }
+        except Exception:
+            return None
 
     def _get_alpha_from_format_str(self, format_str: str) -> bool:
         fmt = format_str.upper()
@@ -155,14 +168,41 @@ class DirectXTexLoader(BaseLoader):
         )
 
     def _handle_alpha_logic(self, pil_image: Image.Image) -> Image.Image:
+        """
+        Checks alpha channel properties and unpremultiplies if necessary.
+        Optimized to avoid NumPy conversion if alpha is simple (solid white/black).
+        """
         if pil_image.mode != "RGBA":
             return pil_image
 
+        # OPTIMIZATION: Use PIL's C-based getextrema() first.
+        # It's much faster than np.array(img) for 4K+ textures.
+        try:
+            extrema = pil_image.getextrema()
+            # RGBA extrema: [(Rmin, Rmax), (Gmin, Gmax), (Bmin, Bmax), (Amin, Amax)]
+            if len(extrema) >= 4:
+                alpha_min, alpha_max = extrema[3]
+
+                # Case 1: Alpha is fully opaque (255). Drop alpha channel.
+                if alpha_min >= 255:
+                    return pil_image.convert("RGB")
+
+                # Case 2: Alpha is fully transparent (0).
+                # Return as is (don't waste CPU unpremultiplying nothing).
+                if alpha_max <= 0:
+                    return pil_image
+        except Exception:
+            # Fallback if getextrema fails for some reason
+            pass
+
+        # Case 3: Mixed Alpha. Convert to NumPy and fix premultiplication.
         arr = np.array(pil_image)
         rgb, alpha = arr[:, :, :3], arr[:, :, 3]
-        alpha_max, rgb_max = np.max(alpha), np.max(rgb)
+        alpha_max = np.max(alpha)
+        rgb_max = np.max(rgb)
 
         # Optimization: Pure emission (Alpha ~0 but Color > 0)
+        # e.g. FX textures. Force Alpha to max of color.
         if alpha_max < 5 and rgb_max > 0:
             arr[:, :, 3] = np.max(rgb, axis=2)
             return Image.fromarray(arr)
@@ -170,9 +210,10 @@ class DirectXTexLoader(BaseLoader):
         # Optimization: Pure alpha mask (Color ~0)
         if rgb_max == 0 and alpha_max > 0:
             if np.max(alpha) != np.min(alpha):
+                # Move alpha to RGB for visibility
                 arr[:, :, :3] = alpha[:, :, np.newaxis]
                 arr[:, :, 3] = 255
             return Image.fromarray(arr)
 
-        # Use the selected implementation (Numba or NumPy)
+        # Standard unpremultiply
         return Image.fromarray(_unpremultiply_alpha(arr))
