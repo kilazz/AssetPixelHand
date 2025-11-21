@@ -99,9 +99,6 @@ class DirectXTexLoader(BaseLoader):
         if not DIRECTXTEX_AVAILABLE:
             return None
 
-        # Note: directxtex_decoder python binding usually loads the main image surface.
-        # Shrink optimization happens after loading for this specific library wrapper
-        # unless specific bindings for skipping mips exist.
         try:
             decoded = directxtex_decoder.decode_dds(path.read_bytes())
             numpy_array, dtype = decoded["data"], decoded["data"].dtype
@@ -128,9 +125,12 @@ class DirectXTexLoader(BaseLoader):
             if pil_image is None:
                 raise TypeError(f"Unhandled NumPy dtype from DirectXTex decoder: {dtype}")
 
-            # Resize if shrink requested (since we couldn't skip load)
             if shrink > 1:
-                pil_image.thumbnail((pil_image.width // shrink, pil_image.height // shrink), Image.Resampling.NEAREST)
+                # Ensure dimensions never collapse to 0 (causes PIL errors / div by zero)
+                target_w = max(1, pil_image.width // shrink)
+                target_h = max(1, pil_image.height // shrink)
+
+                pil_image.thumbnail((target_w, target_h), Image.Resampling.NEAREST)
 
             return self._handle_alpha_logic(pil_image)
 
@@ -192,7 +192,7 @@ class DirectXTexLoader(BaseLoader):
                 if alpha_max <= 0:
                     return pil_image
         except Exception:
-            # Fallback if getextrema fails for some reason
+            # Fallback if getextrema fails
             pass
 
         # Case 3: Mixed Alpha. Convert to NumPy and fix premultiplication.
