@@ -29,6 +29,13 @@ sys.path.insert(0, str(SCRIPT_DIR.resolve()))
 APP_DATA_DIR = SCRIPT_DIR / "app_data"
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+APP_TEMP_DIR = APP_DATA_DIR / "temp"
+APP_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+os.environ["TMP"] = str(APP_TEMP_DIR.resolve())
+os.environ["TEMP"] = str(APP_TEMP_DIR.resolve())
+os.environ["TMPDIR"] = str(APP_TEMP_DIR.resolve())
+
 MODELS_DIR = APP_DATA_DIR / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
