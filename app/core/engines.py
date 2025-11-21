@@ -51,6 +51,7 @@ if LANCEDB_AVAILABLE:
             """
             Performs an Approximate Nearest Neighbor (ANN) search for every item in the DB.
             Uses the IVF-PQ index to avoid loading the full dataset into RAM.
+            Uses .to_arrow() instead of .to_list() for search results to avoid massive overhead from Python dictionary creation.
             """
             try:
                 num_rows = self.table.to_lance().count_rows()
@@ -87,7 +88,8 @@ if LANCEDB_AVAILABLE:
                     if stop_event.is_set():
                         return []
 
-                    # Convert Arrow batch to Python list of dicts for easier iteration
+                    # Convert Arrow batch to Python list of dicts for the outer loop queries
+                    # (The outer loop runs less frequently than the inner search results loop, so this is fine)
                     batch_rows = batch.to_pylist()
 
                     for row in batch_rows:
@@ -99,25 +101,35 @@ if LANCEDB_AVAILABLE:
                         query_path = row["path"]
                         query_channel = row["channel"] or "RGB"
 
-                        # Perform ANN Search for this specific vector against the whole DB
-                        # This leverages the IVF-PQ index on disk.
-                        results = (
+                        # Perform ANN Search for this specific vector against the whole DB.
+                        # OPTIMIZATION: Return PyArrow Table instead of list of dicts.
+                        arrow_results = (
                             self.table.search(query_vec)
                             .metric("cosine")
                             .limit(k_neighbors)
                             .nprobes(nprobes)
                             .refine_factor(refine_factor)
-                            .to_list()
+                            .to_arrow()
                         )
 
-                        for match in results:
-                            match_dist = match["_distance"]
+                        # Extract columns efficiently
+                        # _distance is float array (use numpy for zero-copy access)
+                        r_dists = arrow_results["_distance"].to_numpy()
+
+                        # Strings are faster to iterate as a python list than accessing arrow scalars one by one
+                        r_ids = arrow_results["id"].to_pylist()
+                        r_paths = arrow_results["path"].to_pylist()
+                        r_channels = arrow_results["channel"].to_pylist()
+
+                        # Iterate by index
+                        for i in range(len(arrow_results)):
+                            match_dist = r_dists[i]
 
                             # Filter by threshold
                             if match_dist > self.dist_threshold:
                                 continue
 
-                            match_id = match["id"]
+                            match_id = r_ids[i]
 
                             # Skip self-match (distance is approx 0.0)
                             if query_id == match_id:
@@ -133,8 +145,8 @@ if LANCEDB_AVAILABLE:
                             found_pairs_set.add(pair_sig)
 
                             # Extract match details
-                            match_path = match["path"]
-                            match_channel = match["channel"] or "RGB"
+                            match_path = r_paths[i]
+                            match_channel = r_channels[i] or "RGB"
 
                             found_links.append((query_path, query_channel, match_path, match_channel, match_dist))
 

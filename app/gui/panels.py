@@ -524,8 +524,6 @@ class ScanOptionsPanel(QGroupBox):
 
         self.channel_check.toggled.connect(self._update_dependent_ui_state)
 
-        # --- REMOVED SIGNAL CONNECTION FOR LANCE_DB_IN_MEMORY ---
-
         self.save_visuals_check.toggled.connect(self.settings_manager.set_save_visuals)
         self.visuals_tonemap_check.toggled.connect(self.settings_manager.set_visuals_tonemap)
         self.max_visuals_entry.textChanged.connect(self.settings_manager.set_max_visuals)
