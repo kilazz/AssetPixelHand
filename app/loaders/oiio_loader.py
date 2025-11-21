@@ -88,7 +88,7 @@ class OIIOLoader(BaseLoader):
                 # Read as UINT8
                 data = inp.read_image(format=oiio.UINT8)
 
-                # FIX for PIL Error: "Cannot handle this data type: (1, 1, 1), |u1"
+                # "Cannot handle this data type: (1, 1, 1), |u1"
                 # PIL expects grayscale images to be 2D (H, W), not 3D (H, W, 1).
                 if data.ndim == 3 and data.shape[2] == 1:
                     data = data.squeeze(2)

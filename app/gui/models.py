@@ -168,7 +168,7 @@ class ResultsTreeModel(QAbstractItemModel):
     def _process_full_groups(self, raw_groups: dict):
         group_id_counter = 1
         for best_fp, dups in raw_groups.items():
-            # FIX: Safely handle None for file_size using (x or 0)
+            # Safely handle None for file_size using (x or 0)
             total_size = (best_fp.file_size or 0) + sum((fp.file_size or 0) for fp, _, _ in dups)
             count = len(dups) + 1
 
@@ -369,8 +369,6 @@ class ResultsTreeModel(QAbstractItemModel):
             if child.is_best:
                 self.group_id_to_best_path[group_id] = child.path
 
-        # === FIX START: Transform & Append Strategy ===
-
         if not children:
             # Error or empty group: Just remove dummy
             self.beginRemoveRows(parent_index, 0, 0)
@@ -397,8 +395,6 @@ class ResultsTreeModel(QAbstractItemModel):
 
         node.count = len(node.children)
         node.fetched = True
-
-        # === FIX END ===
 
         self.fetch_completed.emit(parent_index)
 

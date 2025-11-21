@@ -1305,6 +1305,11 @@ class ImageViewerPanel(QGroupBox):
         self.compare_type_combo.addItems([e.value for e in CompareMode])
         top_controls.addWidget(self.back_button)
         top_controls.addWidget(self.compare_type_combo)
+
+        self.tiling_check = QCheckBox("Tile Check (3x3)")
+        self.tiling_check.setToolTip("Displays the image in a 3x3 grid to check for seamless tiling.")
+        top_controls.addWidget(self.tiling_check)
+
         top_controls.addStretch()
 
         self.tonemap_view_label = QLabel("View:")
@@ -1411,6 +1416,15 @@ class ImageViewerPanel(QGroupBox):
         self.show_action.triggered.connect(self._context_show_in_explorer)
         self.delete_action.triggered.connect(self._context_delete_file)
 
+        self.tiling_check.toggled.connect(self._on_tiling_toggled)
+
+    @Slot(bool)
+    def _on_tiling_toggled(self, checked: bool):
+        self.compare_view_1.set_tiling_enabled(checked)
+        self.compare_view_2.set_tiling_enabled(checked)
+        self.compare_widget.set_tiling_enabled(checked)
+        self.diff_view.set_tiling_enabled(checked)
+
     def _open_path(self, path: Path | None):
         if path and path.exists():
             try:
@@ -1485,8 +1499,7 @@ class ImageViewerPanel(QGroupBox):
     def show_image_group(self, items: list, group_id: int, scroll_to_path: Path | None):
         """
         Displays a group of images in the viewer.
-
-        CRITICAL FIX: Accepts a list of ResultNode items directly instead of querying a DB.
+        Accepts a list of ResultNode items directly instead of querying a DB.
         This prevents groups from disappearing due to empty queries on non-existent DBs.
         """
         if self.current_group_id == group_id and not scroll_to_path:
@@ -1602,6 +1615,7 @@ class ImageViewerPanel(QGroupBox):
             button.setChecked(True)
             self._update_channel_button_style(button, True)
         self.state.stop_loaders()
+        self.tiling_check.setChecked(False)
         self._set_view_mode(is_list=True)
         self.list_view.viewport().update()
         if self.model.rowCount() > 0:

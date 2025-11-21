@@ -5,7 +5,6 @@ These widgets encapsulate specific functionalities like displaying images with
 transparency, comparing images, or emitting signals on resize/hover.
 """
 
-import math
 from collections import OrderedDict
 from typing import ClassVar
 
@@ -28,6 +27,7 @@ class AlphaBackgroundWidget(QWidget):
         self.error_message = ""
         self.bg_alpha = 255
         self.is_transparency_enabled = True
+        self.is_tiling_enabled = False
 
     def set_alpha(self, alpha: int):
         self.bg_alpha = alpha
@@ -35,6 +35,10 @@ class AlphaBackgroundWidget(QWidget):
 
     def set_transparency_enabled(self, state: bool):
         self.is_transparency_enabled = state
+        self.update()
+
+    def set_tiling_enabled(self, state: bool):
+        self.is_tiling_enabled = state
         self.update()
 
     def setPixmap(self, pixmap: QPixmap):
@@ -48,26 +52,46 @@ class AlphaBackgroundWidget(QWidget):
     def paintEvent(self, event):
         super().paintEvent(event)
         with QPainter(self) as painter:
+            # 1. Draw Background
             if self.is_transparency_enabled:
                 painter.drawPixmap(self.rect(), self._get_checkered_pixmap(self.size(), self.bg_alpha))
             else:
                 painter.fillRect(self.rect(), self.palette().base())
 
+            # 2. Draw Content
             if self.error_message:
                 painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.error_message)
             elif not self.pixmap.isNull():
+                # Calculate Scaled Geometry
                 scaled = self.pixmap.scaled(
                     self.size(),
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
-                centered_rect = QRect(
-                    (self.width() - scaled.width()) // 2,
-                    (self.height() - scaled.height()) // 2,
-                    scaled.width(),
-                    scaled.height(),
-                )
-                painter.drawPixmap(centered_rect, scaled)
+
+                # Calculate center position
+                center_x = (self.width() - scaled.width()) // 2
+                center_y = (self.height() - scaled.height()) // 2
+                base_rect = QRect(center_x, center_y, scaled.width(), scaled.height())
+
+                if self.is_tiling_enabled:
+                    # --- TILING LOGIC (3x3 Grid) ---
+                    # We iterate from -1 to 1 to draw neighbors around the center
+                    w, h = scaled.width(), scaled.height()
+                    for dy in range(-1, 2):
+                        for dx in range(-1, 2):
+                            # Offset the rect
+                            tiled_rect = base_rect.translated(dx * w, dy * h)
+                            # Optimization: Only draw if it intersects with the widget view
+                            if tiled_rect.intersects(self.rect()):
+                                painter.drawPixmap(tiled_rect, scaled)
+
+                    # Optional: Draw a subtle border around the center tile to show boundaries
+                    painter.setPen(QPen(QColor(255, 255, 0, 100), 1, Qt.PenStyle.DashLine))
+                    painter.drawRect(base_rect)
+                else:
+                    # Normal Draw
+                    painter.drawPixmap(base_rect, scaled)
 
     @classmethod
     def _get_checkered_pixmap(cls, size, alpha) -> QPixmap:
@@ -81,8 +105,12 @@ class AlphaBackgroundWidget(QWidget):
         with QPainter(pixmap) as painter:
             light, dark = QColor(200, 200, 200, alpha), QColor(150, 150, 150, alpha)
             tile_size = 10
-            for y in range(math.ceil(size.height() / tile_size)):
-                for x in range(math.ceil(size.width() / tile_size)):
+            # Use integer division + 1 to ensure coverage without float issues
+            cols = (size.width() // tile_size) + 1
+            rows = (size.height() // tile_size) + 1
+
+            for y in range(rows):
+                for x in range(cols):
                     painter.fillRect(
                         x * tile_size,
                         y * tile_size,
@@ -109,6 +137,7 @@ class ImageCompareWidget(QWidget):
         self.bg_alpha = 255
         self.is_dragging = False
         self.is_transparency_enabled = True
+        self.is_tiling_enabled = False
         self.setMouseTracking(True)
 
     def setPixmaps(self, p1: QPixmap, p2: QPixmap):
@@ -133,6 +162,10 @@ class ImageCompareWidget(QWidget):
         self.is_transparency_enabled = state
         self.update()
 
+    def set_tiling_enabled(self, state: bool):
+        self.is_tiling_enabled = state
+        self.update()
+
     def paintEvent(self, event):
         super().paintEvent(event)
         with QPainter(self) as painter:
@@ -143,30 +176,74 @@ class ImageCompareWidget(QWidget):
                 )
             else:
                 painter.fillRect(self.rect(), self.palette().base())
+
             if self.pixmap1.isNull() or self.pixmap2.isNull():
                 return
-            rect = self._calculate_scaled_rect(self.pixmap1)
-            if not rect.isValid():
-                return
-            if self.mode == CompareMode.WIPE:
-                self._paint_wipe(painter, rect)
-            elif self.mode == CompareMode.OVERLAY:
-                self._paint_overlay(painter, rect)
 
-    def _paint_wipe(self, painter: QPainter, rect: QRect):
-        painter.drawPixmap(rect, self.pixmap2)
-        painter.setClipRect(QRect(rect.x(), rect.y(), self.wipe_x - rect.x(), rect.height()))
-        painter.drawPixmap(rect, self.pixmap1)
+            base_rect = self._calculate_scaled_rect(self.pixmap1)
+            if not base_rect.isValid():
+                return
+
+            # --- TILING LOGIC FOR COMPARE ---
+            # We generate a list of rects to draw (either just 1, or 9 for 3x3)
+            draw_rects = []
+            if self.is_tiling_enabled:
+                w, h = base_rect.width(), base_rect.height()
+                for dy in range(-1, 2):
+                    for dx in range(-1, 2):
+                        tiled = base_rect.translated(dx * w, dy * h)
+                        if tiled.intersects(self.rect()):
+                            draw_rects.append(tiled)
+            else:
+                draw_rects.append(base_rect)
+
+            if self.mode == CompareMode.WIPE:
+                self._paint_wipe(painter, draw_rects)
+            elif self.mode == CompareMode.OVERLAY:
+                self._paint_overlay(painter, draw_rects)
+
+    def _paint_wipe(self, painter: QPainter, rects: list[QRect]):
+        # Draw Image 2 (Right side / Underneath)
+        for r in rects:
+            painter.drawPixmap(r, self.pixmap2)
+
+        # Draw Image 1 (Left side / Top, clipped)
+        # Define clip region (left side of wipe bar)
+        painter.setClipRect(QRect(0, 0, self.wipe_x, self.height()))
+        for r in rects:
+            painter.drawPixmap(r, self.pixmap1)
+
         painter.setClipping(False)
+
+        # Draw Divider
         painter.setPen(QPen(QColor(UIConfig.Colors.DIVIDER), 2))
         painter.drawLine(self.wipe_x, 0, self.wipe_x, self.height())
         painter.setBrush(QColor(UIConfig.Colors.DIVIDER))
         painter.drawEllipse(QPoint(self.wipe_x, self.height() // 2), 8, 8)
 
-    def _paint_overlay(self, painter: QPainter, rect: QRect):
-        painter.drawPixmap(rect, self.pixmap1)
+        # Draw Tile Borders (Optional hint)
+        if self.is_tiling_enabled:
+            painter.setPen(QPen(QColor(255, 255, 0, 80), 1, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for r in rects:
+                painter.drawRect(r)
+
+    def _paint_overlay(self, painter: QPainter, rects: list[QRect]):
+        # Draw Image 1
+        for r in rects:
+            painter.drawPixmap(r, self.pixmap1)
+
+        # Draw Image 2 with Opacity
         painter.setOpacity(self.overlay_alpha / 255.0)
-        painter.drawPixmap(rect, self.pixmap2)
+        for r in rects:
+            painter.drawPixmap(r, self.pixmap2)
+
+        # Reset opacity for borders
+        painter.setOpacity(1.0)
+        if self.is_tiling_enabled:
+            painter.setPen(QPen(QColor(255, 255, 0, 80), 1, Qt.PenStyle.DashLine))
+            for r in rects:
+                painter.drawRect(r)
 
     def _calculate_scaled_rect(self, pixmap: QPixmap) -> QRect:
         scaled = pixmap.scaled(
@@ -221,7 +298,7 @@ class ResizedListView(QListView):
         self.setMouseTracking(True)
         self._last_hovered_index = QModelIndex()
         self._last_channel = None
-        self.preview_size = 250  # Default value
+        self.preview_size = 250
 
     def set_preview_size(self, size: int):
         """Updates the internal knowledge of thumbnail size for hit-testing."""

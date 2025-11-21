@@ -83,7 +83,7 @@ def worker_calculate_perceptual_hashes(item: "AnalysisItem", ignore_solid_channe
             image_for_hashing = original_pil_img.convert("L")
 
         elif analysis_type in ("R", "G", "B", "A"):
-            # Ensure RGBA for splitting (SIM108 Fix)
+            # Ensure RGBA for splitting
             rgba_img = original_pil_img.convert("RGBA") if original_pil_img.mode != "RGBA" else original_pil_img
 
             channels = rgba_img.split()
