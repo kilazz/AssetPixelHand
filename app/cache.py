@@ -48,7 +48,6 @@ class CacheManager:
     """Manages a cache using the primary LanceDB Table for all metadata and vectors."""
 
     def __init__(self, scanned_folder_path: Path, model_name: str, lancedb_table: Any):
-        # We receive the LanceDB Table directly.
         self.lancedb_table: Table = lancedb_table
         self.db_path = None
         self.model_name = model_name
@@ -62,109 +61,139 @@ class CacheManager:
 
     def get_cached_fingerprints(self, all_file_paths: list[Path]) -> tuple[list[Path], list[ImageFingerprint]]:
         """
-        Retrieves cached fingerprints from LanceDB based on path, mtime, and size.
-        LanceDB acts as both the cache and the final DB.
+        Retrieves cached fingerprints from LanceDB.
+        Now uses batching to query only relevant paths instead of loading the entire DB.
         """
         if not self.is_valid or not all_file_paths:
             return all_file_paths, []
 
+        to_process_paths = set()
+        cached_fps = []
+
+        # Optimization: Only process unique paths
+        unique_paths = list({p for p in all_file_paths if p.exists() and p.is_file()})
+
+        # Batch size for SQL IN (...) query
+        # Too large batch = parser error, Too small = slow
+        BATCH_SIZE = 2000
+
         try:
-            # 1. Create Polars DataFrame of current disk files
-            disk_files_data = [
-                {
-                    "path": str(p),
-                    "mtime": p.stat().st_mtime,
-                    "file_size": p.stat().st_size,
-                }
-                for p in all_file_paths
-                if p.exists() and p.is_file()
-            ]
-            if not disk_files_data:
-                return [], []
-            disk_files_df = pl.DataFrame(disk_files_data)
+            total_items = len(unique_paths)
 
-            # 2. Get all file-level metadata from LanceDB (LanceDB is the primary DB)
-            cached_data_df = self.lancedb_table.to_polars()
+            for i in range(0, total_items, BATCH_SIZE):
+                batch_paths = unique_paths[i : i + BATCH_SIZE]
 
-            # Select necessary columns for comparison and data reconstruction.
-            cache_cols = [
-                "path",
-                "mtime",
-                "file_size",
-                "vector",
-                "resolution_w",
-                "resolution_h",
-                "capture_date",
-                "format_str",
-                "format_details",
-                "has_alpha",
-                "bit_depth",
-                "xxhash",
-                "dhash",
-                "phash",
-            ]
-
-            # 3. Join the two DataFrames to find mismatches (LanceDB as the right side)
-            comparison_df = disk_files_df.join(
-                cached_data_df.select(cache_cols).rename(
-                    {"vector": "hashes"}
-                ),  # LanceDB uses 'vector', we rename to 'hashes' for ImageFingerprint
-                on="path",
-                how="left",
-                suffix="_cached",
-            )
-
-            # 4. Filter for to_process (new or modified)
-            to_process_df = comparison_df.filter(
-                (pl.col("mtime_cached").is_null())  # New file (no match in cache)
-                | (pl.col("mtime_cached") != pl.col("mtime"))  # Modified mtime
-                | (pl.col("file_size_cached") != pl.col("file_size"))  # Modified size
-            )
-            to_process_paths = {Path(p) for p in to_process_df.select("path").to_series().to_list()}
-
-            # 5. Filter for cached (valid matches)
-            cached_df = comparison_df.filter(
-                (pl.col("mtime_cached") == pl.col("mtime"))
-                & (pl.col("file_size_cached") == pl.col("file_size"))
-                & (pl.col("hashes").is_not_null())  # Must have a vector to be a valid cache hit
-            )
-
-            cached_fps = []
-
-            for row_dict in cached_df.to_dicts():
-                try:
-                    # Rename Polars "_cached" columns to be clean (e.g. mtime_cached -> mtime)
-                    row = {
-                        k.replace("_cached", ""): v for k, v in row_dict.items() if k not in self.cache_check_columns
+                # 1. Create Polars DataFrame for the current batch (Disk State)
+                batch_disk_data = [
+                    {
+                        "path": str(p),
+                        "mtime": p.stat().st_mtime,
+                        "file_size": p.stat().st_size,
                     }
-                    # Merge disk stats (un-suffixed) with cached data
-                    row.update({k: row_dict[k] for k in self.cache_check_columns})
+                    for p in batch_paths
+                ]
+                disk_df = pl.DataFrame(batch_disk_data)
 
-                    # Handle vector data (list of floats from LanceDB)
-                    vector_data = np.array(row.pop("hashes"), dtype=np.float32) if row.get("hashes") else np.array([])
+                # 2. Query LanceDB specifically for these paths (DB State)
+                # Escape single quotes in paths for SQL safety
+                path_list_sql = ", ".join(f"'{str(p).replace("'", "''")}'" for p in batch_paths)
 
-                    fp = ImageFingerprint(
-                        path=Path(row["path"]),
-                        hashes=vector_data,
-                        resolution=(row["resolution_w"], row["resolution_h"]),
-                        file_size=row["file_size"],
-                        mtime=row["mtime"],
-                        capture_date=row.get("capture_date"),
-                        format_str=row["format_str"],
-                        compression_format=row.get("compression_format", row.get("format_str")),
-                        format_details=row["format_details"],
-                        has_alpha=bool(row["has_alpha"]),
-                        bit_depth=row["bit_depth"],
-                        xxhash=row.get("xxhash"),
-                        dhash=imagehash.hex_to_hash(row["dhash"]) if row.get("dhash") and IMAGEHASH_AVAILABLE else None,
-                        phash=imagehash.hex_to_hash(row["phash"]) if row.get("phash") and IMAGEHASH_AVAILABLE else None,
+                # Fetch only necessary columns for comparison + reconstruction
+                # Note: We filter by 'path' to avoid loading the whole DB
+                try:
+                    # Using search(None) or empty search implies filtering/scan
+                    db_df = (
+                        self.lancedb_table.search()
+                        .where(f"path IN ({path_list_sql})")
+                        .limit(None)  # No limit
+                        .to_polars()
                     )
-                    cached_fps.append(fp)
-                except Exception as e:
-                    app_logger.warning(
-                        f"Could not load cached fingerprint for {row_dict['path']}, will re-process. Error: {e}"
-                    )
-                    to_process_paths.add(Path(row_dict["path"]))
+                except Exception:
+                    # Fallback or empty result
+                    db_df = pl.DataFrame([])
+
+                if db_df.is_empty():
+                    # None of the files in this batch are in DB -> All need processing
+                    to_process_paths.update(batch_paths)
+                    continue
+
+                # Rename LanceDB columns to avoid conflict during join (suffixed)
+                # Only specific check columns need suffixes for comparison logic
+
+                # 3. Join Disk Batch vs DB Result
+                # We do a LEFT JOIN on disk files.
+                # If DB record missing -> New file.
+                # If DB record exists -> Check mtime/size.
+
+                # Rename 'vector' to 'hashes' for consistency with ImageFingerprint model
+                if "vector" in db_df.columns:
+                    db_df = db_df.rename({"vector": "hashes"})
+
+                # Add suffix to DB check columns
+                db_df = db_df.rename({"mtime": "mtime_cached", "file_size": "file_size_cached"})
+
+                joined_df = disk_df.join(db_df, on="path", how="left")
+
+                # 4. Filter: To Process (New or Modified)
+                # Conditions: Cache is null (New) OR mtime differs OR size differs
+                changed_df = joined_df.filter(
+                    (pl.col("mtime_cached").is_null())
+                    | (pl.col("mtime_cached") != pl.col("mtime"))
+                    | (pl.col("file_size_cached") != pl.col("file_size"))
+                )
+
+                for row in changed_df.select("path").iter_rows():
+                    to_process_paths.add(Path(row[0]))
+
+                # 5. Filter: Valid Cache Hits
+                valid_df = joined_df.filter(
+                    (pl.col("mtime_cached") == pl.col("mtime"))
+                    & (pl.col("file_size_cached") == pl.col("file_size"))
+                    & (pl.col("hashes").is_not_null())
+                )
+
+                # 6. Reconstruct Objects
+                # We iterate row-by-row to reconstruct ImageFingerprint objects
+                for row_dict in valid_df.to_dicts():
+                    try:
+                        # Restore original column names for the object
+                        row_dict["mtime"] = row_dict["mtime_cached"]
+                        row_dict["file_size"] = row_dict["file_size_cached"]
+
+                        # Handle vector data
+                        vector_data = (
+                            np.array(row_dict["hashes"], dtype=np.float32) if row_dict.get("hashes") else np.array([])
+                        )
+
+                        fp = ImageFingerprint(
+                            path=Path(row_dict["path"]),
+                            hashes=vector_data,
+                            resolution=(row_dict["resolution_w"], row_dict["resolution_h"]),
+                            file_size=row_dict["file_size"],
+                            mtime=row_dict["mtime"],
+                            capture_date=row_dict.get("capture_date"),
+                            format_str=row_dict["format_str"],
+                            compression_format=row_dict.get("compression_format", row_dict.get("format_str")),
+                            format_details=row_dict["format_details"],
+                            has_alpha=bool(row_dict["has_alpha"]),
+                            bit_depth=row_dict["bit_depth"],
+                            xxhash=row_dict.get("xxhash"),
+                            dhash=imagehash.hex_to_hash(row_dict["dhash"])
+                            if row_dict.get("dhash") and IMAGEHASH_AVAILABLE
+                            else None,
+                            phash=imagehash.hex_to_hash(row_dict["phash"])
+                            if row_dict.get("phash") and IMAGEHASH_AVAILABLE
+                            else None,
+                            mipmap_count=row_dict.get("mipmap_count", 1),
+                            texture_type=row_dict.get("texture_type", "2D"),
+                            color_space=row_dict.get("color_space"),
+                            channel=row_dict.get("channel"),  # Critical: restore channel info
+                        )
+                        cached_fps.append(fp)
+                    except Exception:
+                        # If reconstruction fails, mark for reprocessing
+                        # app_logger.warning(f"Reconstruction error for {row_dict.get('path')}: {e}")
+                        to_process_paths.add(Path(row_dict["path"]))
 
             return list(to_process_paths), cached_fps
 
@@ -183,13 +212,13 @@ class CacheManager:
             return
 
         # When scanning channels (RGBA), multiple fingerprints are generated for the same file path.
-        unique_map = {str(fp.path): fp for fp in fingerprints}
-        unique_fingerprints = list(unique_map.values())
+        # We process them all.
 
         # 1. Prepare data in LanceDB format
         data_to_insert = []
-        for fp in unique_fingerprints:
-            data_to_insert.append(fp.to_lancedb_dict(channel=None))
+        for fp in fingerprints:
+            # Important: preserve the channel info in the DB record
+            data_to_insert.append(fp.to_lancedb_dict(channel=fp.channel))
 
         if not data_to_insert:
             return
@@ -200,16 +229,17 @@ class CacheManager:
 
             # 3. Perform LanceDB Upsert (Delete + Add)
 
-            # A. Get paths to delete (all unique paths in this batch)
-            paths_to_delete = [d["path"] for d in data_to_insert]
+            # A. Get paths+channels to delete to ensure no duplicates
+            # Since LanceDB SQL delete is limited, we delete by Path.
+            # This is safe because put_many usually handles a batch of completely processed files.
+            paths_to_delete = {d["path"] for d in data_to_insert}
 
             # B. Delete old records
-            # Standard SQL escaping: replace ' with ''
             path_list_str = ", ".join(f"'{str(p).replace("'", "''")}'" for p in paths_to_delete)
-            self.lancedb_table.delete(f"path IN ({path_list_str})")
+            if path_list_str:
+                self.lancedb_table.delete(f"path IN ({path_list_str})")
 
             # C. Insert the new batch
-            # Convert Polars to Arrow
             arrow_table = df.to_arrow()
             self.lancedb_table.add(data=arrow_table)
 
@@ -272,8 +302,6 @@ if LANCEDB_AVAILABLE:
                     )
                     self.table = self.db.create_table(db_name, schema=schema)
 
-                app_logger.info(f"Using LanceDB thumbnail cache ({'in-memory' if in_memory else 'on-disk'}).")
-
             except Exception as e:
                 app_logger.error(f"Failed to initialize LanceDB thumbnail cache: {e}")
                 self.db = None
@@ -283,7 +311,6 @@ if LANCEDB_AVAILABLE:
             if not self.table:
                 return None
             try:
-                # Use query() for clean filtering and select the 'data' column
                 result = self.table.query().where(f"key = '{key}'").limit(1).to_list()
                 return result[0]["data"] if result else None
             except Exception as e:
@@ -296,23 +323,17 @@ if LANCEDB_AVAILABLE:
             try:
                 import pyarrow as pa
 
-                # Delete + Add for Upsert
                 self.table.delete(f"key = '{key}'")
-
-                # Prepare and Add
                 record = pa.Table.from_pylist([{"key": key, "data": data}])
                 self.table.add(record)
-
             except Exception as e:
                 app_logger.error(f"Failed to write to LanceDB thumbnail cache: {e}")
 
         def close(self):
-            # No explicit close needed for LanceDB, but clean up references.
             self.table = None
             self.db = None
 
 
-# Fallback/Default Dummy
 class DummyThumbnailCache(AbstractThumbnailCache):
     def get(self, key: str) -> bytes | None:
         return None
@@ -324,7 +345,6 @@ class DummyThumbnailCache(AbstractThumbnailCache):
         pass
 
 
-# Global variable to access the current session's thumbnail cache
 thumbnail_cache: AbstractThumbnailCache = DummyThumbnailCache()
 
 
@@ -339,22 +359,16 @@ def get_thumbnail_cache_key(
     return hashlib.sha1(key_str.encode()).hexdigest()
 
 
-# --- Lifecycle Management Functions ---
 def setup_caches(config: "ScanConfig"):
-    """Initializes the thumbnail cache (now LanceDB-based)."""
     global thumbnail_cache
     thumbnail_cache.close()
-
-    # Use LanceDBThumbnailCache now
     if LANCEDB_AVAILABLE:
-        # Pass a dummy in_memory flag; LanceDB handles this based on config
         thumbnail_cache = LanceDBThumbnailCache(in_memory=config.lancedb_in_memory)
     else:
         thumbnail_cache = DummyThumbnailCache()
 
 
 def teardown_caches():
-    """Closes and cleans up all active caches."""
     global thumbnail_cache
     thumbnail_cache.close()
     thumbnail_cache = DummyThumbnailCache()

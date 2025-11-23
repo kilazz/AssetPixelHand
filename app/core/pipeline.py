@@ -66,6 +66,8 @@ class PipelineManager(QObject):
 
         # Executors
         self.db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="DBWriter")
+
+        # Limit max_workers to avoid excessive context switching, but allowing concurrency
         self.preproc_executor = ThreadPoolExecutor(
             max_workers=self.config.perf.num_workers, thread_name_prefix="Preprocessor"
         )
@@ -131,23 +133,46 @@ class PipelineManager(QObject):
     def _monitor_preprocessing(self, items, input_size, dtype):
         """
         Submits tasks and waits for them to finish, then sends Sentinel.
+        Implements Backpressure using Semaphore to prevent flooding the executor.
         """
         batch_size = self.config.perf.batch_size
         simple_config = {"ignore_solid_channels": self.config.ignore_solid_channels}
 
-        for i in range(0, len(items), batch_size):
-            if self.stop_event.is_set() or self._internal_stop_event.is_set():
-                break
-            batch = items[i : i + batch_size]
-            self.preproc_executor.submit(
-                worker.worker_preprocess_threaded,
-                items=batch,
-                input_size=input_size,
-                dtype=dtype,
-                simple_config=simple_config,
-                output_queue=self.tensor_queue,
-            )
+        # Semaphore limits the number of un-started tasks in the executor queue.
+        # We allow a buffer of 2x workers to ensure the CPU is always fed,
+        # but prevents loading 100k tasks into RAM.
+        max_pending_tasks = self.config.perf.num_workers * 2
+        semaphore = threading.Semaphore(max_pending_tasks)
 
+        def task_done_callback(_):
+            """Release semaphore when a task is finished by the worker."""
+            semaphore.release()
+
+        try:
+            for i in range(0, len(items), batch_size):
+                if self.stop_event.is_set() or self._internal_stop_event.is_set():
+                    break
+
+                # Acquire (block) if too many tasks are pending
+                semaphore.acquire()
+
+                batch = items[i : i + batch_size]
+                future = self.preproc_executor.submit(
+                    worker.worker_preprocess_threaded,
+                    items=batch,
+                    input_size=input_size,
+                    dtype=dtype,
+                    simple_config=simple_config,
+                    output_queue=self.tensor_queue,
+                )
+
+                # Attach callback to release semaphore
+                future.add_done_callback(task_done_callback)
+
+        except Exception as e:
+            app_logger.error(f"Preprocessing monitor crashed: {e}")
+
+        # Wait for all submitted tasks to complete
         self.preproc_executor.shutdown(wait=True)
         self.tensor_queue.put(None)
 
@@ -175,11 +200,9 @@ class PipelineManager(QObject):
             self.tensor_queue.task_done()
 
     def _collect_results(self, cache: CacheManager, context: "ScanContext") -> list[str]:
-        """
-        Buffers DB writes to reduce locking overhead on fast SSDs.
-        """
-        fps_to_cache_buffer = []  # This buffer now holds metadata/vectors for LanceDB update
-        db_buffer = []  # This buffer holds data ready for LanceDB vector insertion
+        """Buffers DB writes to reduce locking overhead on fast SSDs."""
+        fps_to_cache_buffer = []
+        db_buffer = []
         all_skipped = []
 
         unique_paths_processed = set()
@@ -250,7 +273,6 @@ class PipelineManager(QObject):
         """
         Matches raw vectors to File Paths/Channels and fills the buffers.
         """
-
         for (path_str, channel), vector in batch_results.items():
             path_key = next((k for k in context.all_image_fps if str(k) == str(path_str)), None)
 
@@ -265,8 +287,8 @@ class PipelineManager(QObject):
 
                 # Add to CacheManager buffer (for metadata/vector update)
                 fp_copy = copy.copy(fp_orig)
-                fp_copy.hashes = vector  # Attach the vector for completeness
-                fp_copy.channel = channel  # Ensure channel info is carried for to_lancedb_dict
+                fp_copy.hashes = vector
+                fp_copy.channel = channel
                 fps_to_cache_buffer.append(fp_copy)
             else:
                 app_logger.warning(f"Path mismatch during collection: {path_str}")

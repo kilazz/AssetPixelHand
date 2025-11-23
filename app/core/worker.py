@@ -60,7 +60,6 @@ class InferenceEngine:
 
         model_dir = MODELS_DIR / model_name
 
-        # FIX: Explicitly convert Path to string for transformers compatibility
         self.processor = AutoProcessor.from_pretrained(str(model_dir))
 
         self.is_fp16 = FP16_MODEL_SUFFIX in model_name.lower()
@@ -126,15 +125,19 @@ class ModelManager:
     """
     Singleton to manage the lifecycle of AI models and Preprocessors.
     Encapsulates state to prevent memory leaks and ensure clean switching.
+    Added RLock to prevent race conditions during model swapping.
     """
 
     _instance = None
-    _lock = threading.Lock()
+    _lock = threading.Lock()  # Lock for Singleton instantiation
 
     def __init__(self):
         self.inference_engine: InferenceEngine | None = None
         self.preprocessor: Any | None = None
         self.current_model_name: str | None = None
+
+        # Lock for protecting internal state (engine/preprocessor) during updates
+        self.access_lock = threading.RLock()
 
     @classmethod
     def instance(cls):
@@ -147,56 +150,69 @@ class ModelManager:
     def load_model(self, config: dict):
         requested_model = config["model_name"]
 
-        # If model is already loaded and matching, do nothing
-        if self.inference_engine and self.current_model_name == requested_model:
-            return
+        # Protect the entire check-and-load process
+        with self.access_lock:
+            # If model is already loaded and matching, do nothing
+            if self.inference_engine and self.current_model_name == requested_model:
+                return
 
-        app_logger.info(f"ModelManager: Switching model {self.current_model_name} -> {requested_model}")
+            app_logger.info(f"ModelManager: Switching model {self.current_model_name} -> {requested_model}")
 
-        # Clean up old resources first
-        self.release_resources()
+            # Clean up old resources first (protected by lock)
+            self.release_resources()
 
-        try:
-            # Load new Inference Engine
-            self.inference_engine = InferenceEngine(
-                model_name=requested_model,
-                device=config.get("device", "CPUExecutionProvider"),
-                threads_per_worker=config.get("threads_per_worker", 1),
-            )
+            try:
+                # Load new Inference Engine
+                self.inference_engine = InferenceEngine(
+                    model_name=requested_model,
+                    device=config.get("device", "CPUExecutionProvider"),
+                    threads_per_worker=config.get("threads_per_worker", 1),
+                )
 
-            # Load Preprocessor (kept separate for CPU threads)
-            from transformers import AutoProcessor
+                # Load Preprocessor (kept separate for CPU threads)
+                from transformers import AutoProcessor
 
-            model_dir = MODELS_DIR / requested_model
-            # FIX: Explicit string conversion
-            self.preprocessor = AutoProcessor.from_pretrained(str(model_dir))
+                model_dir = MODELS_DIR / requested_model
+                self.preprocessor = AutoProcessor.from_pretrained(str(model_dir))
 
-            self.current_model_name = requested_model
-        except Exception as e:
-            app_logger.error(f"Failed to load model {requested_model}: {e}")
-            self.release_resources()  # Cleanup on failure
-            raise e
+                self.current_model_name = requested_model
+            except Exception as e:
+                app_logger.error(f"Failed to load model {requested_model}: {e}")
+                self.release_resources()  # Cleanup on failure
+                raise e
 
     def release_resources(self):
         """Explicitly release ONNX sessions and memory."""
-        if self.inference_engine:
-            # Break references to C++ objects
-            self.inference_engine.visual_session = None
-            self.inference_engine.text_session = None
-            self.inference_engine = None
+        # Protect cleanup
+        with self.access_lock:
+            if self.inference_engine:
+                # Break references to C++ objects
+                self.inference_engine.visual_session = None
+                self.inference_engine.text_session = None
+                self.inference_engine = None
 
-        self.preprocessor = None
-        self.current_model_name = None
+            self.preprocessor = None
+            self.current_model_name = None
 
         # Force Garbage Collection to clear VRAM/RAM held by PyTorch/ONNX tensors
         gc.collect()
 
     def get_input_size(self) -> tuple[int, int]:
-        if self.preprocessor:
-            image_proc = getattr(self.preprocessor, "image_processor", self.preprocessor)
-            size_cfg = getattr(image_proc, "size", {}) or getattr(image_proc, "crop_size", {})
-            return (size_cfg["height"], size_cfg["width"]) if "height" in size_cfg else (224, 224)
-        return (224, 224)
+        # Thread-safe access to preprocessor config
+        with self.access_lock:
+            if self.preprocessor:
+                image_proc = getattr(self.preprocessor, "image_processor", self.preprocessor)
+                size_cfg = getattr(image_proc, "size", {}) or getattr(image_proc, "crop_size", {})
+                return (size_cfg["height"], size_cfg["width"]) if "height" in size_cfg else (224, 224)
+            return (224, 224)
+
+    def get_models_snapshot(self) -> tuple[InferenceEngine | None, Any | None]:
+        """
+        Returns a thread-safe snapshot of the current engine and preprocessor.
+        Worker threads should use this instead of accessing attributes directly.
+        """
+        with self.access_lock:
+            return self.inference_engine, self.preprocessor
 
 
 # --- Helper Functions (API) ---
@@ -235,20 +251,12 @@ def _read_and_process_batch_for_ai(
     skipped_tuples = []
     ignore_solid_channels = simple_config.get("ignore_solid_channels", True)
 
-    # Standard AI Input size is usually 224x224 or 384x384.
-    # Large textures (4K) need heavy downscaling.
-
     for item in items:
         path = Path(item.path)
         analysis_type = item.analysis_type
 
         try:
             # 1. Heuristic Shrink (Optimization)
-            # Reading metadata with OIIO/DirectXTex is slow. OS stat is fast.
-            # We guess the shrink factor based on file size.
-            # > 50MB -> shrink 8
-            # > 10MB -> shrink 4
-            # > 2MB  -> shrink 2
             try:
                 file_size = path.stat().st_size
                 shrink = 1
@@ -282,18 +290,13 @@ def _read_and_process_batch_for_ai(
                     channel_img = channels[idx]
                     if ignore_solid_channels:
                         min_val, max_val = channel_img.getextrema()
-
-                        # Check 1: Fast absolute bounds check
                         if max_val < 5 or min_val > 250:
                             continue
-
-                        # Check 2: Robust average check
                         stat = ImageStat.Stat(channel_img)
                         mean_val = stat.mean[0]
                         if mean_val < 5 or mean_val > 250:
                             continue
 
-                    # Reconstruct as RGB for the model (R,R,R)
                     processed_image = Image.merge("RGB", (channel_img, channel_img, channel_img))
                     channel_name = analysis_type
 
@@ -303,7 +306,6 @@ def _read_and_process_batch_for_ai(
 
             else:  # Composite
                 if pil_image.mode == "RGBA":
-                    # Paste onto black background to handle transparency
                     processed_image = Image.new("RGB", pil_image.size, (0, 0, 0))
                     processed_image.paste(pil_image, mask=pil_image.split()[3])
                 else:
@@ -313,7 +315,6 @@ def _read_and_process_batch_for_ai(
             # 3. Final Resize (Optimization: BILINEAR)
             if processed_image:
                 if processed_image.size != input_size:
-                    # BILINEAR is 3x faster than LANCZOS and sufficient for Neural Networks
                     processed_image = processed_image.resize(input_size, Image.Resampling.BILINEAR)
 
                 images.append(processed_image)
@@ -336,10 +337,12 @@ def worker_preprocess_threaded(
     Executed by Preprocessor Threads.
     Reads images -> Transforms -> Puts NumPy tensors into queue.
     """
-    manager = ModelManager.instance()
-    if not manager.preprocessor:
-        # If preprocessor is missing, abort batch
-        output_queue.put((None, [], [(str(i.path), "Model not initialized") for i in items]))
+    # Use thread-safe snapshot instead of direct access
+    _, preprocessor = ModelManager.instance().get_models_snapshot()
+
+    if not preprocessor:
+        # If preprocessor is missing (model unloaded), abort batch
+        output_queue.put((None, [], [(str(i.path), "Model not initialized (race condition fixed)") for i in items]))
         return
 
     images, successful_paths_with_channels, skipped_tuples = _read_and_process_batch_for_ai(
@@ -352,7 +355,7 @@ def worker_preprocess_threaded(
 
     try:
         # HuggingFace Processor runs here (CPU bound, mostly normalization)
-        batch_dict = manager.preprocessor(images=images, return_tensors="np")
+        batch_dict = preprocessor(images=images, return_tensors="np")
         pixel_values = batch_dict.pixel_values.astype(dtype)
         output_queue.put((pixel_values, successful_paths_with_channels, skipped_tuples))
     except Exception as e:
@@ -366,7 +369,9 @@ def run_inference_direct(pixel_values: np.ndarray, paths_with_channels: list) ->
     Executed by Inference Thread.
     Takes NumPy tensors -> Runs ONNX -> Returns embeddings.
     """
-    engine = ModelManager.instance().inference_engine
+    # Use thread-safe snapshot
+    engine, _ = ModelManager.instance().get_models_snapshot()
+
     if engine is None:
         return {}, [(p, "Inference Engine not initialized") for p, _ in paths_with_channels]
 
@@ -394,9 +399,8 @@ def run_inference_direct(pixel_values: np.ndarray, paths_with_channels: list) ->
 
 def worker_get_single_vector(image_path_str: str) -> np.ndarray | None:
     """Used for Search-by-Image."""
-    manager = ModelManager.instance()
-    engine = manager.inference_engine
-    preproc = manager.preprocessor
+    # Use snapshot
+    engine, preproc = ModelManager.instance().get_models_snapshot()
 
     if engine is None or preproc is None:
         return None
@@ -425,7 +429,8 @@ def worker_get_single_vector(image_path_str: str) -> np.ndarray | None:
 
 def worker_get_text_vector(text: str) -> np.ndarray | None:
     """Used for Search-by-Text."""
-    engine = ModelManager.instance().inference_engine
+    # Use snapshot
+    engine, _ = ModelManager.instance().get_models_snapshot()
     if engine is None:
         return None
     try:
